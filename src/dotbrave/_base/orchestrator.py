@@ -33,7 +33,11 @@ from dotbrave._base.cdp import (
     remember_devtools_port,
     wait_for_devtools_endpoint,
 )
-from dotbrave._base.live_apply import LiveApplyUnsupported
+from dotbrave._base.live_apply import (
+    LiveApplyUnsupported,
+    apply_external_plans,
+    write_state_files,
+)
 from dotbrave._base.utils import Plan, find_preferences, load_prefs, write_atomic
 
 
@@ -201,6 +205,19 @@ def cmd_apply(
     was_closed = False
     relaunch_live_port: int | None = None
     if running_fn():
+        if all(p.external_apply_fn is not None for p in non_empty):
+            # Every requested change lives in external managed policy
+            # ([pwa]): nothing touches Preferences and nothing needs the
+            # DevTools endpoint, so leave the running browser alone. The
+            # browser reads the policy on its next launch.
+            apply_external_plans(plans)
+            write_state_files(plans)
+            names = ", ".join(f"[{p.namespace}]" for p in non_empty)
+            print(
+                f"ok -- {names} policy written without touching the "
+                f"running {display_name} (loaded at its next launch)"
+            )
+            return
         if live_apply_fn is not None:
             live_port = find_devtools_port(args.profile_root, args.profile)
             if live_port is None:

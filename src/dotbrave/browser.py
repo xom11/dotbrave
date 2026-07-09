@@ -159,7 +159,8 @@ _INIT_TEMPLATE = """\
 
 # [pwa]
 # Force-installed Progressive Web Apps via Chromium enterprise policy.
-# Requires sudo (Linux/macOS) or Administrator (Windows) + Brave restart.
+# Requires sudo (Linux/macOS) or Administrator (Windows); a running Brave
+# is left untouched and picks the change up at its next launch.
 # Uncomment the header and add URLs to enable.
 #
 # urls = [

@@ -9,8 +9,9 @@
 #   - REQUIRES SUDO. The policy file is root-owned:
 #       Linux: /etc/brave/policies/managed/dotbrave-pwa.json
 #       macOS: /Library/Managed Preferences/com.brave.Browser.plist
-#   - REQUIRES BRAVE RESTART. Policies load at startup only — pass
-#     `--kill-browser` (`-k`) to apply immediately.
+#   - TAKES EFFECT AT THE NEXT BRAVE LAUNCH. A pwa-only apply never
+#     touches a running Brave: the policy file is written immediately
+#     and Brave reads it the next time it starts.
 # Force-installed apps cannot be removed via the Brave UI; delete the URL
 # here and re-apply to uninstall.
 

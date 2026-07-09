@@ -82,7 +82,9 @@ Preserve these contracts unless a change explicitly redesigns them:
 5. Plain `apply` manages live apply. Endpoints bind to `127.0.0.1` and
    remain internal; no public endpoint or force-kill switch is exposed.
    Unsupported live settings and removals fall back to a normal close,
-   verified offline apply, and relaunch.
+   verified offline apply, and relaunch. A diff whose only changes are
+   `[pwa]` never touches the running browser: the policy is written
+   directly (no endpoint bootstrap) and Brave loads it at next launch.
 6. `export` intentionally omits `[settings]` (Chromium has no defaults
    table for arbitrary prefs). It emits `[shortcuts]` diffs against
    `brave.default_accelerators` plus `[pwa]`.
