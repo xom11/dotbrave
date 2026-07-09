@@ -1,0 +1,79 @@
+# `dotbrave apply` — all three namespaces in one file.
+# One apply = one backup + write cycle. See ./shortcuts.toml,
+# ./settings.toml, ./pwa.toml for single-namespace variants.
+#
+# Table semantics:
+#   - missing header  → module skipped, managed entries left alone.
+#   - empty body      → all previously-managed entries reset / popped.
+
+[shortcuts]
+
+# vim-style hjkl: Alt+H/L for history, Alt+J/K for tab switching.
+back                = ["Alt+KeyH"]
+forward             = ["Alt+KeyL"]
+select_previous_tab = ["Alt+KeyK"]
+select_next_tab     = ["Alt+KeyJ"]
+
+new_tab           = ["Control+KeyT"]
+close_tab         = ["Control+KeyW"]
+reload            = ["Control+KeyR"]
+focus_search      = ["Control+KeyS"]
+find              = ["Control+KeyF"]
+show_downloads    = ["Control+KeyJ"]
+show_history      = ["Control+KeyH"]
+bookmark_this_tab = ["Control+KeyD"]
+focus_location    = ["Control+KeyL"]
+
+[settings]
+
+# Appearance
+"browser.custom_chrome_frame"  = true
+"bookmark_bar.show_tab_groups" = false
+"auto_pin_new_tab_groups"      = false
+"brave.location_bar_is_wide"   = false
+
+# Tabs — vertical tabs in minimal (icon-only) mode.
+"brave.tabs.vertical_tabs_enabled"   = true
+"brave.tabs.vertical_tabs_collapsed" = true
+
+# Bookmarks bar + address bar.
+"bookmark_bar.show_on_all_tabs"         = false
+"brave.always_show_bookmark_bar_on_ntp" = false
+"omnibox.prevent_url_elisions"          = true
+
+# New Tab Page — declutter.
+"ntp.shortcust_visible"                            = false
+"brave.brave_search.show-ntp-search"               = false
+"brave.brave_search.show-ntp-chat"                 = false
+"brave.new_tab_page.show_background_image"         = false
+"brave.new_tab_page.show_branded_background_image" = false
+"brave.new_tab_page.show_clock"                    = false
+"brave.new_tab_page.show_stats"                    = false
+"brave.new_tab_page.show_rewards"                  = false
+"brave.new_tab_page.show_brave_vpn"                = false
+"brave.new_tab_page.show_together"                 = false
+"brave.new_tab_page.show_brave_news"               = false
+
+# Toolbar declutter.
+"brave.wallet.show_wallet_icon_on_toolbar"                = false
+"brave.ai_chat.show_toolbar_button"                       = false
+"brave.rewards.show_brave_rewards_button_in_location_bar" = false
+"brave.brave_vpn.show_button"                             = false
+"brave.today.should_show_toolbar_button"                  = false
+
+# Leo AI — fully out of the way.
+"brave.ai_chat.context_menu_enabled"          = false
+"brave.ai_chat.autocomplete_provider_enabled" = false
+
+# Window-close prompts.
+"brave.enable_closing_last_tab"       = false
+"brave.enable_window_closing_confirm" = false
+"brave.show_fullscreen_reminder"      = false
+
+# [pwa] — left commented out so the quick-start `apply` doesn't pull in
+# extra apps + a sudo prompt. See ./pwa.toml for a working example.
+#
+# [pwa]
+# urls = [
+#   "https://squoosh.app/",
+# ]

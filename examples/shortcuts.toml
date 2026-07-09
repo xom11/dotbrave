@@ -1,0 +1,22 @@
+# `dotbrave apply` — keyboard shortcut overrides only.
+# Keys are Chromium KeyEvent codes (https://www.w3.org/TR/uievents-code/)
+# joined by `+`. `Meta+` is auto-translated to `Cmd` on macOS, so the same
+# config works cross-platform.
+
+[shortcuts]
+
+# vim-style hjkl: Alt+H/L for history, Alt+J/K for tab switching.
+back                = ["Alt+KeyH"]
+forward             = ["Alt+KeyL"]
+select_previous_tab = ["Alt+KeyK"]
+select_next_tab     = ["Alt+KeyJ"]
+
+new_tab           = ["Control+KeyT"]
+close_tab         = ["Control+KeyW"]
+reload            = ["Control+KeyR"]
+focus_search      = ["Control+KeyS"]
+find              = ["Control+KeyF"]
+show_downloads    = ["Control+KeyJ"]
+show_history      = ["Control+KeyH"]
+bookmark_this_tab = ["Control+KeyD"]
+focus_location    = ["Control+KeyL"]

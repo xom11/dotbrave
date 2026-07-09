@@ -1,0 +1,20 @@
+# `dotbrave apply` — force-installed Progressive Web Apps only.
+#
+# Each URL is installed via Chromium's enterprise `WebAppInstallForceList`
+# policy: Brave fetches the manifest, downloads icons, registers the app in
+# chrome://apps, and emits a `.desktop` launcher (Linux). Removing a URL
+# here + re-applying causes Brave to uninstall on next launch.
+#
+# Two important differences from [shortcuts] / [settings]:
+#   - REQUIRES SUDO. The policy file is root-owned:
+#       Linux: /etc/brave/policies/managed/dotbrave-pwa.json
+#       macOS: /Library/Managed Preferences/com.brave.Browser.plist
+#   - REQUIRES BRAVE RESTART. Policies load at startup only — pass
+#     `--kill-browser` (`-k`) to apply immediately.
+# Force-installed apps cannot be removed via the Brave UI; delete the URL
+# here and re-apply to uninstall.
+
+[pwa]
+urls = [
+  "https://squoosh.app/",
+]

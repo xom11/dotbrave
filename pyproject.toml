@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dotbrave"
+dynamic = ["version"]
+description = "Manage Brave as a dotfile: keyboard shortcuts, general settings (non-MAC keys), and force-installed PWAs from one TOML."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "xom11" }]
+keywords = ["brave", "browser", "dotfiles", "shortcuts", "keybindings", "settings", "pwa", "config"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+dotbrave = "dotbrave.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/xom11/dotbrave"
+Issues = "https://github.com/xom11/dotbrave/issues"
+
+[tool.hatch.version]
+path = "src/dotbrave/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dotbrave"]
