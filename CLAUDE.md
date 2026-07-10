@@ -126,8 +126,13 @@ Preserve these contracts unless a change explicitly redesigns them:
   graceful close, windowless background-mode residue is terminated (it
   holds the profile and process singleton); processes with open windows
   are never force-killed -- the error names their window titles. Brave
-  on Windows does not write `DevToolsActivePort`, so every apply
-  re-bootstraps the endpoint instead of reusing a running one.
+  on Windows does not write `DevToolsActivePort`, so endpoint discovery
+  relies on the `.dotbrave.live.json` sidecar that `apply` writes at the
+  profile root after a successful live apply; `find_devtools_port` trusts
+  it only while `devtools_endpoint_alive` confirms the port. A later
+  `apply` that finds a live port reuses it; once the port is gone (e.g.
+  `apply --undo` restarts Brave without the debug flags) the next apply
+  re-bootstraps.
 - Live apply drives privileged pages in a dedicated work tab
   (`CdpClient.create_page`/`close_page`), never by navigating a user's
   existing tab.
