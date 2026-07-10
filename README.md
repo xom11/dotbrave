@@ -25,11 +25,11 @@ namespaces; [`shortcuts.toml`](examples/shortcuts.toml),
 
 ![Brave with the minimal config — empty new tab page, vertical tabs collapsed to icons, decluttered toolbar](docs/img/minimal-brave.png)
 
-**Scaffold a starter config from scratch:**
+**Start from what you already have** — export your current
+customizations as a ready-to-edit config:
 
 ```bash
-dotbrave init                # write commented template to stdout
-dotbrave init -o brave.toml  # ...or to a file
+dotbrave export -o brave.toml
 ```
 
 **Or apply the example directly from GitHub** — no clone, no install.
@@ -117,7 +117,8 @@ dotbrave apply brave.toml              # live apply if Brave is running
 - **Setting keys**: dotted paths into the profile `Preferences` JSON.
   MAC-protected keys (`homepage`, default search engine, `pinned_tabs`, …)
   are refused with a clear error — Brave would silently reset them on
-  launch. Run `dotbrave settings blocked` to see what's protected.
+  launch. `export` lists protected keys as comments so you know what to
+  set in the Brave UI instead.
 - **PWA URLs**: every entry installs with
   `default_launch_container = "window"` and `create_desktop_shortcut = true`.
   `[pwa]` is the only namespace that needs elevated privileges: it writes a
@@ -156,20 +157,19 @@ dotbrave apply --channel beta brave.toml
 
 ### Actions
 
+There are exactly two:
+
 | Action | What it does |
 |---|---|
-| `init [-o FILE]` | Scaffold a commented starter TOML. Refuses to overwrite. |
-| `apply [-n] CONFIG` | Apply `[shortcuts]` + `[settings]` + `[pwa]` from a file or HTTPS URL. `-n/--dry-run` previews the diff. URL fetches print size + SHA-256; pin with `--expect-sha256 HEX`; plain HTTP refused unless `--allow-http`. |
-| `export [-o FILE] [-a]` | Emit `[shortcuts]` (only bindings that differ from Brave defaults; `-a/--all-shortcuts` lifts the filter), `[settings]` (keys managed by dotbrave plus keys changed since the last `settings snapshot`; omitted without a snapshot), and `[pwa]` as round-trippable TOML. |
-| `restore [--list] [--from FILE] [-n]` | Restore Preferences from a backup created by `apply` (most recent by default) and clear dotbrave sidecars. Does not touch `[pwa]` policy. |
-| `shortcuts dump [-a] [-o FILE]` | Emit current bindings as TOML (default: only user-customised ones). |
-| `shortcuts list [FILTER]` | List every bindable command name (substring filter). |
-| `settings dump [KEYS...] [-o FILE]` | Dump managed keys, or explicit dotted paths. |
-| `settings blocked [-o FILE]` | List MAC-protected keys `apply` will refuse, with current values. |
-| `settings snapshot [--clear]` | Capture a Preferences baseline. Change settings in the Brave UI, then `export` emits the diff as `[settings]`. `--clear` deletes the baseline. Wait a few seconds after a UI change (Brave flushes Preferences on a delay) before exporting. |
-| `pwa dump [-o FILE]` | Emit currently force-installed PWA URLs as a `[pwa]` table. |
+| `export [-o FILE] [-a] [--snapshot [--clear]]` | Read your customizations as round-trippable TOML: `[shortcuts]` (bindings that differ from Brave defaults; `-a/--all-shortcuts` lists every binding with its command name), `[settings]` (well-known user-facing keys, keys dotbrave manages, and keys changed since the last `--snapshot` baseline; MAC-protected keys appear as comments), and `[pwa]`. `--snapshot` captures the baseline instead of exporting; `--snapshot --clear` deletes it. |
+| `apply [-n] CONFIG \| --undo` | Write `[shortcuts]` + `[settings]` + `[pwa]` from a file or HTTPS URL. `-n/--dry-run` previews the diff. URL fetches print size + SHA-256; pin with `--expect-sha256 HEX`; plain HTTP refused unless `--allow-http`. `--undo` restores the most recent apply-time Preferences backup instead. |
 
-Every action has detailed `--help` with safety notes and examples.
+To capture settings you only know how to change in the Brave UI: run
+`dotbrave export --snapshot`, change them in Brave, wait a few seconds
+(Brave flushes Preferences on a delay), then `dotbrave export` — the
+changed keys appear under `[settings]`.
+
+Both actions have detailed `--help` with safety notes and examples.
 
 ## How it works
 
@@ -193,9 +193,10 @@ no force-kill switch.
 (`Preferences.dotbrave.{shortcuts,settings}.json`), so removing a key from
 your config restores Brave's default on the next apply. `[pwa]` state
 lives in Chromium's managed-policy storage (Linux JSON file, macOS plist,
-Windows Registry) — the policy *is* the state. `settings snapshot` stores
+Windows Registry) — the policy *is* the state. `export --snapshot` stores
 its baseline in a third sidecar
-(`Preferences.dotbrave.settings-snapshot.json`); `restore` leaves it alone.
+(`Preferences.dotbrave.settings-snapshot.json`); `apply --undo` leaves it
+alone.
 
 On macOS, `/Library/Managed Preferences/` is a system-managed cache that
 gets reclaimed at boot on non-MDM machines, which would otherwise

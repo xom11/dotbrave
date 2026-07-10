@@ -43,7 +43,7 @@ pytest tests/test_platform.py tests/test_macos_pwa_daemon.py
 - `src/dotbrave/cli.py`: root parser; mounts actions via
   `browser.register(parser)`.
 - `src/dotbrave/browser.py`: channel/profile-root resolution, plan
-  assembly, init template, `cmd_*` handlers, registration.
+  assembly, `cmd_*` handlers, registration.
 - `src/dotbrave/shortcuts.py`, `settings.py`, `pwa.py`: namespace wrappers
   (module-level state kept patchable for tests).
 - `src/dotbrave/live.py`: Brave live-apply routes (settingsPrivate, New
@@ -51,10 +51,12 @@ pytest tests/test_platform.py tests/test_macos_pwa_daemon.py
 - `src/dotbrave/utils.py`: Brave `BrowserProcess` config per channel.
 - `src/dotbrave/command_ids.py`: generated name<->id mapping.
 - `src/dotbrave/_base/`: engine shared with upstream dotbrowser:
-  `orchestrator.py` (config loading, unified apply/init/export/restore,
+  `orchestrator.py` (config loading, unified apply/export/restore engines,
   argparse wiring), `utils.py` (`Plan`, atomic write), `settings.py`
-  (dotted keys + MAC refusal), `pwa.py` (policy storage + macOS daemon),
-  `process.py`, `cdp.py`, `live_apply.py`.
+  (dotted keys + MAC refusal + snapshot/allowlist export), `pwa.py`
+  (policy storage + macOS daemon), `process.py`, `cdp.py`,
+  `live_apply.py`. Helpers dotbrave no longer registers (init, the
+  settings/shortcuts/pwa sub-actions) stay here for upstream porting.
 - `examples/*.toml`: valid user-facing config samples.
 - `tests/`: behavior contracts. Add or update tests alongside behavior or
   CLI-help changes.
@@ -85,24 +87,26 @@ Preserve these contracts unless a change explicitly redesigns them:
    verified offline apply, and relaunch. A diff whose only changes are
    `[pwa]` never touches the running browser: the policy is written
    directly (no endpoint bootstrap) and Brave loads it at next launch.
-6. `export` emits `[shortcuts]` diffs against `brave.default_accelerators`,
-   `[pwa]`, and -- only when a `settings snapshot` baseline sidecar exists --
-   a `[settings]` block: currently-managed keys (so re-applying the export
-   cannot reset them) plus keys changed since the snapshot, with
-   MAC-protected changes as comments. There is no defaults table for
-   arbitrary prefs, so no snapshot means no `[settings]` block. `export`
-   never consumes the snapshot; `restore` does not delete it.
-7. `restore` restores Preferences backups and clears shortcut/settings
-   sidecars. If Brave is running, it closes normally and restarts; it does
-   not roll back external `[pwa]` policy.
+6. The CLI surface is exactly two actions, `apply` and `export`; new
+   capabilities become flags on one of them, not new actions. `export`
+   emits `[shortcuts]` diffs against `brave.default_accelerators`,
+   `[pwa]`, and a `[settings]` block that unions: currently-managed keys
+   (so re-applying the export cannot reset them), allowlisted well-known
+   keys (`KNOWN_SETTINGS` in `settings.py`; prefixes only ever get added
+   -- Chromium/Brave do not rename shipped pref strings), and -- when an
+   `export --snapshot` baseline sidecar exists -- keys changed since the
+   snapshot. MAC-protected keys appear only as comments. `export` never
+   consumes the snapshot; `apply --undo` does not delete it.
+7. `apply --undo` restores the most recent Preferences backup and clears
+   shortcut/settings sidecars. If Brave is running, it closes normally and
+   restarts; it does not roll back external `[pwa]` policy.
 8. Profile flags (`--channel`, `-r`, `-p`) are accepted both before and
    after the action name: real defaults live on the root parser; action
    parsers re-declare them with `argparse.SUPPRESS` so the after-action
-   form overrides. Profile-reading leaves set `_needs_profile` so
-   `_normalize_brave_args` skips profile-root resolution for `init` and
-   `shortcuts list`. Keep new action parsers consistent with this scheme.
+   form overrides. Keep new action parsers consistent with this scheme.
 9. Runtime help is part of the capability contract. Do not reintroduce
-   manual endpoint-selection or force-kill controls.
+   manual endpoint-selection or force-kill controls, and do not readvertise
+   removed actions.
 
 ## Browser Notes
 
