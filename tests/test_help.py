@@ -71,7 +71,9 @@ def test_removed_apply_flags_are_rejected() -> None:
 def test_export_and_restore_help_state_deliberate_limits() -> None:
     export = _help("export")
     restore = _help("restore")
-    assert "[settings] is intentionally not exported" in export
+    # [settings] needs a `settings snapshot` baseline; no snapshot, no block.
+    assert "settings\nsnapshot`" in export
+    assert "[settings] block is omitted" in export
     assert "[pwa] policy is not restored" in restore
 
 

@@ -439,14 +439,14 @@ _EXPORT_HEADER_NOTES = (
     "# profile + managed-policy file:",
     "#",
     "#   [shortcuts] -- bindings that differ from Brave's defaults.",
+    "#   [settings]  -- keys dotbrave already manages plus keys changed since",
+    "#                  the last `dotbrave settings snapshot` (block omitted",
+    "#                  when no snapshot exists).",
     "#   [pwa]       -- URLs currently force-installed via the managed-policy",
     "#                  file / Windows registry.",
     "#",
-    "# [settings] is intentionally NOT exported: Chromium does not expose a",
-    "# defaults table for arbitrary prefs, so 'diff vs default' is not",
-    "# computable.  Use `dotbrave settings dump <key>...` to dump specific",
-    "# keys you already know about, or `dotbrave settings blocked` to list",
-    "# MAC-protected keys (which `apply` would refuse).",
+    "# To capture settings you change in the browser UI: run `dotbrave",
+    "# settings snapshot`, change settings, then re-run `dotbrave export`.",
     "#",
     "# Apply this file with: `dotbrave apply <this file>`",
 )
@@ -623,8 +623,9 @@ Examples:
 
     if cmd_export_fn is not None:
         export_scope = (
-            "[shortcuts] changes versus Brave defaults plus [pwa] "
-            "force-installed URLs."
+            "[shortcuts] changes versus Brave defaults, [settings] keys "
+            "managed by dotbrave plus keys changed since the last `settings "
+            "snapshot`, and [pwa] force-installed URLs."
         )
         e = sub.add_parser(
             "export",
@@ -635,10 +636,11 @@ Export a round-trippable TOML snapshot for {display_name}.
 
 Output: {export_scope}
 
-[settings] is intentionally not exported: Chromium does not expose a
-defaults table for arbitrary Preferences keys, so a safe diff cannot be
-computed from a profile. Inspect known values with `settings dump` and
-protected keys with `settings blocked`.""",
+Chromium exposes no defaults table for arbitrary Preferences keys, so
+[settings] is diffed against a baseline you capture with `settings
+snapshot` before changing settings in the browser UI. Without a snapshot
+the [settings] block is omitted. MAC-protected keys are emitted as
+comments -- `apply` refuses them.""",
             epilog="""\
 Examples:
   dotbrave export

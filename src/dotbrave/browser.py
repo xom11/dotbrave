@@ -286,6 +286,12 @@ def _export_shortcuts(args: argparse.Namespace, prefs_path: Path, prefs: dict) -
     )
 
 
+def _export_settings(
+    args: argparse.Namespace, prefs_path: Path, prefs: dict
+) -> list[str] | None:
+    return settings_mod.build_export_lines(args, prefs_path, prefs)
+
+
 def _export_pwa(args: argparse.Namespace, prefs_path: Path, prefs: dict) -> list[str] | None:
     if pwa_mod.POLICY_FILE is None and sys.platform != "win32":
         return None
@@ -296,7 +302,7 @@ def cmd_export(args: argparse.Namespace) -> None:
     _base_cmd_export(
         args,
         browser_name="brave",
-        builders=[_export_shortcuts, _export_pwa],
+        builders=[_export_shortcuts, _export_settings, _export_pwa],
     )
 
 
