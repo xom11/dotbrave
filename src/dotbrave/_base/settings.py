@@ -296,89 +296,114 @@ def _is_volatile(parts: tuple[str, ...]) -> bool:
     return parts[-1] in VOLATILE_LEAVES
 
 
+def _emit_pair(key: str, val: Any) -> str:
+    """One ``"key" = value`` line, or a comment when TOML can't hold it."""
+    try:
+        return f"{json.dumps(key)} = {_format_toml_value(val)}"
+    except ValueError:
+        return (
+            f"# {json.dumps(key)} = {json.dumps(val)}  "
+            "(value not representable in TOML)"
+        )
+
+
 def build_export_lines(
     browser_name: str,
     args: argparse.Namespace,
     prefs_path: Path,
     prefs: dict,
-) -> list[str] | None:
-    """Build the ``[settings]`` block for `export`, or None without a snapshot.
+    known_prefixes: tuple[str, ...] = (),
+) -> list[str]:
+    """Build the ``[settings]`` block for `export`.
 
-    The block is the union of currently-managed keys (so applying the
-    exported file does not reset them -- an absent managed key means
-    "remove" to `apply`) and keys changed since the snapshot.  MAC-protected
-    changes, removals, and non-TOML values are reported as comments.
+    The block unions, deduped in this order: currently-managed keys (so
+    applying the exported file does not reset them -- an absent managed
+    key means "remove" to `apply`), allowlisted well-known settings
+    present in Preferences, and keys changed since the `export
+    --snapshot` baseline when one exists.  MAC-protected keys, removals,
+    and non-TOML values are reported as comments.
     """
     snapshot = _load_snapshot(prefs_path)
-    if snapshot is None:
-        return None
-
     macs = _all_macs(prefs, prefs_path)
     lines = ["[settings]"]
+    seen: set[str] = set()
+    blocked: list[tuple[str, Any]] = []
 
     managed = sorted(_get_managed_keys(prefs_path))
     if managed:
         lines.append("# currently managed by dotbrave:")
         for key in managed:
+            seen.add(key)
             val = _get_value(prefs, _split_key(key))
             if val is _MISSING:
                 lines.append(
                     f"# {json.dumps(key)} -- managed but not present in Preferences"
                 )
                 continue
-            lines.append(f"{json.dumps(key)} = {_format_toml_value(val)}")
-    managed_set = set(managed)
+            lines.append(_emit_pair(key, val))
 
-    changed: list[str] = []
-    blocked: list[tuple[str, Any]] = []
-    for parts, _old, new in _walk_leaf_diffs(snapshot["prefs"], prefs):
-        if _is_volatile(parts):
-            continue
-        key = ".".join(parts)
-        if key in managed_set:
-            continue  # already emitted above, at its current value
-        if _is_mac_protected(macs, parts):
-            blocked.append((key, new))
-            continue
-        if new is _MISSING:
-            changed.append(
-                f"# {json.dumps(key)} was removed since the snapshot "
-                "(apply cannot delete unmanaged keys)"
-            )
-            continue
-        try:
-            rhs = _format_toml_value(new)
-        except ValueError:
-            changed.append(
-                f"# {json.dumps(key)} = {json.dumps(new)}  "
-                "(value not representable in TOML)"
-            )
-            continue
-        changed.append(f"{json.dumps(key)} = {rhs}")
+    if known_prefixes:
+        known: list[str] = []
+        for parts, _old, val in _walk_leaf_diffs({}, prefs):
+            key = ".".join(parts)
+            if key in seen or _is_volatile(parts):
+                continue
+            if not any(key.startswith(p) for p in known_prefixes):
+                continue
+            seen.add(key)
+            if _is_mac_protected(macs, parts):
+                blocked.append((key, val))
+                continue
+            known.append(_emit_pair(key, val))
+        if known:
+            lines.append("# current values of well-known settings:")
+            lines.extend(known)
 
-    # Tracked prefs live in Secure Preferences; a diff there is a
-    # MAC-protected setting changed via the UI.  protection.* churn is
-    # already excluded by the volatile filter.
-    secure_now = _load_secure_prefs(prefs_path)
-    seen_blocked = {key for key, _ in blocked}
-    for parts, _old, new in _walk_leaf_diffs(snapshot["secure_prefs"], secure_now):
-        if _is_volatile(parts):
-            continue
-        key = ".".join(parts)
-        if key not in seen_blocked:
-            blocked.append((key, new))
-            seen_blocked.add(key)
+    if snapshot is not None:
+        changed: list[str] = []
+        for parts, _old, new in _walk_leaf_diffs(snapshot["prefs"], prefs):
+            if _is_volatile(parts):
+                continue
+            key = ".".join(parts)
+            if key in seen:
+                continue  # already emitted above, at its current value
+            seen.add(key)
+            if _is_mac_protected(macs, parts):
+                blocked.append((key, new))
+                continue
+            if new is _MISSING:
+                changed.append(
+                    f"# {json.dumps(key)} was removed since the snapshot "
+                    "(apply cannot delete unmanaged keys)"
+                )
+                continue
+            changed.append(_emit_pair(key, new))
 
-    lines.append(f"# changed since snapshot {snapshot['created']}:")
-    if changed:
-        lines.extend(changed)
-    else:
-        lines.append("# (no changes since snapshot)")
+        # Tracked prefs live in Secure Preferences; a diff there is a
+        # MAC-protected setting changed via the UI.  protection.* churn
+        # is already excluded by the volatile filter.
+        secure_now = _load_secure_prefs(prefs_path)
+        seen_blocked = {key for key, _ in blocked}
+        for parts, _old, new in _walk_leaf_diffs(
+            snapshot["secure_prefs"], secure_now
+        ):
+            if _is_volatile(parts):
+                continue
+            key = ".".join(parts)
+            if key not in seen_blocked:
+                blocked.append((key, new))
+                seen_blocked.add(key)
+
+        lines.append(f"# changed since snapshot {snapshot['created']}:")
+        if changed:
+            lines.extend(changed)
+        else:
+            lines.append("# (no changes since snapshot)")
 
     if blocked:
         lines.append(
-            "# changed since snapshot but MAC-protected -- `apply` would "
-            f"refuse these; set them in the {browser_name.title()} UI:"
+            "# MAC-protected -- `apply` would refuse these; "
+            f"set them in the {browser_name.title()} UI:"
         )
         for key, new in blocked:
             if new is _MISSING:
@@ -390,6 +415,8 @@ def build_export_lines(
                 rhs = json.dumps(new)
             lines.append(f"#   {json.dumps(key)} = {rhs}")
 
+    if len(lines) == 1:
+        lines.append("# (no known settings found in this profile)")
     return lines
 
 

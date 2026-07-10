@@ -225,13 +225,40 @@ def _snapshot_then_mutate(
     return prefs_path, load_prefs(prefs_path)
 
 
-def test_export_lines_none_without_snapshot(
+def test_export_lines_known_settings_without_snapshot(
     fake_settings_profile_root: Path,
 ) -> None:
+    """No snapshot needed: allowlisted keys present in Preferences are
+    exported at their current values; MAC-protected ones demote to
+    comments; no snapshot section appears."""
     prefs_path = find_preferences(fake_settings_profile_root, "Default")
     prefs = load_prefs(prefs_path)
     args = _args(fake_settings_profile_root)
-    assert brave_settings.build_export_lines(args, prefs_path, prefs) is None
+    lines = brave_settings.build_export_lines(args, prefs_path, prefs)
+    assert lines is not None and lines[0] == "[settings]"
+    body = "\n".join(lines)
+    doc = tomllib.loads(body)
+    assert doc["settings"]["bookmark_bar.show_tab_groups"] is False
+    assert doc["settings"]["brave.tabs.vertical_tabs_enabled"] is False
+    # browser.show_home_button is allowlisted but MAC-protected here.
+    assert "browser.show_home_button" not in doc["settings"]
+    assert "MAC-protected" in body and "browser.show_home_button" in body
+    assert "changed since snapshot" not in body
+
+
+def test_known_prefix_metrics_still_filtered(
+    fake_settings_profile_root: Path,
+) -> None:
+    """Volatile leaves under an allowlisted prefix stay hidden."""
+    prefs_path = find_preferences(fake_settings_profile_root, "Default")
+    prefs = load_prefs(prefs_path)
+    prefs["bookmark_bar"]["last_visit"] = "13381990"
+    prefs_path.write_text(json.dumps(prefs))
+    prefs = load_prefs(prefs_path)
+    lines = brave_settings.build_export_lines(
+        _args(fake_settings_profile_root), prefs_path, prefs
+    )
+    assert "last_visit" not in "\n".join(lines)
 
 
 def test_export_lines_diff_since_snapshot(

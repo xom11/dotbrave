@@ -42,10 +42,33 @@ def cmd_snapshot(args: argparse.Namespace) -> None:
     _base.cmd_snapshot("brave", args)
 
 
+# User-facing pref keys safe to export without a snapshot baseline.
+# Entries are dotted-key prefixes matched by startswith(); exact keys are
+# prefixes that only match themselves.  Chromium/Brave never rename pref
+# strings once shipped (they persist in user profiles), so this list only
+# ever needs additions for new features -- a missing entry means a key is
+# absent from export, never wrong output.
+KNOWN_SETTINGS: tuple[str, ...] = (
+    "bookmark_bar.",
+    "brave.tabs.",
+    "brave.new_tab_page.show_",
+    "brave.new_tab_page.hide_all_widgets",
+    "brave.location_bar_is_wide",
+    "brave.show_side_panel_button",
+    "brave.today.should_show_toolbar_button",
+    "brave.today.opted_in",
+    "brave.wayback_machine_enabled",
+    "omnibox.prevent_url_elisions",
+    "browser.show_home_button",
+)
+
+
 def build_export_lines(
     args: argparse.Namespace, prefs_path: Path, prefs: dict
-) -> list[str] | None:
-    return _base.build_export_lines("brave", args, prefs_path, prefs)
+) -> list[str]:
+    return _base.build_export_lines(
+        "brave", args, prefs_path, prefs, known_prefixes=KNOWN_SETTINGS
+    )
 
 
 def register(subparsers: argparse._SubParsersAction, profile_args) -> None:
