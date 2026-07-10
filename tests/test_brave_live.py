@@ -17,9 +17,23 @@ class FakeCdpClient:
         self.navigations: list[str] = []
         self.evaluations: list[str] = []
         self.evaluation_results = iter(evaluation_results or [])
+        self.created: list[dict] = []
+        self.closed: list[dict] = []
+        self.refuse_create = False
 
     def list_targets(self) -> list[dict]:
         return self.targets
+
+    def create_page(self, url: str = "about:blank") -> dict:
+        if self.refuse_create:
+            raise RuntimeError("endpoint refuses /json/new")
+        target = {"type": "page", "url": url, "id": f"work-{len(self.created)}"}
+        self.created.append(target)
+        self.targets.append(target)
+        return target
+
+    def close_page(self, target: dict) -> None:
+        self.closed.append(target)
 
     def navigate(self, target: dict, url: str) -> None:
         self.navigations.append(url)
@@ -171,3 +185,72 @@ def test_brave_live_preflight_rejects_unknown_settings_before_mutation(
     assert any("chrome.settingsPrivate.getPref" in expr for expr in fake.evaluations)
     assert not any("chrome.settingsPrivate.setPref" in expr for expr in fake.evaluations)
     assert list(prefs_path.parent.glob("Preferences.bak.*")) == []
+
+
+def _settings_plan(prefs_path: Path) -> Plan:
+    def apply_fn(target: dict) -> None:
+        target["brave"]["tabs"]["vertical_tabs_enabled"] = True
+
+    return Plan(
+        namespace="settings",
+        diff_lines=["changed"],
+        apply_fn=apply_fn,
+        verify_fn=lambda _prefs: None,
+        state_path=prefs_path.with_name("Preferences.dotbrave.settings.json"),
+        state_payload={"managed_keys": ["brave.tabs.vertical_tabs_enabled"]},
+    )
+
+
+def test_live_apply_uses_dedicated_tab_and_closes_it(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Live apply must not hijack a user tab: it opens its own work tab
+    and closes it afterwards, even though it navigates privileged pages."""
+    prefs_path = tmp_path / "Default" / "Preferences"
+    prefs_path.parent.mkdir()
+    prefs = {"brave": {"tabs": {"vertical_tabs_enabled": False}}}
+    prefs_path.write_text(json.dumps(prefs))
+
+    fake = FakeCdpClient(9333)
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake)
+    live.apply_live(9333, prefs_path, prefs, [_settings_plan(prefs_path)])
+
+    assert len(fake.created) == 1
+    assert fake.closed == fake.created
+    # The pre-existing user tab was never navigated.
+    assert fake.targets[0]["url"] == "chrome://newtab/"
+
+
+def test_live_apply_closes_work_tab_when_preflight_rejects(
+    tmp_path: Path, monkeypatch
+) -> None:
+    prefs_path = tmp_path / "Default" / "Preferences"
+    prefs_path.parent.mkdir()
+    prefs = {"brave": {"tabs": {"vertical_tabs_enabled": False}}}
+    prefs_path.write_text(json.dumps(prefs))
+
+    fake = FakeCdpClient(
+        9333, evaluation_results=[["brave.tabs.vertical_tabs_enabled"]]
+    )
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake)
+    with pytest.raises(shared_live.LiveApplyUnsupported):
+        live.apply_live(9333, prefs_path, prefs, [_settings_plan(prefs_path)])
+    assert fake.closed == fake.created
+
+
+def test_live_apply_falls_back_to_existing_tab_without_closing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    prefs_path = tmp_path / "Default" / "Preferences"
+    prefs_path.parent.mkdir()
+    prefs = {"brave": {"tabs": {"vertical_tabs_enabled": False}}}
+    prefs_path.write_text(json.dumps(prefs))
+
+    fake = FakeCdpClient(9333)
+    fake.refuse_create = True
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake)
+    live.apply_live(9333, prefs_path, prefs, [_settings_plan(prefs_path)])
+
+    assert fake.created == []
+    assert fake.closed == []  # never close a tab we did not open
+    assert "chrome://settings/appearance" in fake.navigations

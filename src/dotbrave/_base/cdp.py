@@ -148,6 +148,39 @@ class CdpClient:
         targets = self._json("/json/list")
         return targets if isinstance(targets, list) else []
 
+    def create_page(self, url: str = "about:blank") -> dict:
+        """Open a fresh page target (tab) and return its descriptor.
+
+        Live apply drives privileged UI pages in a dedicated tab so no
+        user tab gets navigated away; callers close it when done.
+        """
+        path = f"/json/new?{urllib.parse.quote(url, safe=':/')}"
+        req = urllib.request.Request(
+            f"http://{self.host}:{self.port}{path}", method="PUT"
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                created = json.loads(resp.read().decode("utf-8"))
+        except (urllib.error.URLError, TimeoutError, OSError,
+                json.JSONDecodeError) as e:
+            raise RuntimeError(f"could not open a DevTools work tab: {e}")
+        if not isinstance(created, dict):
+            raise RuntimeError("unexpected /json/new response")
+        return created
+
+    def close_page(self, target: dict) -> None:
+        """Best-effort close of a tab opened via ``create_page``."""
+        target_id = target.get("id")
+        if not target_id:
+            return
+        try:
+            urllib.request.urlopen(
+                f"http://{self.host}:{self.port}/json/close/{target_id}",
+                timeout=5,
+            )
+        except (urllib.error.URLError, TimeoutError, OSError):
+            pass
+
     def navigate(self, target: dict, url: str) -> None:
         self._command(target, "Page.navigate", {"url": url})
 

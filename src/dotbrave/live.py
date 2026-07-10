@@ -43,6 +43,19 @@ def _page_target(client: CdpClient) -> dict:
     sys.exit("error: live apply found no page target to drive Brave")
 
 
+def _worker_target(client: CdpClient) -> tuple[dict, bool]:
+    """A page target for driving privileged UI pages.
+
+    Prefer a dedicated new tab so no user tab gets navigated away (the
+    caller closes it afterwards); fall back to reusing an existing page
+    on endpoints that refuse /json/new -- that one is never closed.
+    """
+    try:
+        return client.create_page("about:blank"), True
+    except RuntimeError:
+        return _page_target(client), False
+
+
 def _is_shortcut_path(parts: tuple[str, ...]) -> bool:
     return parts[:2] in {
         shortcuts_mod.ACCELERATORS_KEY_PATH,
@@ -235,39 +248,43 @@ def apply_live(port: int, prefs_path: Path, prefs: dict, plans: list[Plan]) -> N
     changes = _setting_changes(prefs, target_prefs)
     newtab_changes, ordinary_changes = _route_settings(changes)
     client = CdpClient(port)
-    target = _page_target(client)
-    unsupported = _preflight_settings(
-        client, target, newtab_changes, ordinary_changes
-    )
-    if unsupported:
-        raise _live.LiveApplyUnsupported("Brave", unsupported)
+    target, created = _worker_target(client)
+    try:
+        unsupported = _preflight_settings(
+            client, target, newtab_changes, ordinary_changes
+        )
+        if unsupported:
+            raise _live.LiveApplyUnsupported("Brave", unsupported)
 
-    has_pref_changes = any(
-        not plan.empty and plan.namespace in {"settings", "shortcuts"}
-        for plan in plans
-    )
-    if has_pref_changes:
-        _live.backup_preferences(prefs_path)
+        has_pref_changes = any(
+            not plan.empty and plan.namespace in {"settings", "shortcuts"}
+            for plan in plans
+        )
+        if has_pref_changes:
+            _live.backup_preferences(prefs_path)
 
-    _live.apply_external_plans(plans)
+        _live.apply_external_plans(plans)
 
-    newtab_script = _newtab_script(newtab_changes)
-    if newtab_script is not None:
-        client.navigate(target, _NEWTAB_URL)
-        time.sleep(0.5)
-        client.evaluate(target, newtab_script)
+        newtab_script = _newtab_script(newtab_changes)
+        if newtab_script is not None:
+            client.navigate(target, _NEWTAB_URL)
+            time.sleep(0.5)
+            client.evaluate(target, newtab_script)
 
-    settings_script = _settings_script(ordinary_changes)
-    if settings_script is not None:
-        client.navigate(target, _SETTINGS_URL)
-        time.sleep(0.5)
-        client.evaluate(target, settings_script)
+        settings_script = _settings_script(ordinary_changes)
+        if settings_script is not None:
+            client.navigate(target, _SETTINGS_URL)
+            time.sleep(0.5)
+            client.evaluate(target, settings_script)
 
-    shortcut_script = _shortcut_script(prefs, target_prefs)
-    if shortcut_script is not None:
-        client.navigate(target, _SHORTCUTS_URL)
-        time.sleep(0.5)
-        client.evaluate(target, shortcut_script)
+        shortcut_script = _shortcut_script(prefs, target_prefs)
+        if shortcut_script is not None:
+            client.navigate(target, _SHORTCUTS_URL)
+            time.sleep(0.5)
+            client.evaluate(target, shortcut_script)
 
-    _live.write_state_files(plans)
+        _live.write_state_files(plans)
+    finally:
+        if created:
+            client.close_page(target)
     print("ok -- live applied through Brave DevTools endpoint")

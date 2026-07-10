@@ -432,6 +432,42 @@ class BrowserProcess:
         self._spawn_detached(cmdline)
         return cmdline
 
+    def _spawn_via_console_trampoline(self, cmdline: list[str]) -> bool:
+        """Launch ``cmdline`` in the desktop session via a .ps1 script.
+
+        Start-Process detaches (the trampoline returns right away
+        instead of blocking until the browser exits) and, because the
+        arguments live in a script file run with ``-File``, they never
+        pass through cmd.exe tokenization -- an inline ``-Command``
+        loses the embedded quotes that keep space-containing arguments
+        (``--user-data-dir=...``) whole, silently splitting them.
+        """
+        import tempfile
+
+        exe = cmdline[0].replace("'", "''")
+        lines = [f"$exe = '{exe}'"]
+        if len(cmdline) > 1:
+            args = ",".join(
+                "'\"" + a.replace("'", "''") + "\"'" for a in cmdline[1:]
+            )
+            lines.append(f"Start-Process -FilePath $exe -ArgumentList {args}")
+        else:
+            lines.append("Start-Process -FilePath $exe")
+        script = Path(tempfile.gettempdir()) / f"dotbrave-launch-{os.getpid()}.ps1"
+        try:
+            script.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except OSError:
+            return False
+        try:
+            return _run_in_console_session(
+                f'powershell -NoProfile -ExecutionPolicy Bypass -File "{script}"'
+            ) is not None
+        finally:
+            try:
+                script.unlink()
+            except OSError:
+                pass
+
     def _spawn_detached(self, cmdline: list[str]) -> None:
         """Launch a browser command line without waiting for it.
 
@@ -440,20 +476,7 @@ class BrowserProcess:
         appears on the user's desktop instead of an invisible session.
         """
         if _is_windows() and _windows_console_session_mismatch():
-            # Start-Process detaches (the trampoline script returns right
-            # away instead of blocking until the browser exits) and keeps
-            # argument boundaries intact -- batch `start` strips quotes
-            # around arguments containing spaces, which silently drops
-            # --user-data-dir and with it the debug endpoint.
-            exe = cmdline[0].replace("'", "''")
-            ps = f"powershell -NoProfile -Command \"Start-Process -FilePath '{exe}'"
-            if len(cmdline) > 1:
-                args = ",".join(
-                    "'\"" + a.replace("'", "''") + "\"'" for a in cmdline[1:]
-                )
-                ps += f" -ArgumentList {args}"
-            ps += "\""
-            if _run_in_console_session(ps) is not None:
+            if self._spawn_via_console_trampoline(cmdline):
                 return
         subprocess.Popen(
             cmdline,

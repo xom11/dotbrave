@@ -160,10 +160,16 @@ def test_launch_live_routes_through_trampoline_cross_session(
         proc_mod, "_windows_console_session_mismatch", lambda: True
     )
     calls: list[str] = []
-    monkeypatch.setattr(
-        proc_mod, "_run_in_console_session",
-        lambda cmd: calls.append(cmd) or True,
-    )
+    scripts: list[str] = []
+
+    def capture(cmd: str) -> str:
+        calls.append(cmd)
+        # The .ps1 exists only while the trampoline runs -- read it now.
+        path = cmd.split('-File "', 1)[1].rstrip('"')
+        scripts.append(Path(path).read_text(encoding="utf-8"))
+        return ""
+
+    monkeypatch.setattr(proc_mod, "_run_in_console_session", capture)
     monkeypatch.setattr(
         proc_mod.subprocess, "Popen",
         lambda *a, **k: pytest.fail("Popen must not run cross-session"),
@@ -172,13 +178,14 @@ def test_launch_live_routes_through_trampoline_cross_session(
     root = tmp_path / "User Data"  # space: the quoting trap
     cmdline = bp.launch_live(root, "Default", 9333)
     assert len(calls) == 1
-    # Start-Process detaches AND preserves argument boundaries -- `start`
-    # in a batch file strips the quotes around args with spaces, which
-    # silently drops --user-data-dir and with it the debug endpoint.
-    assert calls[0].startswith("powershell -NoProfile -Command \"Start-Process")
-    assert f"-FilePath '{exe}'" in calls[0]
-    assert f"'\"--user-data-dir={root}\"'" in calls[0]
-    assert "'\"--remote-debugging-port=9333\"'" in calls[0]
+    # The launch goes through a .ps1 file: inline -Command passes through
+    # cmd.exe tokenization, which strips the embedded quotes that keep
+    # space-containing arguments (--user-data-dir=...) whole.
+    assert "-ExecutionPolicy Bypass -File" in calls[0]
+    script = scripts[0]
+    assert "-FilePath $exe" in script and str(exe) in script
+    assert f"'\"--user-data-dir={root}\"'" in script
+    assert "'\"--remote-debugging-port=9333\"'" in script
     assert "--remote-debugging-port=9333" in " ".join(cmdline)
 
 
@@ -193,17 +200,22 @@ def test_restart_routes_through_trampoline_cross_session(
         proc_mod, "_windows_console_session_mismatch", lambda: True
     )
     calls: list[str] = []
-    monkeypatch.setattr(
-        proc_mod, "_run_in_console_session",
-        lambda cmd: calls.append(cmd) or True,
-    )
+    scripts: list[str] = []
+
+    def capture(cmd: str) -> str:
+        calls.append(cmd)
+        path = cmd.split('-File "', 1)[1].rstrip('"')
+        scripts.append(Path(path).read_text(encoding="utf-8"))
+        return ""
+
+    monkeypatch.setattr(proc_mod, "_run_in_console_session", capture)
     monkeypatch.setattr(
         proc_mod.subprocess, "Popen",
         lambda *a, **k: pytest.fail("Popen must not run cross-session"),
     )
     bp = _bp()
     bp.restart([str(exe)])
-    assert calls and f"-FilePath '{exe}'" in calls[0]
+    assert calls and scripts and str(exe) in scripts[0]
 
 
 def test_launch_live_popen_same_session(
