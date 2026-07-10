@@ -85,9 +85,13 @@ Preserve these contracts unless a change explicitly redesigns them:
    verified offline apply, and relaunch. A diff whose only changes are
    `[pwa]` never touches the running browser: the policy is written
    directly (no endpoint bootstrap) and Brave loads it at next launch.
-6. `export` intentionally omits `[settings]` (Chromium has no defaults
-   table for arbitrary prefs). It emits `[shortcuts]` diffs against
-   `brave.default_accelerators` plus `[pwa]`.
+6. `export` emits `[shortcuts]` diffs against `brave.default_accelerators`,
+   `[pwa]`, and -- only when a `settings snapshot` baseline sidecar exists --
+   a `[settings]` block: currently-managed keys (so re-applying the export
+   cannot reset them) plus keys changed since the snapshot, with
+   MAC-protected changes as comments. There is no defaults table for
+   arbitrary prefs, so no snapshot means no `[settings]` block. `export`
+   never consumes the snapshot; `restore` does not delete it.
 7. `restore` restores Preferences backups and clears shortcut/settings
    sidecars. If Brave is running, it closes normally and restarts; it does
    not roll back external `[pwa]` policy.
