@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -172,6 +173,13 @@ def test_plain_live_apply_unsupported_setting_falls_back_without_force_kill(
 
 
 def _sudo_preflight_ok(monkeypatch: pytest.MonkeyPatch) -> None:
+    if sys.platform == "win32":
+        # Windows escalates through IsUserAnAdmin(), not sudo.
+        import ctypes
+
+        monkeypatch.setattr(ctypes.windll.shell32, "IsUserAnAdmin", lambda: 1)
+        return
+
     import subprocess
 
     def fake_run(cmd, *args, **kwargs):
