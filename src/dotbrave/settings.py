@@ -49,17 +49,42 @@ def cmd_snapshot(args: argparse.Namespace) -> None:
 # ever needs additions for new features -- a missing entry means a key is
 # absent from export, never wrong output.
 KNOWN_SETTINGS: tuple[str, ...] = (
+    # Appearance / window chrome
+    "auto_pin_new_tab_groups",
     "bookmark_bar.",
+    "brave.always_show_bookmark_bar_on_ntp",
+    "brave.location_bar_is_wide",
+    "brave.show_bookmarks_button",
+    "brave.show_side_panel_button",
+    "browser.custom_chrome_frame",
+    "browser.show_home_button",
+    # Tabs / window behavior
     "brave.tabs.",
+    "brave.mru_cycling_enabled",
+    "brave.enable_closing_last_tab",
+    "brave.enable_window_closing_confirm",
+    "brave.show_fullscreen_reminder",
+    # New Tab Page
     "brave.new_tab_page.show_",
     "brave.new_tab_page.hide_all_widgets",
-    "brave.location_bar_is_wide",
-    "brave.show_side_panel_button",
-    "brave.today.should_show_toolbar_button",
+    "brave.brave_search.show-ntp-",
+    "ntp.shortcust_visible",  # (sic -- the typo is Chromium's own)
+    # Toolbar / location-bar buttons
+    "brave.ai_chat.autocomplete_provider_enabled",
+    "brave.ai_chat.context_menu_enabled",
+    "brave.ai_chat.show_toolbar_button",
+    "brave.brave_vpn.show_button",
+    "brave.rewards.show_brave_rewards_button_in_location_bar",
     "brave.today.opted_in",
+    "brave.today.should_show_toolbar_button",
+    "brave.wallet.show_wallet_icon_on_toolbar",
+    # Feature toggles
+    "brave.de_amp.enabled",
+    "brave.shields.advanced_view_enabled",
+    "brave.speedreader.enabled",
     "brave.wayback_machine_enabled",
+    # Omnibox
     "omnibox.prevent_url_elisions",
-    "browser.show_home_button",
 )
 
 

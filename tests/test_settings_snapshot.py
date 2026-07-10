@@ -281,6 +281,25 @@ def test_export_lines_known_settings_without_snapshot(
     assert "changed since snapshot" not in body
 
 
+def test_known_settings_cover_example_configs() -> None:
+    """Every [settings] key shipped in examples/ must be matched by the
+    allowlist, so `export` round-trips the configs we advertise without
+    needing a snapshot."""
+    from dotbrave.settings import KNOWN_SETTINGS
+
+    examples = Path(__file__).resolve().parents[1] / "examples"
+    keys: set[str] = set()
+    for toml_file in examples.glob("*.toml"):
+        doc = tomllib.loads(toml_file.read_text(encoding="utf-8"))
+        keys |= set(doc.get("settings", {}))
+    assert keys, "examples/ should carry [settings] keys"
+
+    uncovered = sorted(
+        k for k in keys if not any(k.startswith(p) for p in KNOWN_SETTINGS)
+    )
+    assert uncovered == [], f"extend KNOWN_SETTINGS for: {uncovered}"
+
+
 def test_known_prefix_metrics_still_filtered(
     fake_settings_profile_root: Path,
 ) -> None:
