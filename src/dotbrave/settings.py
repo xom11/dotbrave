@@ -42,5 +42,11 @@ def cmd_snapshot(args: argparse.Namespace) -> None:
     _base.cmd_snapshot("brave", args)
 
 
+def build_export_lines(
+    args: argparse.Namespace, prefs_path: Path, prefs: dict
+) -> list[str] | None:
+    return _base.build_export_lines("brave", args, prefs_path, prefs)
+
+
 def register(subparsers: argparse._SubParsersAction, profile_args) -> None:
     _base.register("brave", subparsers, profile_args)

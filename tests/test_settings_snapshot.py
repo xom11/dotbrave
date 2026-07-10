@@ -190,3 +190,180 @@ def test_is_volatile_prefix_and_leaf_names() -> None:
     )
     # `session` (singular) holds real user settings -- must NOT be filtered.
     assert not base_settings._is_volatile(("session", "restore_on_startup"))
+
+
+# ---------------------------------------------------------------------------
+# build_export_lines
+# ---------------------------------------------------------------------------
+
+def _snapshot_then_mutate(
+    profile_root: Path, mutate
+) -> tuple[Path, dict]:
+    """Take a snapshot, apply `mutate(prefs)` to Preferences, reload."""
+    brave_settings.cmd_snapshot(_args(profile_root, clear=False))
+    prefs_path = find_preferences(profile_root, "Default")
+    prefs = load_prefs(prefs_path)
+    mutate(prefs)
+    prefs_path.write_text(json.dumps(prefs))
+    return prefs_path, load_prefs(prefs_path)
+
+
+def test_export_lines_none_without_snapshot(
+    fake_settings_profile_root: Path,
+) -> None:
+    prefs_path = find_preferences(fake_settings_profile_root, "Default")
+    prefs = load_prefs(prefs_path)
+    args = _args(fake_settings_profile_root)
+    assert brave_settings.build_export_lines(args, prefs_path, prefs) is None
+
+
+def test_export_lines_diff_since_snapshot(
+    fake_settings_profile_root: Path, capsys: pytest.CaptureFixture
+) -> None:
+    def mutate(prefs: dict) -> None:
+        prefs["brave"]["tabs"]["vertical_tabs_enabled"] = True   # changed
+        prefs["omnibox"] = {"prevent_url_elisions": True}        # added subtree
+        prefs["sessions"] = {"event_log": [1, 2, 3]}             # volatile: hidden
+
+    prefs_path, prefs = _snapshot_then_mutate(fake_settings_profile_root, mutate)
+    lines = brave_settings.build_export_lines(
+        _args(fake_settings_profile_root), prefs_path, prefs
+    )
+    assert lines is not None and lines[0] == "[settings]"
+    body = "\n".join(lines)
+    doc = tomllib.loads(body)
+    assert doc["settings"]["brave.tabs.vertical_tabs_enabled"] is True
+    assert doc["settings"]["omnibox.prevent_url_elisions"] is True
+    assert "sessions" not in body
+    assert "changed since snapshot" in body
+
+
+def test_export_lines_includes_managed_keys(
+    fake_settings_profile_root: Path,
+) -> None:
+    prefs_path = find_preferences(fake_settings_profile_root, "Default")
+    # Simulate a prior apply that manages one key.
+    base_settings._state_file(prefs_path).write_text(
+        json.dumps({"managed_keys": ["bookmark_bar.show_tab_groups"]})
+    )
+
+    def mutate(prefs: dict) -> None:
+        prefs["brave"]["tabs"]["vertical_tabs_enabled"] = True
+
+    prefs_path, prefs = _snapshot_then_mutate(fake_settings_profile_root, mutate)
+    lines = brave_settings.build_export_lines(
+        _args(fake_settings_profile_root), prefs_path, prefs
+    )
+    doc = tomllib.loads("\n".join(lines))
+    # Managed key present at its current value + the UI-changed key.
+    assert doc["settings"]["bookmark_bar.show_tab_groups"] is False
+    assert doc["settings"]["brave.tabs.vertical_tabs_enabled"] is True
+    assert "# currently managed by dotbrave" in "\n".join(lines)
+
+
+def test_export_lines_managed_key_not_duplicated_when_changed(
+    fake_settings_profile_root: Path,
+) -> None:
+    prefs_path = find_preferences(fake_settings_profile_root, "Default")
+    base_settings._state_file(prefs_path).write_text(
+        json.dumps({"managed_keys": ["bookmark_bar.show_tab_groups"]})
+    )
+
+    def mutate(prefs: dict) -> None:
+        prefs["bookmark_bar"]["show_tab_groups"] = True  # managed AND changed
+
+    prefs_path, prefs = _snapshot_then_mutate(fake_settings_profile_root, mutate)
+    lines = brave_settings.build_export_lines(
+        _args(fake_settings_profile_root), prefs_path, prefs
+    )
+    body = "\n".join(lines)
+    doc = tomllib.loads(body)  # would raise on a duplicate TOML key
+    assert doc["settings"]["bookmark_bar.show_tab_groups"] is True
+
+
+def test_export_lines_zero_diff_still_emits_managed_block(
+    fake_settings_profile_root: Path,
+) -> None:
+    prefs_path = find_preferences(fake_settings_profile_root, "Default")
+    base_settings._state_file(prefs_path).write_text(
+        json.dumps({"managed_keys": ["bookmark_bar.show_tab_groups"]})
+    )
+    prefs_path, prefs = _snapshot_then_mutate(
+        fake_settings_profile_root, lambda prefs: None
+    )
+    lines = brave_settings.build_export_lines(
+        _args(fake_settings_profile_root), prefs_path, prefs
+    )
+    body = "\n".join(lines)
+    assert "no changes since snapshot" in body
+    doc = tomllib.loads(body)
+    assert doc["settings"]["bookmark_bar.show_tab_groups"] is False
+
+
+def test_export_lines_mac_protected_change_is_comment(
+    fake_settings_profile_root: Path,
+) -> None:
+    def mutate(prefs: dict) -> None:
+        # browser.show_home_button is MAC-protected in the fixture.
+        prefs["browser"]["show_home_button"] = False
+
+    prefs_path, prefs = _snapshot_then_mutate(fake_settings_profile_root, mutate)
+    lines = brave_settings.build_export_lines(
+        _args(fake_settings_profile_root), prefs_path, prefs
+    )
+    body = "\n".join(lines)
+    doc = tomllib.loads(body)
+    assert "browser.show_home_button" not in doc.get("settings", {})
+    assert "MAC-protected" in body
+    assert "browser.show_home_button" in body
+
+
+def test_export_lines_secure_prefs_change_is_comment(
+    fake_settings_profile_root: Path,
+) -> None:
+    secure = fake_settings_profile_root / "Default" / "Secure Preferences"
+    secure.write_text(json.dumps({"homepage": "https://old.example"}))
+    brave_settings.cmd_snapshot(_args(fake_settings_profile_root, clear=False))
+    secure.write_text(json.dumps({"homepage": "https://new.example"}))
+
+    prefs_path = find_preferences(fake_settings_profile_root, "Default")
+    prefs = load_prefs(prefs_path)
+    lines = brave_settings.build_export_lines(
+        _args(fake_settings_profile_root), prefs_path, prefs
+    )
+    body = "\n".join(lines)
+    doc = tomllib.loads(body)
+    assert "homepage" not in doc.get("settings", {})
+    assert "MAC-protected" in body and "homepage" in body
+
+
+def test_export_lines_removed_leaf_is_comment(
+    fake_settings_profile_root: Path,
+) -> None:
+    def mutate(prefs: dict) -> None:
+        del prefs["some"]["unrelated"]
+
+    prefs_path, prefs = _snapshot_then_mutate(fake_settings_profile_root, mutate)
+    lines = brave_settings.build_export_lines(
+        _args(fake_settings_profile_root), prefs_path, prefs
+    )
+    body = "\n".join(lines)
+    doc = tomllib.loads(body)
+    assert "some.unrelated" not in doc.get("settings", {})
+    assert "removed since the snapshot" in body
+
+
+def test_export_lines_unrepresentable_value_is_comment(
+    fake_settings_profile_root: Path,
+) -> None:
+    def mutate(prefs: dict) -> None:
+        prefs["weird"] = None  # TOML has no null
+
+    prefs_path, prefs = _snapshot_then_mutate(fake_settings_profile_root, mutate)
+    lines = brave_settings.build_export_lines(
+        _args(fake_settings_profile_root), prefs_path, prefs
+    )
+    body = "\n".join(lines)
+    doc = tomllib.loads(body)
+    assert "weird" not in doc.get("settings", {})
+    assert "not representable" in body
