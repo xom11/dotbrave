@@ -225,6 +225,72 @@ def cmd_snapshot(browser_name: str, args: argparse.Namespace) -> None:
     )
 
 
+def _walk_leaf_diffs(
+    old: Any, new: Any, prefix: tuple[str, ...] = ()
+) -> Iterator[tuple[tuple[str, ...], Any, Any]]:
+    """Yield ``(parts, old_value, new_value)`` for every leaf that differs.
+
+    A leaf is any non-dict value; added/removed subtrees recurse down to
+    their leaves so each yielded path is directly usable as a [settings]
+    dotted key.  ``_MISSING`` marks a path absent on that side.  A dict
+    replaced by a scalar (or vice versa) is reported at the path where
+    the shapes diverge.
+    """
+    if old == new:
+        return
+    if isinstance(old, dict) and isinstance(new, dict):
+        for k in sorted(set(old) | set(new)):
+            yield from _walk_leaf_diffs(
+                old.get(k, _MISSING), new.get(k, _MISSING), prefix + (k,)
+            )
+        return
+    if isinstance(new, dict) and old is _MISSING:
+        for k in sorted(new):
+            yield from _walk_leaf_diffs(_MISSING, new[k], prefix + (k,))
+        return
+    if isinstance(old, dict) and new is _MISSING:
+        for k in sorted(old):
+            yield from _walk_leaf_diffs(old[k], _MISSING, prefix + (k,))
+        return
+    yield (prefix, old, new)
+
+
+# Subtrees the browser rewrites on its own; diffs under these prefixes are
+# never user-actionable settings.  Note `sessions` (plural, session-restore
+# bookkeeping) is volatile while `session` (singular, e.g.
+# session.restore_on_startup) holds real user settings.
+VOLATILE_PREFIXES: tuple[tuple[str, ...], ...] = (
+    ("protection",),                  # MAC/HMAC bookkeeping
+    ("sessions",),                    # session-restore event log
+    ("sync",),                        # sync machinery state, not user prefs
+    ("browser", "window_placement"),  # window geometry
+    ("in_product_help",),             # IPH counters/timestamps
+    ("zerosuggest",),                 # cached omnibox suggestions
+    ("media_router",),
+    ("gcm",),
+    ("google", "services"),           # account bookkeeping
+    ("signin",),
+    ("invalidation",),
+    ("ntp", "num_personal_suggestions"),
+    ("profile", "last_engagement_time"),
+    ("safebrowsing", "metrics_last_log_time"),
+)
+
+# Leaf names that are timestamps/counters wherever they appear (e.g. every
+# content-settings exception carries a `last_modified`).
+VOLATILE_LEAVES: frozenset[str] = frozenset(
+    {"last_modified", "last_visit", "last_visited_time", "last_used",
+     "lastEngagementTime", "last_engagement_time"}
+)
+
+
+def _is_volatile(parts: tuple[str, ...]) -> bool:
+    for pfx in VOLATILE_PREFIXES:
+        if parts[: len(pfx)] == pfx:
+            return True
+    return parts[-1] in VOLATILE_LEAVES
+
+
 def diff_summary(
     prefs: dict,
     target: dict[str, Any],

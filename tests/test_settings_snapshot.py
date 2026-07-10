@@ -139,3 +139,54 @@ def test_snapshot_subcommand_is_registered() -> None:
     assert args.clear is False
     args = parser.parse_args(["settings", "snapshot", "--clear"])
     assert args.clear is True
+
+
+# ---------------------------------------------------------------------------
+# _walk_leaf_diffs / _is_volatile
+# ---------------------------------------------------------------------------
+
+def _diffs(old: dict, new: dict) -> list[tuple[tuple[str, ...], object, object]]:
+    return list(base_settings._walk_leaf_diffs(old, new))
+
+
+def test_walk_identical_yields_nothing() -> None:
+    prefs = {"a": {"b": 1}, "c": [1, 2]}
+    assert _diffs(prefs, json.loads(json.dumps(prefs))) == []
+
+
+def test_walk_changed_scalar_leaf() -> None:
+    assert _diffs({"a": {"b": 1}}, {"a": {"b": 2}}) == [(("a", "b"), 1, 2)]
+
+
+def test_walk_added_nested_subtree_reports_leaves() -> None:
+    got = _diffs({}, {"brave": {"tabs": {"vertical_tabs_enabled": True}}})
+    assert got == [
+        (("brave", "tabs", "vertical_tabs_enabled"), base_settings._MISSING, True)
+    ]
+
+
+def test_walk_removed_leaf_reports_missing_new() -> None:
+    got = _diffs({"a": {"b": 1}}, {"a": {}})
+    assert got == [(("a", "b"), 1, base_settings._MISSING)]
+
+
+def test_walk_list_change_is_one_leaf() -> None:
+    assert _diffs({"a": [1, 2]}, {"a": [1, 3]}) == [(("a",), [1, 2], [1, 3])]
+
+
+def test_walk_dict_replaced_by_scalar_reports_at_that_path() -> None:
+    assert _diffs({"a": {"b": 1}}, {"a": 5}) == [(("a",), {"b": 1}, 5)]
+
+
+def test_is_volatile_prefix_and_leaf_names() -> None:
+    assert base_settings._is_volatile(("protection", "macs", "homepage"))
+    assert base_settings._is_volatile(("sessions", "event_log"))
+    assert base_settings._is_volatile(("browser", "window_placement", "left"))
+    assert base_settings._is_volatile(
+        ("profile", "content_settings", "x", "last_modified")
+    )
+    assert not base_settings._is_volatile(
+        ("brave", "tabs", "vertical_tabs_enabled")
+    )
+    # `session` (singular) holds real user settings -- must NOT be filtered.
+    assert not base_settings._is_volatile(("session", "restore_on_startup"))
