@@ -652,6 +652,10 @@ def test_restart_windows_uses_known_exe(monkeypatch, tmp_path) -> None:
             captured["cmd"] = cmd
 
     monkeypatch.setattr(bp.subprocess, "Popen", FakePopen)
+    # This test covers exe selection + the plain Popen path; on a real
+    # Windows host reached over SSH the cross-session trampoline would
+    # kick in, so pin it off.
+    monkeypatch.setattr(bp, "_windows_console_session_mismatch", lambda: False)
     used = utils.restart_brave(["captured-cmdline"])
     assert str(brave_exe) in used[0]
     assert captured["cmd"] == used

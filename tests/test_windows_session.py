@@ -168,5 +168,8 @@ def test_launch_live_popen_same_session(
     assert popen_calls and str(exe) == popen_calls[0][0]
 
 
-def test_session_mismatch_is_false_off_windows() -> None:
+def test_session_mismatch_is_false_off_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("sys.platform", "linux")
     assert proc_mod._windows_console_session_mismatch() is False
