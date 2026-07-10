@@ -439,14 +439,14 @@ _EXPORT_HEADER_NOTES = (
     "# profile + managed-policy file:",
     "#",
     "#   [shortcuts] -- bindings that differ from Brave's defaults.",
-    "#   [settings]  -- keys dotbrave already manages plus keys changed since",
-    "#                  the last `dotbrave settings snapshot` (block omitted",
-    "#                  when no snapshot exists).",
+    "#   [settings]  -- well-known user-facing keys, keys dotbrave manages,",
+    "#                  and keys changed since the last `dotbrave export",
+    "#                  --snapshot`.",
     "#   [pwa]       -- URLs currently force-installed via the managed-policy",
     "#                  file / Windows registry.",
     "#",
-    "# To capture settings you change in the browser UI: run `dotbrave",
-    "# settings snapshot`, change settings, then re-run `dotbrave export`.",
+    "# To capture ANY setting you change in the browser UI: run `dotbrave",
+    "# export --snapshot`, change settings, then re-run `dotbrave export`.",
     "#",
     "# Apply this file with: `dotbrave apply <this file>`",
 )
@@ -586,6 +586,12 @@ Safety:
   A changed [pwa] table writes managed policy and may require sudo or
   Administrator privileges.
 
+Undo:
+  `apply --undo` restores the most recent timestamped Preferences backup
+  (each real apply creates one, next to Preferences) and clears dotbrave's
+  shortcut/settings sidecars. [pwa] policy and the `export --snapshot`
+  baseline are left untouched.
+
 Execution:
   {apply_execution_text}""",
         epilog="""\
@@ -596,13 +602,22 @@ explicitly opt in with `--allow-http`.
 Examples:
   dotbrave apply --dry-run brave.toml
   dotbrave apply brave.toml
-  dotbrave apply --expect-sha256 HEX https://example.com/brave.toml""",
+  dotbrave apply --expect-sha256 HEX https://example.com/brave.toml
+  dotbrave apply --undo""",
     )
     leaf_profile_args(a)
     a.add_argument(
         "config",
+        nargs="?",
+        default=None,
         help="path to a local TOML file, or https:// URL to fetch one "
         "(http:// is refused unless --allow-http is set)",
+    )
+    a.add_argument(
+        "--undo",
+        action="store_true",
+        help="restore the most recent apply-time Preferences backup "
+        "instead of applying a config",
     )
     a.add_argument(
         "--expect-sha256",
@@ -623,28 +638,36 @@ Examples:
 
     if cmd_export_fn is not None:
         export_scope = (
-            "[shortcuts] changes versus Brave defaults, [settings] keys "
-            "managed by dotbrave plus keys changed since the last `settings "
-            "snapshot`, and [pwa] force-installed URLs."
+            "[shortcuts] changes versus Brave defaults, [settings] "
+            "well-known keys plus everything dotbrave manages, and [pwa] "
+            "force-installed URLs."
         )
         e = sub.add_parser(
             "export",
-            help="emit exportable customizations as a TOML config",
+            help="emit your current customizations as a TOML config",
             formatter_class=_HELP_FORMATTER,
             description=f"""\
-Export a round-trippable TOML snapshot for {display_name}.
+Export a round-trippable TOML config for {display_name}.
 
 Output: {export_scope}
+The exported file is a valid starter config: save it, edit it, feed it
+back to `apply`.
 
-Chromium exposes no defaults table for arbitrary Preferences keys, so
-[settings] is diffed against a baseline you capture with `settings
-snapshot` before changing settings in the browser UI. Without a snapshot
-the [settings] block is omitted. MAC-protected keys are emitted as
-comments -- `apply` refuses them.""",
+[settings] sources: keys dotbrave already manages, a curated list of
+well-known user-facing keys, and -- when you captured a baseline with
+`export --snapshot` before changing settings in the browser UI -- any
+other key changed since. MAC-protected keys are emitted as comments;
+`apply` refuses them. {display_name} persists Preferences on a delay
+(~10s): wait a few seconds after a UI change, or quit the browser,
+before exporting.
+
+Use `-a` to list every shortcut binding (with command names), not just
+customized ones.""",
             epilog="""\
 Examples:
-  dotbrave export
-  dotbrave export -o brave.toml""",
+  dotbrave export -o brave.toml
+  dotbrave export --snapshot     # then change settings in the Brave UI...
+  dotbrave export                # ...and see them under [settings]""",
         )
         leaf_profile_args(e)
         e.add_argument(

@@ -1,13 +1,9 @@
 """Top-level CLI for dotbrave.
 
 Usage:
-    dotbrave init -o brave.toml
-    dotbrave apply <config>          # writes [shortcuts] + [settings] + [pwa]
-    dotbrave export -o snapshot.toml
-    dotbrave restore --list
-    dotbrave shortcuts dump|list
-    dotbrave settings  dump|blocked
-    dotbrave pwa       dump
+    dotbrave export -o brave.toml    # read current customizations as TOML
+    dotbrave apply brave.toml        # write [shortcuts] + [settings] + [pwa]
+    dotbrave apply --undo            # revert the last apply
 
 Profile options (--channel, -r/--profile-root, -p/--profile) may be given
 before or after the action name; the after-action form wins when both are
@@ -28,8 +24,9 @@ def build_parser() -> argparse.ArgumentParser:
         description="""\
 Manage Brave browser customizations as TOML dotfiles.
 
-Command shape:
-  dotbrave [profile-options] <action> [action-options]
+Two actions:
+  export   read your current customizations as a TOML config
+  apply    write a TOML config back to Brave (or `--undo` the last apply)
 
 Supported TOML tables: [shortcuts] [settings] [pwa]
 
@@ -39,18 +36,19 @@ browser policy. Live apply is attempted when Brave is running; plain
 `apply` manages a local endpoint and normal-close fallback automatically.""",
         epilog="""\
 Typical workflow:
-  dotbrave init -o brave.toml
+  dotbrave export -o brave.toml    # start from your current state
+  (edit brave.toml)
   dotbrave apply --dry-run brave.toml
   dotbrave apply brave.toml
-  dotbrave export -o snapshot.toml
-  dotbrave restore --list
+  dotbrave apply --undo            # roll back if needed
 
 Browser notes:
   `--channel {stable,beta,nightly}` selects the Brave release channel and
-  its profile root. Shortcut names map to Brave command IDs; portable
-  Meta+ bindings are normalized per OS.
+  its profile root. Shortcut names map to Brave command IDs (see them all
+  with `export -a`); portable Meta+ bindings are normalized per OS.
 
-Use `dotbrave <action> --help` for safety details and examples.""",
+Use `dotbrave export --help` / `dotbrave apply --help` for safety details
+and examples.""",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     register(parser)

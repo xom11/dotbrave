@@ -4,13 +4,12 @@ Top-level CLI shape:
 
     dotbrave [--profile-root ...] [--profile ...] <ACTION> ...
 
-Where <ACTION> is one of:
-- ``init`` -- scaffold a commented starter TOML config.
-- ``apply <file>`` -- unified apply for ``[shortcuts]``, ``[settings]``
-  and ``[pwa]`` tables in a single TOML file.
-- ``shortcuts dump|list`` -- read-only inspection (delegated to shortcuts).
-- ``settings dump`` -- read-only inspection (delegated to settings).
-- ``pwa dump`` -- read-only inspection (delegated to pwa).
+Where <ACTION> is one of exactly two verbs:
+- ``export [-o FILE] [-a] [--snapshot [--clear]]`` -- read the current
+  ``[shortcuts]`` + ``[settings]`` + ``[pwa]`` customizations as TOML
+  (or capture/clear the settings baseline).
+- ``apply <file> | --undo`` -- write a TOML config back to Brave, or
+  restore the most recent apply-time Preferences backup.
 """
 from __future__ import annotations
 
@@ -22,7 +21,6 @@ from pathlib import Path
 from dotbrave._base.orchestrator import (
     cmd_apply as _base_cmd_apply,
     cmd_export as _base_cmd_export,
-    cmd_init as _base_cmd_init,
     cmd_restore as _base_cmd_restore,
     register_actions,
 )
@@ -117,59 +115,6 @@ def _build_plans(prefs_path: Path, prefs: dict, doc: dict) -> list[Plan]:
 
 
 # ---------------------------------------------------------------------------
-# Init template
-# ---------------------------------------------------------------------------
-
-_INIT_TEMPLATE = """\
-# dotbrave -- Brave configuration
-# Docs: https://github.com/xom11/dotbrave
-# List available shortcut names:  dotbrave shortcuts list
-# Inspect current settings:       dotbrave settings dump
-#
-# Apply this file:
-#   dotbrave apply {filename}
-#
-# Table semantics:
-#   - missing header  -> module skipped, managed entries left alone.
-#   - empty body      -> all previously-managed entries reset / popped.
-
-[shortcuts]
-# Command names map to Brave accelerators. Values are lists of key combos
-# using Chromium KeyEvent codes (https://www.w3.org/TR/uievents-code/).
-# Meta+ is auto-translated to Cmd on macOS.
-#
-# back                = ["Alt+KeyH"]
-# forward             = ["Alt+KeyL"]
-# select_previous_tab = ["Alt+KeyK"]
-# select_next_tab     = ["Alt+KeyJ"]
-# new_tab             = ["Control+KeyT"]
-# close_tab           = ["Control+KeyW"]
-# reload              = ["Control+KeyR"]
-
-[settings]
-# Keys are dotted paths into Brave's Preferences JSON.
-# MAC-protected keys (homepage, default search, etc.) are refused -- set those
-# in the Brave UI.
-#
-# "brave.tabs.vertical_tabs_enabled"   = true
-# "brave.tabs.vertical_tabs_collapsed" = true
-# "omnibox.prevent_url_elisions"       = true
-# "brave.new_tab_page.show_stats"      = false
-# "brave.new_tab_page.show_brave_news" = false
-
-# [pwa]
-# Force-installed Progressive Web Apps via Chromium enterprise policy.
-# Requires sudo (Linux/macOS) or Administrator (Windows); a running Brave
-# is left untouched and picks the change up at its next launch.
-# Uncomment the header and add URLs to enable.
-#
-# urls = [
-#   "https://squoosh.app/",
-# ]
-"""
-
-
-# ---------------------------------------------------------------------------
 # Channel-aware argument resolution
 # ---------------------------------------------------------------------------
 
@@ -241,11 +186,22 @@ def _normalize_brave_args(args: argparse.Namespace) -> None:
 def cmd_apply(args: argparse.Namespace) -> None:
     """Unified apply for Brave.
 
-    For ``--channel stable`` we keep the module-level callbacks so
-    tests can monkeypatch ``brave_pkg.brave_running`` etc.  For
+    ``--undo`` routes to the restore engine (most recent Preferences
+    backup).  For ``--channel stable`` we keep the module-level callbacks
+    so tests can monkeypatch ``brave_pkg.brave_running`` etc.  For
     beta/nightly we use a freshly built BrowserProcess (those channels
     have no test coverage today).
     """
+    if getattr(args, "undo", False):
+        if getattr(args, "config", None):
+            sys.exit("error: --undo takes no CONFIG argument")
+        args.from_path = None
+        args.list = False
+        cmd_restore(args)
+        return
+    if not getattr(args, "config", None):
+        sys.exit("error: CONFIG is required (or pass --undo)")
+
     channel = getattr(args, "channel", "stable")
     if channel == "stable":
         _base_cmd_apply(
@@ -274,10 +230,6 @@ def cmd_apply(args: argparse.Namespace) -> None:
         graceful_close_fn=proc.close_and_wait,
         launch_live_fn=proc.launch_live,
     )
-
-
-def cmd_init(args: argparse.Namespace) -> None:
-    _base_cmd_init(args, "brave", _INIT_TEMPLATE)
 
 
 def _export_shortcuts(args: argparse.Namespace, prefs_path: Path, prefs: dict) -> list[str]:
@@ -352,15 +304,9 @@ def register(parser: argparse.ArgumentParser) -> None:
         display_name="Brave",
         namespaces=("shortcuts", "settings", "pwa"),
         cmd_apply_fn=cmd_apply,
-        cmd_init_fn=cmd_init,
-        cmd_restore_fn=cmd_restore,
         cmd_export_fn=cmd_export,
         export_has_shortcuts=True,
-        module_registers=[
-            shortcuts_mod.register,
-            settings_mod.register,
-            pwa_mod.register,
-        ],
+        module_registers=[],
         setup_profile_args=_setup_brave_profile_args,
         normalize_args=_normalize_brave_args,
     )

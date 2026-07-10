@@ -1,8 +1,8 @@
 """Smoke tests against the real on-disk Brave profile (read-only).
 
 Skipped automatically if no Brave profile is present (CI, fresh machine,
-non-supported OS). Never modifies Preferences — only invokes `list`,
-`dump`, and `apply --dry-run`.
+non-supported OS). Never modifies Preferences — only invokes `export`
+and `apply --dry-run`.
 """
 from __future__ import annotations
 
@@ -46,25 +46,25 @@ def test_help_does_not_crash() -> None:
 def test_root_help_lists_actions() -> None:
     r = _run("--help")
     assert r.returncode == 0
-    # Top-level apply + the two read-only inspection sub-namespaces
+    # Exactly the two verbs.
     assert "apply" in r.stdout
-    assert "shortcuts" in r.stdout
-    assert "settings" in r.stdout
-
-
-def test_list_returns_known_commands() -> None:
-    r = _run("shortcuts", "list", "focus")
-    # `list` does NOT need a profile; it just prints the static mapping
-    assert r.returncode == 0, r.stderr
-    assert "focus_location" in r.stdout
+    assert "export" in r.stdout
 
 
 @requires_brave_profile
-def test_dump_real_profile_succeeds() -> None:
-    r = _run("shortcuts", "dump")
+def test_export_real_profile_succeeds() -> None:
+    r = _run("export")
     assert r.returncode == 0, r.stderr
-    # `dump` always emits a [shortcuts] header
     assert "[shortcuts]" in r.stdout
+    assert "[settings]" in r.stdout
+
+
+@requires_brave_profile
+def test_export_all_shortcuts_lists_command_names() -> None:
+    """`export -a` is the shortcut-name discovery path now."""
+    r = _run("export", "-a")
+    assert r.returncode == 0, r.stderr
+    assert "new_tab" in r.stdout
 
 
 @requires_brave_profile

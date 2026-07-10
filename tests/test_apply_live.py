@@ -154,21 +154,18 @@ def test_apply_unknown_command_errors(fake_profile_root: Path, tmp_path: Path) -
 
 
 def test_dump_and_list_against_fake_profile(fake_profile_root: Path) -> None:
-    """`list` is static; `dump` reads the fake profile's accelerators."""
-    r = _run_cli(fake_profile_root, "shortcuts", "list", "focus")
-    assert r.returncode == 0
-    assert "focus_location" in r.stdout
-
-    # `dump` (no --all) only emits user-overridden entries; the fixture
-    # has focus_location overridden but new_tab matching default.
-    r = _run_cli(fake_profile_root, "shortcuts", "dump")
+    """`export` reads the fake profile's accelerators; `-a` lifts the
+    user-overridden-only filter (shortcut-name discovery path)."""
+    # Plain export only emits user-overridden entries; the fixture has
+    # focus_location overridden but new_tab matching default.
+    r = _run_cli(fake_profile_root, "export")
     assert r.returncode == 0
     assert "focus_location" in r.stdout
     # new_tab matches default in the fixture, so it should NOT appear
     assert "new_tab" not in r.stdout
 
-    # `dump --all` should include every binding in accelerators
-    r = _run_cli(fake_profile_root, "shortcuts", "dump", "--all")
+    # `export -a` should include every binding in accelerators
+    r = _run_cli(fake_profile_root, "export", "-a")
     assert r.returncode == 0
     assert "focus_location" in r.stdout
     assert "new_tab" in r.stdout

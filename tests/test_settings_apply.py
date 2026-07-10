@@ -14,6 +14,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from dotbrave import browser as brave_pkg
 from dotbrave import settings as st
 
@@ -57,6 +59,23 @@ def _apply(profile_root: Path, config: Path) -> None:
         dry_run=False,
     )
     brave_pkg.cmd_apply(args)
+
+
+# `settings dump|blocked` lost their CLI entry points when the surface
+# collapsed to apply/export; the engine behavior they cover still backs
+# the [settings] export block, so drive the functions in-process.
+
+def _dump(profile_root: Path, *keys: str, output: str | None = None) -> None:
+    st.cmd_dump(argparse.Namespace(
+        profile_root=profile_root, profile="Default",
+        keys=list(keys), output=output,
+    ))
+
+
+def _blocked(profile_root: Path, output: str | None = None) -> None:
+    st.cmd_blocked(argparse.Namespace(
+        profile_root=profile_root, profile="Default", output=output,
+    ))
 
 
 def test_apply_writes_then_drops(
@@ -193,7 +212,8 @@ def test_apply_creates_missing_nested_path(
 
 
 def test_dump_managed_keys_round_trip(
-    fake_settings_profile_root: Path, tmp_path: Path, monkeypatch
+    fake_settings_profile_root: Path, tmp_path: Path, monkeypatch,
+    capsys: pytest.CaptureFixture,
 ) -> None:
     """`dump` (no args) should emit a TOML doc that, when parsed, has
     exactly the managed keys with their current values."""
@@ -209,55 +229,54 @@ def test_dump_managed_keys_round_trip(
     )
     _apply(fake_settings_profile_root, cfg)
 
-    r = _run_cli(fake_settings_profile_root, "settings", "dump")
-    assert r.returncode == 0, r.stderr
+    capsys.readouterr()  # discard apply output
+    _dump(fake_settings_profile_root)
 
     if sys.version_info >= (3, 11):
         import tomllib
     else:
         import tomli as tomllib  # type: ignore
-    parsed = tomllib.loads(r.stdout)
+    parsed = tomllib.loads(capsys.readouterr().out)
     assert parsed["settings"] == {
         "brave.tabs.vertical_tabs_enabled": True,
         "bookmark_bar.show_tab_groups": True,
     }
 
 
-def test_dump_explicit_keys(fake_settings_profile_root: Path) -> None:
+def test_dump_explicit_keys(
+    fake_settings_profile_root: Path, capsys: pytest.CaptureFixture
+) -> None:
     """`dump <key>...` should emit those exact keys regardless of state."""
-    r = _run_cli(
+    _dump(
         fake_settings_profile_root,
-        "settings",
-        "dump",
         "brave.tabs.vertical_tabs_enabled",
         "bookmark_bar.show_tab_groups",
         "missing.never.set",
     )
-    assert r.returncode == 0, r.stderr
-    assert '"brave.tabs.vertical_tabs_enabled" = false' in r.stdout
-    assert '"bookmark_bar.show_tab_groups" = false' in r.stdout
+    out = capsys.readouterr().out
+    assert '"brave.tabs.vertical_tabs_enabled" = false' in out
+    assert '"bookmark_bar.show_tab_groups" = false' in out
     # Missing keys are reported as a comment, not silently emitted
-    assert "missing.never.set" in r.stdout
-    assert "# keys not present" in r.stdout
+    assert "missing.never.set" in out
+    assert "# keys not present" in out
 
 
 def test_dump_no_managed_errors(fake_settings_profile_root: Path) -> None:
     """First-run `dump` (no state file, no args) should fail loudly so
     the user knows to pass keys explicitly."""
-    r = _run_cli(fake_settings_profile_root, "settings", "dump")
-    assert r.returncode != 0
-    assert "no managed keys" in (r.stdout + r.stderr)
+    with pytest.raises(SystemExit) as exc:
+        _dump(fake_settings_profile_root)
+    assert "no managed keys" in str(exc.value)
 
 
 def test_blocked_lists_mac_protected_keys(
-    fake_settings_profile_root: Path,
+    fake_settings_profile_root: Path, capsys: pytest.CaptureFixture
 ) -> None:
     """`settings blocked` walks protection.macs and lists every tracked
     leaf as commented TOML, with the current value when present."""
-    r = _run_cli(fake_settings_profile_root, "settings", "blocked")
-    assert r.returncode == 0, r.stderr
+    _blocked(fake_settings_profile_root)
 
-    out = r.stdout
+    out = capsys.readouterr().out
     assert "MAC-protected" in out
     assert "[settings]" in out
     # Both tracked leaves from the fixture are listed.
@@ -272,26 +291,24 @@ def test_blocked_lists_mac_protected_keys(
     assert "true" in out  # browser.show_home_button
 
 
-def test_blocked_handles_no_protection_subtree(tmp_path: Path) -> None:
+def test_blocked_handles_no_protection_subtree(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
     """A profile with no `protection.macs` should report cleanly,
     not crash."""
     profile = tmp_path / "Default"
     profile.mkdir()
     (profile / "Preferences").write_text(json.dumps({"some": "thing"}))
 
-    r = _run_cli(tmp_path, "settings", "blocked")
-    assert r.returncode == 0, r.stderr
-    assert "no MAC-protected keys" in r.stdout
+    _blocked(tmp_path)
+    assert "no MAC-protected keys" in capsys.readouterr().out
 
 
 def test_blocked_writes_to_output_file(
     fake_settings_profile_root: Path, tmp_path: Path
 ) -> None:
     out_file = tmp_path / "blocked.toml"
-    r = _run_cli(
-        fake_settings_profile_root, "settings", "blocked", "-o", str(out_file)
-    )
-    assert r.returncode == 0, r.stderr
+    _blocked(fake_settings_profile_root, output=str(out_file))
     assert out_file.exists()
     content = out_file.read_text()
     assert '"browser.show_home_button"' in content

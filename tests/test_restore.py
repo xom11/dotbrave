@@ -210,13 +210,61 @@ def test_list_with_no_backups_does_not_crash(
     assert "no backups found" in capsys.readouterr().out
 
 
-def test_cli_restore_help_lists_flags() -> None:
-    """Smoke test the argparse wiring -- restore must appear in `--help`
-    with --from / --list / --dry-run but no removed force-kill switch."""
-    profile = REPO_ROOT  # arbitrary path; --help short-circuits
+def test_cli_restore_action_is_gone() -> None:
+    """The standalone `restore` action was folded into `apply --undo`."""
+    profile = REPO_ROOT  # arbitrary path; argparse rejects before reading it
     r = _run_cli(profile, "restore", "--help")
-    assert r.returncode == 0
-    out = r.stdout
-    for flag in ("--from", "--list", "--dry-run"):
-        assert flag in out
-    assert "--kill-browser" not in out
+    assert r.returncode != 0
+    assert "invalid choice" in r.stderr
+
+
+def test_apply_undo_restores_most_recent_backup(
+    profile_with_backups: tuple[Path, list[Path]],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """`apply --undo` routes to the restore engine: newest backup wins."""
+    profile_root, backups = profile_with_backups
+    monkeypatch.setattr(brave_pkg, "brave_running", lambda: False)
+
+    args = argparse.Namespace(
+        profile_root=profile_root,
+        profile="Default",
+        config=None,
+        undo=True,
+        dry_run=False,
+        channel="stable",
+    )
+    brave_pkg.cmd_apply(args)
+
+    prefs = (profile_root / "Default" / "Preferences").read_text()
+    newest = backups[-1].read_text()
+    assert prefs == newest
+
+
+def test_apply_undo_rejects_config_argument(tmp_path: Path) -> None:
+    args = argparse.Namespace(
+        profile_root=tmp_path,
+        profile="Default",
+        config="some.toml",
+        undo=True,
+        dry_run=False,
+        channel="stable",
+    )
+    with pytest.raises(SystemExit) as exc:
+        brave_pkg.cmd_apply(args)
+    assert "--undo" in str(exc.value)
+
+
+def test_apply_without_config_or_undo_errors(tmp_path: Path) -> None:
+    args = argparse.Namespace(
+        profile_root=tmp_path,
+        profile="Default",
+        config=None,
+        undo=False,
+        dry_run=False,
+        channel="stable",
+    )
+    with pytest.raises(SystemExit) as exc:
+        brave_pkg.cmd_apply(args)
+    assert "CONFIG" in str(exc.value)

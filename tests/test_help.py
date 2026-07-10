@@ -2,7 +2,8 @@
 
 These tests execute the installed CLI surface instead of introspecting
 argparse internals. Help is part of dotbrave's discoverability contract:
-it must report only capabilities the tool actually has.
+it must report only capabilities the tool actually has -- and the tool
+has exactly two actions, `apply` and `export`.
 """
 from __future__ import annotations
 
@@ -38,7 +39,8 @@ def test_root_help_explains_capabilities_and_workflow() -> None:
     assert "--channel" in out
     assert "Typical workflow" in out
     assert "apply --dry-run" in out
-    assert "restore" in out
+    assert "apply --undo" in out
+    assert "export -o" in out
 
 
 def test_help_advertises_automatic_live_apply() -> None:
@@ -68,19 +70,24 @@ def test_removed_apply_flags_are_rejected() -> None:
         assert "unrecognized arguments" in result.stderr
 
 
-def test_export_and_restore_help_state_deliberate_limits() -> None:
+def test_apply_help_covers_undo() -> None:
+    apply_help = _help("apply")
+    assert "--undo" in apply_help
+    assert "backup" in apply_help
+
+
+def test_export_help_covers_settings_sources_and_limits() -> None:
     export = _help("export")
-    restore = _help("restore")
-    # [settings] needs a `settings snapshot` baseline; no snapshot, no block.
-    assert "settings\nsnapshot`" in export
-    assert "[settings] block is omitted" in export
-    assert "[pwa] policy is not restored" in restore
+    assert "well-known" in export
+    assert "--snapshot" in export
+    assert "MAC-protected" in export
+    # Shortcut-name discovery lives here now.
+    assert "-a" in export
 
 
-def test_namespace_help_explains_specialized_discovery() -> None:
-    shortcuts = _help("shortcuts")
-    settings = _help("settings")
-    pwa = _help("pwa")
-    assert "Chromium KeyEvent codes" in shortcuts
-    assert "MAC-protected" in settings
-    assert "managed policy" in pwa
+def test_removed_actions_are_rejected() -> None:
+    """The old action tree is gone: exactly `apply` and `export` remain."""
+    for action in ("init", "restore", "shortcuts", "settings", "pwa"):
+        result = _run(action, "--help")
+        assert result.returncode != 0, f"{action} should be gone"
+        assert "invalid choice" in result.stderr

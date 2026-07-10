@@ -50,7 +50,7 @@ def test_channel_flag_appears_in_help() -> None:
 
 
 def test_invalid_channel_rejected() -> None:
-    r = _run_cli("--channel", "dev", "settings", "dump")
+    r = _run_cli("--channel", "dev", "export")
     assert r.returncode != 0
     assert "invalid choice" in (r.stdout + r.stderr).lower()
 
@@ -60,7 +60,7 @@ def test_channel_beta_resolves_default_profile_root(tmp_path: Path) -> None:
     Brave-Browser-Beta directory and surface its absence as a
     'Preferences not found' error pointing into that directory."""
     env = _isolated_home_env(tmp_path)
-    r = _run_cli("--channel", "beta", "settings", "blocked", env_overrides=env)
+    r = _run_cli("--channel", "beta", "export", env_overrides=env)
     assert r.returncode != 0, r.stdout
     msg = r.stdout + r.stderr
     # The resolver picked the Beta-suffixed path.
@@ -70,7 +70,7 @@ def test_channel_beta_resolves_default_profile_root(tmp_path: Path) -> None:
 def test_channel_default_is_stable(tmp_path: Path) -> None:
     """Omitting --channel must resolve to the stable profile path."""
     env = _isolated_home_env(tmp_path)
-    r = _run_cli("settings", "blocked", env_overrides=env)
+    r = _run_cli("export", env_overrides=env)
     assert r.returncode != 0
     msg = r.stdout + r.stderr
     assert "Brave-Browser" in msg
@@ -88,7 +88,9 @@ def test_explicit_profile_root_wins_over_channel(tmp_path: Path) -> None:
     )
     r = _run_cli(
         "--channel", "nightly", "--profile-root", str(tmp_path),
-        "settings", "blocked",
+        "export",
     )
     assert r.returncode == 0, r.stderr
-    assert '"homepage"' in r.stdout
+    # The export header names the source profile: the explicit root, not
+    # the nightly default.
+    assert f"Source profile: {tmp_path}" in r.stdout
