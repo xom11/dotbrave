@@ -10,8 +10,9 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from dotbrave._base.utils import Plan, find_preferences, load_prefs
 
@@ -161,6 +162,67 @@ def _get_managed_keys(prefs_path: Path) -> set[str]:
     except json.JSONDecodeError:
         return set()
     return set(data.get("managed_keys", []))
+
+
+def _snapshot_file(prefs_path: Path) -> Path:
+    return prefs_path.with_name(
+        prefs_path.name + ".dotbrave.settings-snapshot.json"
+    )
+
+
+def _load_snapshot(prefs_path: Path) -> dict | None:
+    """Load the export baseline written by `settings snapshot`.
+
+    Returns None when no snapshot exists.  A snapshot the user created
+    but that cannot be read is an error, not a silent skip: exporting
+    without the baseline would quietly drop the [settings] block.
+    """
+    snap = _snapshot_file(prefs_path)
+    if not snap.exists():
+        return None
+    try:
+        data = json.loads(snap.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        sys.exit(
+            f"error: unreadable settings snapshot {snap}: {e}\n"
+            "(re-run `dotbrave settings snapshot`, or delete the file)"
+        )
+    if not isinstance(data, dict) or not isinstance(data.get("prefs"), dict):
+        sys.exit(
+            f"error: malformed settings snapshot {snap}\n"
+            "(re-run `dotbrave settings snapshot`, or delete the file)"
+        )
+    data.setdefault("created", "?")
+    if not isinstance(data.get("secure_prefs"), dict):
+        data["secure_prefs"] = {}
+    return data
+
+
+def cmd_snapshot(browser_name: str, args: argparse.Namespace) -> None:
+    prefs_path = find_preferences(args.profile_root, args.profile)
+    snap = _snapshot_file(prefs_path)
+
+    if getattr(args, "clear", False):
+        if snap.exists():
+            snap.unlink()
+            print(f"removed {snap}")
+        else:
+            print(f"no snapshot to remove at {snap}")
+        return
+
+    prefs = load_prefs(prefs_path)
+    created = datetime.now().astimezone().isoformat(timespec="seconds")
+    payload = {
+        "created": created,
+        "prefs": prefs,
+        "secure_prefs": _load_secure_prefs(prefs_path),
+    }
+    snap.write_text(json.dumps(payload), encoding="utf-8")
+    print(f"snapshot saved: {snap} ({created})")
+    print(
+        f"Change settings in the {browser_name.title()} UI, then run "
+        "`dotbrave export` -- its [settings] block will list what changed."
+    )
 
 
 def diff_summary(
@@ -379,12 +441,14 @@ Inspect general {browser_name.title()} Preferences managed through [settings].
 `dump` prints currently managed keys by default, or explicitly requested
 dotted paths. `blocked` lists MAC-protected Preferences keys that
 `dotbrave apply` refuses rather than writing values the
-browser would reset on launch.""",
+browser would reset on launch. `snapshot` captures a baseline so
+`dotbrave export` can emit [settings] keys changed via the browser UI.""",
         epilog="""\
 Examples:
   dotbrave settings dump
   dotbrave settings dump bookmark_bar.show_on_all_tabs
-  dotbrave settings blocked""",
+  dotbrave settings blocked
+  dotbrave settings snapshot""",
     )
     sub = p.add_subparsers(dest="action", required=True, metavar="ACTION")
 
@@ -427,5 +491,31 @@ Example:
     profile_args(b)
     b.add_argument("-o", "--output", help="write to file instead of stdout")
     b.set_defaults(func=lambda args, bn=browser_name: cmd_blocked(bn, args))
+
+    s = sub.add_parser(
+        "snapshot",
+        help="capture a Preferences baseline so `export` can diff [settings]",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=f"""\
+Capture a baseline snapshot of the selected profile's Preferences (and
+Secure Preferences) for `dotbrave export`.
+
+Workflow: run `snapshot`, change settings in the {browser_name.title()} UI,
+then run `dotbrave export` -- its [settings] block lists keys that changed
+since the snapshot.  The snapshot is kept until overwritten by the next
+`snapshot` or deleted with `--clear`; `export` never consumes it.
+
+{browser_name.title()} persists Preferences on a delay (~10s): wait a few
+seconds after changing a setting, or quit the browser, before exporting.""",
+        epilog="""\
+Examples:
+  dotbrave settings snapshot
+  dotbrave settings snapshot --clear""",
+    )
+    profile_args(s)
+    s.add_argument(
+        "--clear", action="store_true", help="delete the stored snapshot"
+    )
+    s.set_defaults(func=lambda args, bn=browser_name: cmd_snapshot(bn, args))
 
     return sub

@@ -38,5 +38,9 @@ def cmd_blocked(args: argparse.Namespace) -> None:
     _base.cmd_blocked("brave", args)
 
 
+def cmd_snapshot(args: argparse.Namespace) -> None:
+    _base.cmd_snapshot("brave", args)
+
+
 def register(subparsers: argparse._SubParsersAction, profile_args) -> None:
     _base.register("brave", subparsers, profile_args)
