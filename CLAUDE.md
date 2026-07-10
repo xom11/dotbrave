@@ -115,6 +115,22 @@ Preserve these contracts unless a change explicitly redesigns them:
 - `--channel` changes both profile discovery and process handling.
   Non-stable Linux channels require PID filtering so applying Beta/Nightly
   does not close another Brave channel.
+- Windows: dotbrave may run outside the interactive desktop session (SSH
+  commands land in session 0; the browser's windows live in session 1).
+  Window messages and GUI launches do not cross sessions, so
+  `close_and_wait` and `_spawn_detached` route through a one-shot
+  `schtasks /IT` trampoline (`_run_in_console_session`), and launches go
+  through a generated `.ps1` -- an inline `-Command` loses the embedded
+  quotes on space-containing args (`--user-data-dir=...`), silently
+  splitting them and launching against the wrong profile. After a
+  graceful close, windowless background-mode residue is terminated (it
+  holds the profile and process singleton); processes with open windows
+  are never force-killed -- the error names their window titles. Brave
+  on Windows does not write `DevToolsActivePort`, so every apply
+  re-bootstraps the endpoint instead of reusing a running one.
+- Live apply drives privileged pages in a dedicated work tab
+  (`CdpClient.create_page`/`close_page`), never by navigating a user's
+  existing tab.
 - Keep shared engine logic in `_base/` (it mirrors upstream dotbrowser's
   `_base/`, which eases porting fixes across the two repos); Brave-specific
   behavior belongs in the top-level modules.
