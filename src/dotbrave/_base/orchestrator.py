@@ -13,7 +13,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import shutil
 import subprocess
 import sys
 import urllib.error
@@ -38,7 +37,14 @@ from dotbrave._base.live_apply import (
     apply_external_plans,
     write_state_files,
 )
-from dotbrave._base.utils import Plan, find_preferences, load_prefs, write_atomic
+from dotbrave._base.utils import (
+    Plan,
+    backup_prefs,
+    find_preferences,
+    load_prefs,
+    restore_prefs,
+    write_atomic,
+)
 
 
 _MAX_URL_CONFIG_BYTES = 256 * 1024
@@ -276,7 +282,7 @@ def cmd_apply(
     backup = prefs_path.with_suffix(
         prefs_path.suffix + f".bak.{datetime.now():%Y%m%d-%H%M%S}"
     )
-    shutil.copy2(prefs_path, backup)
+    backup_prefs(prefs_path, backup)
     print(f"backup: {backup}")
 
     # In-memory mutate first; nothing is on disk yet.
@@ -406,7 +412,7 @@ def cmd_restore(
         graceful_close_fn()
         was_closed = True
 
-    shutil.copy2(backup, prefs_path)
+    restore_prefs(backup, prefs_path)
     print(f"restored Preferences from {backup.name}")
 
     # Clear sidecars so the next `apply` doesn't think the restored

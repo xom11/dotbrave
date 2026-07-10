@@ -143,14 +143,130 @@ def test_write_atomic_replaces_file(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# load_prefs vs the browser's atomic Preferences rewrite
+# Preferences I/O vs the browser's atomic rewrite
 #
 # Chromium replaces Preferences rather than writing it in place. On Windows,
-# opening the path while that replace is pending fails with
+# touching the path while that replace is pending fails with
 # ERROR_ACCESS_DENIED -> PermissionError, for a few milliseconds at a time.
 # A [pwa] apply provokes exactly that: the new policy makes Brave install the
 # forced web app, which rewrites Preferences.
+#
+# Every read, backup copy and replace goes through retry_on_permission_error.
 # ---------------------------------------------------------------------------
+
+def _flaky(monkeypatch: pytest.MonkeyPatch, failures: int) -> dict:
+    """A callable that raises PermissionError its first `failures` calls."""
+    calls = {"n": 0}
+
+    def op():
+        calls["n"] += 1
+        if calls["n"] <= failures:
+            raise PermissionError(13, "Permission denied")
+        return "ok"
+
+    monkeypatch.setattr(bu.time, "sleep", lambda _s: None)
+    calls["op"] = op
+    return calls
+
+
+def test_retry_on_permission_error_returns_after_transient_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _flaky(monkeypatch, failures=2)
+    assert bu.retry_on_permission_error(calls["op"], tmp_path / "Preferences") == "ok"
+    assert calls["n"] == 3
+
+
+def test_retry_on_permission_error_gives_up_with_an_actionable_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _flaky(monkeypatch, failures=99)
+    with pytest.raises(SystemExit) as e:
+        bu.retry_on_permission_error(calls["op"], tmp_path / "Preferences")
+    assert "permission denied" in str(e.value).lower()
+    assert calls["n"] == bu._PREFS_IO_ATTEMPTS
+
+
+def test_retry_on_permission_error_does_not_catch_other_oserrors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(bu.time, "sleep", lambda _s: None)
+
+    def op():
+        raise FileNotFoundError(2, "No such file")
+
+    with pytest.raises(FileNotFoundError):
+        bu.retry_on_permission_error(op, tmp_path / "Preferences")
+
+
+def _flaky_copy2(monkeypatch: pytest.MonkeyPatch, failures: int) -> dict:
+    """Make the first `failures` shutil.copy2 calls raise PermissionError."""
+    real_copy2 = bu.shutil.copy2
+    calls = {"n": 0}
+
+    def fake_copy2(src, dst, **kw):
+        calls["n"] += 1
+        if calls["n"] <= failures:
+            raise PermissionError(13, "Permission denied")
+        return real_copy2(src, dst, **kw)
+
+    monkeypatch.setattr(bu.shutil, "copy2", fake_copy2)
+    monkeypatch.setattr(bu.time, "sleep", lambda _s: None)
+    return calls
+
+
+def test_backup_prefs_retries_while_the_browser_rewrites(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = tmp_path / "Preferences"
+    p.write_text(json.dumps({"foo": 1}), encoding="utf-8")
+    backup = tmp_path / "Preferences.bak.20260101-000000"
+    calls = _flaky_copy2(monkeypatch, failures=2)
+
+    bu.backup_prefs(p, backup)
+
+    assert calls["n"] == 3
+    assert json.loads(backup.read_text()) == {"foo": 1}
+
+
+def test_restore_prefs_retries_while_the_browser_rewrites(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = tmp_path / "Preferences"
+    p.write_text(json.dumps({"new": True}), encoding="utf-8")
+    backup = tmp_path / "Preferences.bak.20260101-000000"
+    backup.write_text(json.dumps({"old": True}), encoding="utf-8")
+    calls = _flaky_copy2(monkeypatch, failures=2)
+
+    bu.restore_prefs(backup, p)
+
+    assert calls["n"] == 3
+    assert json.loads(p.read_text()) == {"old": True}
+
+
+def test_write_atomic_retries_the_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = tmp_path / "Preferences"
+    p.write_text(json.dumps({"old": True}), encoding="utf-8")
+    real_replace = bu.os.replace
+    calls = {"n": 0}
+
+    def fake_replace(src, dst):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise PermissionError(13, "Permission denied")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(bu.os, "replace", fake_replace)
+    monkeypatch.setattr(bu.time, "sleep", lambda _s: None)
+
+    bu.write_atomic(p, {"new": True})
+
+    assert calls["n"] == 3
+    assert json.loads(p.read_text()) == {"new": True}
+    assert not p.with_suffix(p.suffix + ".tmp").exists()
+
 
 def _flaky_open(monkeypatch: pytest.MonkeyPatch, failures: int) -> dict:
     """Make the first `failures` Path.open calls raise PermissionError."""
