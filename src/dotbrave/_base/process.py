@@ -18,6 +18,83 @@ def _is_windows() -> bool:
     return sys.platform == "win32"
 
 
+def _windows_console_session_mismatch() -> bool:
+    """True when this process runs outside the interactive desktop session.
+
+    Windows scopes window messages and GUI visibility to a session: a
+    dotbrave started over SSH lands in session 0 while the browser's
+    windows live in the console session (usually 1).  From there a
+    normal ``taskkill`` close cannot reach the browser's windows and a
+    relaunched browser would be invisible to the user, so both must be
+    routed through :func:`_run_in_console_session` instead.
+    """
+    if not _is_windows():
+        return False
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        console = kernel32.WTSGetActiveConsoleSessionId()
+        if console == 0xFFFFFFFF:  # nobody at the console
+            return False
+        sid = ctypes.c_ulong()
+        if not kernel32.ProcessIdToSessionId(
+            kernel32.GetCurrentProcessId(), ctypes.byref(sid)
+        ):
+            return False
+        return sid.value != console
+    except (OSError, AttributeError):
+        return False
+
+
+def _run_in_console_session(command: str) -> bool:
+    """Run ``command`` inside the interactive desktop session.
+
+    Uses a one-shot Task Scheduler task with ``/IT`` (interactive
+    token): the command executes in the logged-on user's session, where
+    window messages and GUI launches work.  The command is written to a
+    .cmd script because ``schtasks /TR`` mangles quoting and redirects.
+    Returns False when the task could not be created or started (e.g.
+    no interactively logged-on user).
+    """
+    import tempfile
+
+    task = f"dotbrave-console-{os.getpid()}"
+    script = Path(tempfile.gettempdir()) / f"{task}.cmd"
+    try:
+        script.write_text(f"@echo off\r\n{command}\r\n", encoding="utf-8")
+    except OSError:
+        return False
+    try:
+        create = subprocess.run(
+            ["schtasks", "/Create", "/F", "/TN", task, "/SC", "ONCE",
+             "/ST", "23:59", "/IT", "/TR", str(script)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if create.returncode != 0:
+            return False
+        run = subprocess.run(
+            ["schtasks", "/Run", "/I", "/TN", task],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        # Give the one-shot command time to spawn before the task (and
+        # its script) are cleaned up.
+        time.sleep(2.0)
+        return run.returncode == 0
+    finally:
+        subprocess.run(
+            ["schtasks", "/Delete", "/F", "/TN", task],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            script.unlink()
+        except OSError:
+            pass
+
+
 def _read_cmdline(pid: str) -> list[str] | None:
     """Recover the command-line argv for a running process.
 
@@ -205,11 +282,26 @@ class BrowserProcess:
 
     def close_and_wait(self, timeout: float = 15.0) -> None:
         if _is_windows():
-            subprocess.run(
-                ["taskkill", "/IM", self.proc_name()],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            if _windows_console_session_mismatch():
+                # A cross-session `taskkill /IM` cannot deliver WM_CLOSE
+                # ("can only be terminated forcefully"); route the normal
+                # close through the interactive desktop session instead.
+                if not _run_in_console_session(
+                    f"taskkill /IM {self.proc_name()}"
+                ):
+                    sys.exit(
+                        f"error: {self.display_name} is running in the "
+                        "interactive desktop session, but dotbrave is not "
+                        "(e.g. over SSH) and the Task Scheduler trampoline "
+                        f"was unavailable. Close {self.display_name} "
+                        "manually and retry."
+                    )
+            else:
+                subprocess.run(
+                    ["taskkill", "/IM", self.proc_name()],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
         elif _is_macos():
             subprocess.run(
                 [
@@ -279,6 +371,19 @@ class BrowserProcess:
                 cmdline = [wrapper, *captured_cmdline[1:]]
             else:
                 cmdline = list(captured_cmdline)
+        self._spawn_detached(cmdline)
+        return cmdline
+
+    def _spawn_detached(self, cmdline: list[str]) -> None:
+        """Launch a browser command line without waiting for it.
+
+        Cross-session on Windows (e.g. dotbrave over SSH) the launch is
+        routed through the interactive-session trampoline so the browser
+        appears on the user's desktop instead of an invisible session.
+        """
+        if _is_windows() and _windows_console_session_mismatch():
+            if _run_in_console_session(subprocess.list2cmdline(cmdline)):
+                return
         subprocess.Popen(
             cmdline,
             stdin=subprocess.DEVNULL,
@@ -286,7 +391,6 @@ class BrowserProcess:
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
-        return cmdline
 
     def live_launch_cmdline(
         self,
@@ -334,11 +438,5 @@ class BrowserProcess:
         url: str | None = None,
     ) -> list[str]:
         cmdline = self.live_launch_cmdline(profile_root, profile, port, url)
-        subprocess.Popen(
-            cmdline,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
+        self._spawn_detached(cmdline)
         return cmdline
