@@ -274,6 +274,11 @@ VOLATILE_PREFIXES: tuple[tuple[str, ...], ...] = (
     ("ntp", "num_personal_suggestions"),
     ("profile", "last_engagement_time"),
     ("safebrowsing", "metrics_last_log_time"),
+    # Churn observed live on a real profile:
+    ("account_values",),              # signed-in mirror of prefs; the
+                                      # canonical key is exported instead
+    ("profile", "content_settings", "exceptions", "site_engagement"),
+    ("web_apps", "daily_metrics"),    # PWA usage statistics
 )
 
 # Leaf names that are timestamps/counters wherever they appear (e.g. every

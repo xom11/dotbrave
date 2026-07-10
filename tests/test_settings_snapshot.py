@@ -190,6 +190,23 @@ def test_is_volatile_prefix_and_leaf_names() -> None:
     )
     # `session` (singular) holds real user settings -- must NOT be filtered.
     assert not base_settings._is_volatile(("session", "restore_on_startup"))
+    # Churn observed on a real, running profile.
+    assert base_settings._is_volatile(
+        ("profile", "content_settings", "exceptions", "site_engagement",
+         "https://github.com:443,*", "setting", "rawScore")
+    )
+    assert base_settings._is_volatile(
+        ("web_apps", "daily_metrics", "https://claude.ai/",
+         "background_duration_sec")
+    )
+    assert base_settings._is_volatile(
+        ("account_values", "bookmark_bar", "show_on_all_tabs")
+    )
+    # ...but ordinary content-settings exceptions stay exportable.
+    assert not base_settings._is_volatile(
+        ("profile", "content_settings", "exceptions", "notifications",
+         "https://example.com:443,*", "setting")
+    )
 
 
 # ---------------------------------------------------------------------------
