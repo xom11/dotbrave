@@ -291,18 +291,18 @@ class BrowserProcess:
             f"force-kill + {timeout}s wait"
         )
 
-    def _console_windowed_count(self) -> int | None:
-        """How many processes of this browser still own a real window.
+    def _console_window_titles(self) -> list[str] | None:
+        """Titles of this browser's still-open real windows.
 
         Window handles are session-scoped, so cross-session the check
-        runs through the interactive trampoline.  None means the count
+        runs through the interactive trampoline.  None means the state
         could not be determined (treated conservatively by callers).
         """
         name = self.proc_name().removesuffix(".exe")
         ps = (
             "powershell -NoProfile -Command \"(Get-Process "
             f"{name} -ErrorAction SilentlyContinue | Where-Object "
-            "{ $_.MainWindowHandle -ne 0 } | Measure-Object).Count\""
+            "{ $_.MainWindowHandle -ne 0 }).MainWindowTitle\""
         )
         if _windows_console_session_mismatch():
             out = _run_in_console_session(ps)
@@ -315,10 +315,7 @@ class BrowserProcess:
                 out = None
         if out is None:
             return None
-        try:
-            return int(out.strip().splitlines()[-1])
-        except (ValueError, IndexError):
-            return None
+        return [t for t in (line.strip() for line in out.splitlines()) if t]
 
     def close_and_wait(self, timeout: float = 15.0) -> None:
         if _is_windows():
@@ -371,17 +368,27 @@ class BrowserProcess:
             if not self.running():
                 return
             time.sleep(0.1)
-        if _is_windows() and self._console_windowed_count() == 0:
-            # Every window closed gracefully (session saved); what's left
-            # is the browser's windowless background-mode residue, which
-            # keeps the profile open and the process singleton alive --
-            # blocking both the offline write and the endpoint relaunch.
-            print(
-                f"{self.display_name} windows closed; terminating its "
-                "windowless background-mode processes."
-            )
-            self.kill_and_wait(5.0)
-            return
+        if _is_windows():
+            titles = self._console_window_titles()
+            if titles == []:
+                # Every window closed gracefully (session saved); what's
+                # left is the browser's windowless background-mode
+                # residue, which keeps the profile open and the process
+                # singleton alive -- blocking both the offline write and
+                # the endpoint relaunch.
+                print(
+                    f"{self.display_name} windows closed; terminating its "
+                    "windowless background-mode processes."
+                )
+                self.kill_and_wait(5.0)
+                return
+            if titles:
+                sys.exit(
+                    f"error: {self.display_name} did not close; windows "
+                    "still open: " + ", ".join(titles) + ". A page may be "
+                    "showing a leave-site prompt -- close these windows "
+                    "manually and retry."
+                )
         sys.exit(
             f"error: {self.display_name} is still running after a normal "
             "close request. Close it manually and retry."

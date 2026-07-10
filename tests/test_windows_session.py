@@ -112,7 +112,7 @@ def test_close_windows_background_residue_is_terminated(
     )
     bp = _bp()
     monkeypatch.setattr(bp, "running", lambda: True)
-    monkeypatch.setattr(bp, "_console_windowed_count", lambda: 0)
+    monkeypatch.setattr(bp, "_console_window_titles", lambda: [])
     killed: list[float] = []
     monkeypatch.setattr(
         bp, "kill_and_wait", lambda timeout=5.0: killed.append(timeout)
@@ -135,14 +135,18 @@ def test_close_windows_still_open_errors_not_kills(
     )
     bp = _bp()
     monkeypatch.setattr(bp, "running", lambda: True)
-    monkeypatch.setattr(bp, "_console_windowed_count", lambda: 2)
+    monkeypatch.setattr(
+        bp, "_console_window_titles", lambda: ["Discord", "Gmail"]
+    )
     monkeypatch.setattr(
         bp, "kill_and_wait",
         lambda timeout=5.0: pytest.fail("must not kill with windows open"),
     )
     with pytest.raises(SystemExit) as exc:
         bp.close_and_wait(timeout=0.2)
-    assert "still running" in str(exc.value)
+    # The blocking windows are named so the user knows what to close.
+    assert "Discord" in str(exc.value)
+    assert "Gmail" in str(exc.value)
 
 
 def test_launch_live_routes_through_trampoline_cross_session(
