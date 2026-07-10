@@ -88,13 +88,61 @@ def test_close_cross_session_without_trampoline_errors(
         proc_mod, "_windows_console_session_mismatch", lambda: True
     )
     monkeypatch.setattr(
-        proc_mod, "_run_in_console_session", lambda cmd: False
+        proc_mod, "_run_in_console_session", lambda cmd: None
     )
     bp = _bp()
     monkeypatch.setattr(bp, "running", lambda: True)
     with pytest.raises(SystemExit) as exc:
         bp.close_and_wait(timeout=0.2)
     assert "desktop session" in str(exc.value)
+
+
+def test_close_windows_background_residue_is_terminated(
+    win32, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """Brave's background mode keeps windowless processes alive after all
+    windows closed gracefully; those remnants block both the offline
+    write and the endpoint relaunch, so they are terminated once we know
+    no window remains."""
+    monkeypatch.setattr(
+        proc_mod, "_windows_console_session_mismatch", lambda: True
+    )
+    monkeypatch.setattr(
+        proc_mod, "_run_in_console_session", lambda cmd: ""
+    )
+    bp = _bp()
+    monkeypatch.setattr(bp, "running", lambda: True)
+    monkeypatch.setattr(bp, "_console_windowed_count", lambda: 0)
+    killed: list[float] = []
+    monkeypatch.setattr(
+        bp, "kill_and_wait", lambda timeout=5.0: killed.append(timeout)
+    )
+    bp.close_and_wait(timeout=0.2)
+    assert killed, "windowless residue should be terminated"
+    assert "background" in capsys.readouterr().out.lower()
+
+
+def test_close_windows_still_open_errors_not_kills(
+    win32, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If actual windows remain (e.g. an unconfirmed close dialog), never
+    force-kill -- keep the manual-close error."""
+    monkeypatch.setattr(
+        proc_mod, "_windows_console_session_mismatch", lambda: True
+    )
+    monkeypatch.setattr(
+        proc_mod, "_run_in_console_session", lambda cmd: ""
+    )
+    bp = _bp()
+    monkeypatch.setattr(bp, "running", lambda: True)
+    monkeypatch.setattr(bp, "_console_windowed_count", lambda: 2)
+    monkeypatch.setattr(
+        bp, "kill_and_wait",
+        lambda timeout=5.0: pytest.fail("must not kill with windows open"),
+    )
+    with pytest.raises(SystemExit) as exc:
+        bp.close_and_wait(timeout=0.2)
+    assert "still running" in str(exc.value)
 
 
 def test_launch_live_routes_through_trampoline_cross_session(
@@ -121,6 +169,9 @@ def test_launch_live_routes_through_trampoline_cross_session(
     assert len(calls) == 1
     assert "--remote-debugging-port=9333" in calls[0]
     assert str(exe) in calls[0]
+    # `start ""` detaches the browser so the trampoline script returns
+    # immediately instead of blocking until the browser exits.
+    assert calls[0].startswith('start "" ')
     assert "--remote-debugging-port=9333" in " ".join(cmdline)
 
 

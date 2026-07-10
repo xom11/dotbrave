@@ -47,24 +47,29 @@ def _windows_console_session_mismatch() -> bool:
         return False
 
 
-def _run_in_console_session(command: str) -> bool:
+def _run_in_console_session(command: str) -> str | None:
     """Run ``command`` inside the interactive desktop session.
 
     Uses a one-shot Task Scheduler task with ``/IT`` (interactive
     token): the command executes in the logged-on user's session, where
     window messages and GUI launches work.  The command is written to a
     .cmd script because ``schtasks /TR`` mangles quoting and redirects.
-    Returns False when the task could not be created or started (e.g.
-    no interactively logged-on user).
+    Returns the command's combined output ("" is fine), or None when
+    the task could not be created or started (e.g. no interactively
+    logged-on user).
     """
     import tempfile
 
     task = f"dotbrave-console-{os.getpid()}"
     script = Path(tempfile.gettempdir()) / f"{task}.cmd"
+    out_file = Path(tempfile.gettempdir()) / f"{task}.out"
     try:
-        script.write_text(f"@echo off\r\n{command}\r\n", encoding="utf-8")
+        script.write_text(
+            f'@echo off\r\n{command} > "{out_file}" 2>&1\r\n',
+            encoding="utf-8",
+        )
     except OSError:
-        return False
+        return None
     try:
         create = subprocess.run(
             ["schtasks", "/Create", "/F", "/TN", task, "/SC", "ONCE",
@@ -73,26 +78,32 @@ def _run_in_console_session(command: str) -> bool:
             stderr=subprocess.DEVNULL,
         )
         if create.returncode != 0:
-            return False
+            return None
         run = subprocess.run(
             ["schtasks", "/Run", "/I", "/TN", task],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        # Give the one-shot command time to spawn before the task (and
+        if run.returncode != 0:
+            return None
+        # Give the one-shot command time to run before the task (and
         # its script) are cleaned up.
         time.sleep(2.0)
-        return run.returncode == 0
+        try:
+            return out_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
     finally:
         subprocess.run(
             ["schtasks", "/Delete", "/F", "/TN", task],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        try:
-            script.unlink()
-        except OSError:
-            pass
+        for leftover in (script, out_file):
+            try:
+                leftover.unlink()
+            except OSError:
+                pass
 
 
 def _read_cmdline(pid: str) -> list[str] | None:
@@ -280,15 +291,44 @@ class BrowserProcess:
             f"force-kill + {timeout}s wait"
         )
 
+    def _console_windowed_count(self) -> int | None:
+        """How many processes of this browser still own a real window.
+
+        Window handles are session-scoped, so cross-session the check
+        runs through the interactive trampoline.  None means the count
+        could not be determined (treated conservatively by callers).
+        """
+        name = self.proc_name().removesuffix(".exe")
+        ps = (
+            "powershell -NoProfile -Command \"(Get-Process "
+            f"{name} -ErrorAction SilentlyContinue | Where-Object "
+            "{ $_.MainWindowHandle -ne 0 } | Measure-Object).Count\""
+        )
+        if _windows_console_session_mismatch():
+            out = _run_in_console_session(ps)
+        else:
+            try:
+                out = subprocess.check_output(
+                    ps, shell=True, stderr=subprocess.DEVNULL
+                ).decode("utf-8", "replace")
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                out = None
+        if out is None:
+            return None
+        try:
+            return int(out.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            return None
+
     def close_and_wait(self, timeout: float = 15.0) -> None:
         if _is_windows():
             if _windows_console_session_mismatch():
                 # A cross-session `taskkill /IM` cannot deliver WM_CLOSE
                 # ("can only be terminated forcefully"); route the normal
                 # close through the interactive desktop session instead.
-                if not _run_in_console_session(
+                if _run_in_console_session(
                     f"taskkill /IM {self.proc_name()}"
-                ):
+                ) is None:
                     sys.exit(
                         f"error: {self.display_name} is running in the "
                         "interactive desktop session, but dotbrave is not "
@@ -331,6 +371,17 @@ class BrowserProcess:
             if not self.running():
                 return
             time.sleep(0.1)
+        if _is_windows() and self._console_windowed_count() == 0:
+            # Every window closed gracefully (session saved); what's left
+            # is the browser's windowless background-mode residue, which
+            # keeps the profile open and the process singleton alive --
+            # blocking both the offline write and the endpoint relaunch.
+            print(
+                f"{self.display_name} windows closed; terminating its "
+                "windowless background-mode processes."
+            )
+            self.kill_and_wait(5.0)
+            return
         sys.exit(
             f"error: {self.display_name} is still running after a normal "
             "close request. Close it manually and retry."
@@ -382,7 +433,12 @@ class BrowserProcess:
         appears on the user's desktop instead of an invisible session.
         """
         if _is_windows() and _windows_console_session_mismatch():
-            if _run_in_console_session(subprocess.list2cmdline(cmdline)):
+            # `start ""` detaches: the trampoline script returns right
+            # away instead of blocking until the browser exits.
+            launched = _run_in_console_session(
+                f'start "" {subprocess.list2cmdline(cmdline)}'
+            )
+            if launched is not None:
                 return
         subprocess.Popen(
             cmdline,
