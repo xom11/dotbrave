@@ -299,6 +299,11 @@ def _export_pwa(args: argparse.Namespace, prefs_path: Path, prefs: dict) -> list
 
 
 def cmd_export(args: argparse.Namespace) -> None:
+    if getattr(args, "snapshot", False) or getattr(args, "clear", False):
+        if not getattr(args, "snapshot", False):
+            sys.exit("error: --clear requires --snapshot")
+        settings_mod.cmd_snapshot(args)
+        return
     _base_cmd_export(
         args,
         browser_name="brave",

@@ -660,6 +660,17 @@ Examples:
                 action="store_true",
                 help="include every shortcut binding, not just user-customized ones",
             )
+        e.add_argument(
+            "--snapshot",
+            action="store_true",
+            help="capture a Preferences baseline (instead of exporting); a "
+            "later plain `export` lists [settings] keys changed since it",
+        )
+        e.add_argument(
+            "--clear",
+            action="store_true",
+            help="with --snapshot: delete the stored baseline",
+        )
         e.set_defaults(func=cmd_export_fn)
 
     if cmd_restore_fn is not None:

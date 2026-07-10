@@ -130,15 +130,50 @@ def test_load_snapshot_malformed_payload_exits(
 # CLI wiring
 # ---------------------------------------------------------------------------
 
-def test_snapshot_subcommand_is_registered() -> None:
+def test_snapshot_flag_is_registered_on_export() -> None:
     from dotbrave.cli import build_parser
 
     parser = build_parser()
-    args = parser.parse_args(["settings", "snapshot"])
+    args = parser.parse_args(["export", "--snapshot"])
     assert getattr(args, "_needs_profile", False) is True
+    assert args.snapshot is True
     assert args.clear is False
-    args = parser.parse_args(["settings", "snapshot", "--clear"])
+    args = parser.parse_args(["export", "--snapshot", "--clear"])
     assert args.clear is True
+
+
+def test_export_snapshot_flag_writes_baseline(
+    fake_settings_profile_root: Path, capsys: pytest.CaptureFixture
+) -> None:
+    from dotbrave import browser as brave_pkg
+
+    args = _args(
+        fake_settings_profile_root,
+        snapshot=True, clear=False, output=None, all_shortcuts=False,
+    )
+    brave_pkg.cmd_export(args)
+    assert _snapshot_path(fake_settings_profile_root).exists()
+    out = capsys.readouterr().out
+    assert "snapshot saved" in out
+    assert "[shortcuts]" not in out  # snapshot mode does not emit TOML
+
+    args.clear = True
+    brave_pkg.cmd_export(args)
+    assert not _snapshot_path(fake_settings_profile_root).exists()
+
+
+def test_export_clear_without_snapshot_flag_errors(
+    fake_settings_profile_root: Path,
+) -> None:
+    from dotbrave import browser as brave_pkg
+
+    args = _args(
+        fake_settings_profile_root,
+        snapshot=False, clear=True, output=None, all_shortcuts=False,
+    )
+    with pytest.raises(SystemExit) as exc:
+        brave_pkg.cmd_export(args)
+    assert "--snapshot" in str(exc.value)
 
 
 # ---------------------------------------------------------------------------
