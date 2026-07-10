@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -49,9 +50,34 @@ def find_preferences(profile_root: Path, profile: str) -> Path:
     return p
 
 
+_PREFS_READ_ATTEMPTS = 5
+_PREFS_READ_BACKOFF = 0.1
+
+
 def load_prefs(path: Path) -> dict:
-    with path.open(encoding="utf-8") as f:
-        return json.load(f)
+    """Read Preferences, tolerating the browser's atomic rewrite.
+
+    Chromium replaces Preferences instead of writing it in place.  On
+    Windows, opening the path while that replace is still pending fails
+    with ERROR_ACCESS_DENIED -- surfacing as ``PermissionError`` -- for a
+    few milliseconds at a time.  A ``[pwa]`` apply provokes exactly this:
+    the freshly written policy makes the browser install the forced web
+    app, which rewrites Preferences.  Retry instead of aborting the apply.
+    """
+    for attempt in range(_PREFS_READ_ATTEMPTS):
+        try:
+            with path.open(encoding="utf-8") as f:
+                return json.load(f)
+        except PermissionError:
+            if attempt == _PREFS_READ_ATTEMPTS - 1:
+                sys.exit(
+                    f"error: permission denied reading {path} after "
+                    f"{_PREFS_READ_ATTEMPTS} attempts.\n"
+                    "The browser rewrites this file as it runs; retry in a "
+                    "moment, or quit the browser first."
+                )
+            time.sleep(_PREFS_READ_BACKOFF * 2**attempt)
+    raise AssertionError("unreachable")
 
 
 def get_nested(d: dict, keys: tuple[str, ...]) -> dict:

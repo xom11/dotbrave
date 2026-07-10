@@ -9,6 +9,7 @@ import pytest
 from dotbrave import settings as st
 from dotbrave import shortcuts as sc
 from dotbrave import utils as ut
+from dotbrave._base import utils as bu
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +140,60 @@ def test_write_atomic_replaces_file(tmp_path: Path) -> None:
     assert json.loads(p.read_text()) == {"new": True}
     # No leftover .tmp file
     assert not p.with_suffix(p.suffix + ".tmp").exists()
+
+
+# ---------------------------------------------------------------------------
+# load_prefs vs the browser's atomic Preferences rewrite
+#
+# Chromium replaces Preferences rather than writing it in place. On Windows,
+# opening the path while that replace is pending fails with
+# ERROR_ACCESS_DENIED -> PermissionError, for a few milliseconds at a time.
+# A [pwa] apply provokes exactly that: the new policy makes Brave install the
+# forced web app, which rewrites Preferences.
+# ---------------------------------------------------------------------------
+
+def _flaky_open(monkeypatch: pytest.MonkeyPatch, failures: int) -> dict:
+    """Make the first `failures` Path.open calls raise PermissionError."""
+    real_open = Path.open
+    calls = {"n": 0}
+
+    def fake_open(self, *a, **kw):
+        calls["n"] += 1
+        if calls["n"] <= failures:
+            raise PermissionError(13, "Permission denied")
+        return real_open(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "open", fake_open)
+    monkeypatch.setattr(bu.time, "sleep", lambda _s: None)
+    return calls
+
+
+def test_load_prefs_retries_transient_permission_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = tmp_path / "Preferences"
+    p.write_text(json.dumps({"foo": {"bar": 1}}), encoding="utf-8")
+    calls = _flaky_open(monkeypatch, failures=2)
+
+    assert bu.load_prefs(p) == {"foo": {"bar": 1}}
+    assert calls["n"] == 3  # two failures, then the real read
+
+
+def test_load_prefs_gives_up_with_an_actionable_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = tmp_path / "Preferences"
+    p.write_text(json.dumps({"foo": 1}), encoding="utf-8")
+    _flaky_open(monkeypatch, failures=99)
+
+    with pytest.raises(SystemExit) as e:
+        bu.load_prefs(p)
+    assert "permission denied" in str(e.value).lower()
+
+
+def test_load_prefs_does_not_swallow_missing_file(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        bu.load_prefs(tmp_path / "nope")
 
 
 # ---------------------------------------------------------------------------
