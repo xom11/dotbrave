@@ -115,6 +115,19 @@ Preserve these contracts unless a change explicitly redesigns them:
 - `--channel` changes both profile discovery and process handling.
   Non-stable Linux channels require PID filtering so applying Beta/Nightly
   does not close another Brave channel.
+- Process detection/close/kill are scoped to the target
+  `--user-data-dir`, not just the channel. `cmd_apply`/`cmd_restore` call
+  `BrowserProcess.scope_to_profile(profile_root, default_root)` before the
+  engine runs, so an apply against one profile root never closes a Brave
+  the user has open on a different root/profile. On Linux the scope reads
+  each `pgrep -x brave` pid's own cmdline: an explicitly-launched Brave
+  keeps `--user-data-dir=<root>` on its main process *and* every child,
+  while an app-menu launch carries the flag nowhere -- so a flagless pid
+  is matched only when the target root equals the default root. An unset
+  scope keeps the historical global `pgrep`/`pkill -x` behavior (relied on
+  by Snap/Flatpak stable installs, whose paths a filter would exclude).
+  macOS (`osascript quit`) and Windows (`taskkill /IM`) close by
+  app/image name and remain instance-global.
 - Windows: dotbrave may run outside the interactive desktop session (SSH
   commands land in session 0; the browser's windows live in session 1).
   Window messages and GUI launches do not cross sessions, so

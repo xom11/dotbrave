@@ -106,6 +106,24 @@ def _run_in_console_session(command: str) -> str | None:
                 pass
 
 
+def _extract_user_data_dir(args: list[str]) -> str | None:
+    """Pull the ``--user-data-dir`` value out of a captured argv, or None.
+
+    Chromium accepts both ``--user-data-dir=PATH`` and the space-separated
+    ``--user-data-dir PATH`` form.
+    """
+    for i, a in enumerate(args):
+        if a.startswith("--user-data-dir="):
+            return a.split("=", 1)[1]
+        if a == "--user-data-dir" and i + 1 < len(args):
+            return args[i + 1]
+    return None
+
+
+def _same_dir(a: str, b: str) -> bool:
+    return os.path.realpath(a) == os.path.realpath(b)
+
+
 def _read_cmdline(pid: str) -> list[str] | None:
     """Recover the command-line argv for a running process.
 
@@ -183,6 +201,32 @@ class BrowserProcess:
         # asked about.  None disables the filter (the default; keeps
         # behavior unchanged for browsers without per-channel paths).
         self.linux_pid_filter = linux_pid_filter
+        # Optional per-invocation scope to a single --user-data-dir, set
+        # via `scope_to_profile`.  When set, Linux pid detection/close/kill
+        # only touch processes belonging to that profile root so an apply
+        # against one root never closes a Brave the user has open on a
+        # different root/profile.  None keeps the historical global
+        # (pgrep/pkill -x) behavior.
+        self.user_data_dir: str | None = None
+        self.default_user_data_dir: str | None = None
+
+    def scope_to_profile(
+        self, user_data_dir, default_user_data_dir=None
+    ) -> None:
+        """Restrict process operations to one profile root (Linux).
+
+        ``user_data_dir`` is the target ``--user-data-dir``.  On Linux an
+        explicitly-launched Brave keeps that flag on its main process and
+        every child, while a Brave opened from the app menu carries it
+        nowhere -- so a flagless process is treated as belonging to the
+        default root.  ``default_user_data_dir`` supplies that root; when
+        omitted, flagless processes are never matched (conservative:
+        never close a browser we cannot positively identify).
+        """
+        self.user_data_dir = None if user_data_dir is None else str(user_data_dir)
+        self.default_user_data_dir = (
+            None if default_user_data_dir is None else str(default_user_data_dir)
+        )
 
     def proc_name(self) -> str:
         if _is_macos():
@@ -214,25 +258,50 @@ class BrowserProcess:
             return bool(self._pids_windows())
         return bool(self.pids())
 
-    def _apply_linux_filter(self, pids: list[str]) -> list[str]:
-        """Drop pids whose argv[0] does not contain ``linux_pid_filter``.
+    def _linux_scoping_active(self) -> bool:
+        """True when Linux pid selection must be narrowed.
 
-        Only invoked on Linux when the filter is set -- macOS uses
-        channel-distinct proc names already, and Windows uses
-        channel-distinct exe paths.  Pids whose cmdline can't be read
-        (raced exit, EPERM) are dropped; conservative (don't kill
-        what we can't identify).
+        Either a per-channel path filter or a per-invocation profile
+        scope is set.  macOS uses channel-distinct proc names and Windows
+        channel-distinct exe paths, so the extra pass only runs on Linux.
         """
-        if self.linux_pid_filter is None:
-            return pids
-        kept: list[str] = []
-        for pid in pids:
-            args = _read_cmdline(pid)
-            if not args:
-                continue
-            if self.linux_pid_filter in args[0]:
-                kept.append(pid)
-        return kept
+        return (
+            not _is_macos()
+            and not _is_windows()
+            and (
+                self.linux_pid_filter is not None
+                or self.user_data_dir is not None
+            )
+        )
+
+    def _pid_matches_scope(self, pid: str) -> bool:
+        """Whether ``pid`` belongs to this channel + profile root.
+
+        Pids whose cmdline can't be read (raced exit, EPERM) are dropped;
+        conservative -- don't kill what we can't identify.
+        """
+        args = _read_cmdline(pid)
+        if not args:
+            return False
+        if (
+            self.linux_pid_filter is not None
+            and self.linux_pid_filter not in args[0]
+        ):
+            return False
+        if self.user_data_dir is not None:
+            udd = _extract_user_data_dir(args)
+            if udd is None:
+                # Flagless (app-menu) launch: belongs to the default root.
+                if self.default_user_data_dir is None or not _same_dir(
+                    self.user_data_dir, self.default_user_data_dir
+                ):
+                    return False
+            elif not _same_dir(udd, self.user_data_dir):
+                return False
+        return True
+
+    def _apply_linux_filter(self, pids: list[str]) -> list[str]:
+        return [p for p in pids if self._pid_matches_scope(p)]
 
     def pids(self) -> list[str]:
         if _is_windows():
@@ -244,7 +313,7 @@ class BrowserProcess:
         except (subprocess.CalledProcessError, FileNotFoundError):
             return []
         raw = out.decode().split()
-        if not _is_macos() and self.linux_pid_filter is not None:
+        if self._linux_scoping_active():
             return self._apply_linux_filter(raw)
         return raw
 
@@ -266,10 +335,10 @@ class BrowserProcess:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-        elif not _is_macos() and self.linux_pid_filter is not None:
-            # Channel-scoped kill: don't `pkill -x brave` (matches every
-            # channel) -- send SIGKILL only to the pids we already
-            # filtered to this channel.
+        elif self._linux_scoping_active():
+            # Scoped kill: don't `pkill -x brave` (matches every channel
+            # and every profile root) -- send SIGKILL only to the pids we
+            # already filtered to this channel + profile root.
             scoped = self.pids()
             if scoped:
                 subprocess.run(
@@ -349,7 +418,7 @@ class BrowserProcess:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-        elif self.linux_pid_filter is not None:
+        elif self._linux_scoping_active():
             scoped = self.pids()
             if scoped:
                 subprocess.run(

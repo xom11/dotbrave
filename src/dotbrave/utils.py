@@ -41,6 +41,11 @@ def _make_browser_process(channel: str = "stable") -> BrowserProcess:
     falsely exclude.  macOS and Windows have channel-distinct names
     already (``Brave Browser Beta`` and
     ``Brave-Browser-Beta\\Application\\brave.exe`` respectively).
+
+    This handles the *channel* dimension only.  To also avoid closing a
+    Brave running on a different *profile root* of the same channel, the
+    caller narrows the returned process further with
+    ``scope_to_profile(profile_root, default_root)`` before use.
     """
     pretty = _CHANNEL_PRETTY[channel]
     dir_suf = _CHANNEL_DIR[channel]

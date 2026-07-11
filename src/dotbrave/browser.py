@@ -204,6 +204,9 @@ def cmd_apply(args: argparse.Namespace) -> None:
 
     channel = getattr(args, "channel", "stable")
     if channel == "stable":
+        BROWSER_PROCESS.scope_to_profile(
+            args.profile_root, _default_profile_root(channel)
+        )
         _base_cmd_apply(
             args,
             display_name="Brave",
@@ -219,6 +222,7 @@ def cmd_apply(args: argparse.Namespace) -> None:
 
     from dotbrave.utils import _make_browser_process
     proc = _make_browser_process(channel)
+    proc.scope_to_profile(args.profile_root, _default_profile_root(channel))
     _base_cmd_apply(
         args,
         display_name=proc.display_name,
@@ -272,6 +276,9 @@ def cmd_restore(args: argparse.Namespace) -> None:
     """
     channel = getattr(args, "channel", "stable")
     if channel == "stable":
+        BROWSER_PROCESS.scope_to_profile(
+            args.profile_root, _default_profile_root(channel)
+        )
         _base_cmd_restore(
             args,
             display_name="Brave",
@@ -284,6 +291,7 @@ def cmd_restore(args: argparse.Namespace) -> None:
 
     from dotbrave.utils import _make_browser_process
     proc = _make_browser_process(channel)
+    proc.scope_to_profile(args.profile_root, _default_profile_root(channel))
     _base_cmd_restore(
         args,
         display_name=proc.display_name,
