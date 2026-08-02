@@ -245,9 +245,48 @@ def test_darwin_write_unpins_before_writing_and_repins_after(
 
     flat = [" ".join(c) for c in rec.calls]
     lift = flat.index(f"sudo chflags noschg {policy_file}")
-    write = next(i for i, f in enumerate(flat) if f.startswith("sudo tee"))
+    write = flat.index(f"sudo tee {policy_file}")
     pin = flat.index(f"sudo chflags schg {policy_file}")
     assert lift < write < pin
+
+
+def test_darwin_write_seeds_the_daemon_source_before_the_policy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """The daemon reverts anything that disagrees with its source plist, and
+    at ThrottleInterval 1 it reacts inside the window of our own apply. Seed
+    the source first so a heal firing mid-write compares against the content
+    we are writing rather than restoring the policy we are replacing."""
+    _force_darwin(monkeypatch)
+    rec = _Recorder()
+    monkeypatch.setattr(pwa.subprocess, "run", rec)
+    monkeypatch.setattr(pwa, "install_self_healing_daemon", lambda pf, c: None)
+
+    policy_file = tmp_path / "com.brave.Browser.plist"
+    pwa.sudo_write_policy(policy_file, "", [{"url": "https://a/"}])
+
+    source, _ = pwa.macos_support_paths(policy_file)
+    flat = [" ".join(c) for c in rec.calls]
+    assert flat.index(f"sudo tee {source}") < flat.index(f"sudo tee {policy_file}")
+
+
+def test_darwin_empty_table_stops_the_daemon_before_emptying_the_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Removal has no new content to seed the daemon with, so the only way to
+    stop it restoring the entries being removed is to boot it out first."""
+    _force_darwin(monkeypatch)
+    rec = _Recorder()
+    monkeypatch.setattr(pwa.subprocess, "run", rec)
+    monkeypatch.setattr(pwa, "remove_self_healing_daemon", lambda pf: None)
+
+    policy_file = tmp_path / "com.brave.Browser.plist"
+    pwa.sudo_write_policy(policy_file, "", [])
+
+    daemon = str(pwa.macos_daemon_path(policy_file))
+    flat = [" ".join(c) for c in rec.calls]
+    stop = flat.index(f"sudo launchctl bootout system {daemon}")
+    assert stop < flat.index(f"sudo tee {policy_file}")
 
 
 def test_empty_table_leaves_the_policy_file_unpinned(

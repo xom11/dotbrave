@@ -172,6 +172,30 @@ def _darwin_set_immutable(path: Path) -> None:
     )
 
 
+def _darwin_seed_daemon_source(policy_file: Path, managed_content: bytes) -> None:
+    """Point the running daemon at the content we are about to write.
+
+    The daemon restores anything that disagrees with its source plist, and at
+    ``ThrottleInterval`` 1 it reacts well inside the window of our own write.
+    Seeding first means a heal that fires mid-apply compares against the new
+    content instead of restoring the policy we are replacing."""
+    source_plist, _ = macos_support_paths(policy_file)
+    subprocess.run(
+        ["sudo", "mkdir", "-p", "-m", "0755", str(_MACOS_SUPPORT_DIR)],
+        check=True,
+    )
+    _sudo_install_file(source_plist, managed_content, "0644")
+
+
+def _darwin_stop_daemon(policy_file: Path) -> None:
+    """Boot the daemon out. Used before emptying the policy, where there is no
+    new content to seed and the daemon would restore what we are removing."""
+    subprocess.run(
+        ["sudo", "launchctl", "bootout", "system", str(macos_daemon_path(policy_file))],
+        check=False, stderr=subprocess.DEVNULL,
+    )
+
+
 def install_self_healing_daemon(policy_file: Path, managed_content: bytes) -> None:
     """Install/refresh the self-healing daemon for this browser. Patchable
     in tests."""
@@ -421,6 +445,10 @@ def sudo_write_policy(
         check=True,
     )
     if sys.platform == "darwin":
+        if entries:
+            _darwin_seed_daemon_source(policy_file, content)
+        else:
+            _darwin_stop_daemon(policy_file)
         _darwin_clear_immutable(policy_file)
     subprocess.run(
         ["sudo", "tee", str(policy_file)],

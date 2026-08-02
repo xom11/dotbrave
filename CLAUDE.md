@@ -91,7 +91,11 @@ Preserve these contracts unless a change explicitly redesigns them:
    the dropped-notification safety net; and the policy file carries `schg`,
    which makes the reconcile's `unlink` fail outright. `schg` also blocks
    dotbrave's own writes, so every privileged write path lifts it, writes,
-   and re-pins, and teardown must unpin. Whether `schg` actually defeats
+   and re-pins, and teardown must unpin. At `ThrottleInterval` 1 the daemon
+   also reacts inside an apply's own write window, so a write must first
+   seed the daemon's source plist with the new content (or, for an empty
+   table, boot the daemon out) -- otherwise apply races itself and the
+   daemon restores the policy being replaced. Whether `schg` actually defeats
    the reconcile is unverified -- the event is intermittent and resisted
    every attempt to trigger it on demand -- so the heal log is the
    instrument: a line in it means the pin failed that boot.
