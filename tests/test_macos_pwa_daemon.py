@@ -16,6 +16,9 @@ from dotbrave._base import pwa
 
 
 BRAVE_PLIST = Path("/Library/Managed Preferences/com.brave.Browser.plist")
+SOURCE = Path(
+    "/Library/Application Support/dotbrave/com.brave.Browser.managed.plist"
+)
 
 
 def test_bundle_id_is_basename_without_suffix() -> None:
@@ -61,7 +64,64 @@ def test_launchd_plist_watches_managed_prefs_and_runs_at_load() -> None:
     assert parsed["ProgramArguments"] == ["/bin/sh", str(heal)]
     assert parsed["WatchPaths"] == ["/Library/Managed Preferences"]
     assert parsed["RunAtLoad"] is True
-    assert parsed["ThrottleInterval"] == 10
+
+
+def test_launchd_plist_heals_faster_than_a_login_item_browser_starts() -> None:
+    """macOS prunes orphan plists from /Library/Managed Preferences during
+    boot. If the browser auto-starts before the daemon restores the policy it
+    reads an empty ``WebAppInstallForceList`` and uninstalls every managed PWA
+    -- and it will not reload the policy while running. So the daemon must
+    react to the WatchPaths event within about a second, not on launchd's
+    10-second default throttle, and must still recover if the event is missed
+    entirely."""
+    raw = pwa.build_launchd_plist(
+        "org.dotbrave.com.brave.Browser.pwa",
+        Path("/Library/Application Support/dotbrave/com.brave.Browser.heal.sh"),
+        "/Library/Managed Preferences",
+    )
+    parsed = plistlib.loads(raw)
+    # Must be set explicitly: omitting the key leaves launchd's 10s default,
+    # which is the delay that loses the race.
+    assert parsed["ThrottleInterval"] == 1
+    # Safety net for a dropped WatchPaths notification.
+    assert parsed["StartInterval"] == 60
+
+
+def test_heal_log_sits_beside_the_other_support_files() -> None:
+    assert pwa.macos_heal_log(BRAVE_PLIST) == Path(
+        "/Library/Application Support/dotbrave/com.brave.Browser.heal.log"
+    )
+
+
+def test_heal_script_lifts_the_immutable_flag_around_its_write() -> None:
+    """The policy file is pinned `schg` so macOS's boot-time reconcile cannot
+    unlink it. That same flag blocks the daemon's own `cp`, so the script must
+    lift it, write, and re-pin -- in that order."""
+    script = pwa.build_heal_script(SOURCE, BRAVE_PLIST)
+    lift = script.index("chflags noschg")
+    write = script.index('/bin/cp "$SRC" "$DEST"')
+    pin = script.index("chflags schg")
+    assert lift < write < pin
+
+
+def test_heal_script_records_every_heal_for_post_boot_forensics() -> None:
+    """A heal at boot means the browser may already have read an empty policy
+    and uninstalled its PWAs. The log is the only evidence that survives to be
+    read after the fact -- a notification at that point in boot has nobody to
+    show itself to."""
+    script = pwa.build_heal_script(SOURCE, BRAVE_PLIST)
+    assert str(pwa.macos_heal_log(BRAVE_PLIST)) in script
+    # Only actual heals are logged: the cmp short-circuit comes first.
+    assert script.index("cmp -s") < script.index('>> "$LOG"')
+
+
+def test_heal_script_warns_the_console_user_when_one_exists() -> None:
+    script = pwa.build_heal_script(SOURCE, BRAVE_PLIST)
+    # A root daemon cannot post to the user's session directly.
+    assert "launchctl asuser" in script
+    assert "osascript" in script
+    # Best-effort only -- never let a missing GUI session fail the heal.
+    assert script.rstrip().endswith("exit 0")
 
 
 class _Recorder:
@@ -109,7 +169,18 @@ def test_remove_daemon_boots_out_and_deletes_artifacts(
     source, heal = pwa.macos_support_paths(BRAVE_PLIST)
     assert ["sudo", "launchctl", "bootout", "system", daemon] in rec.calls
     removed = {c[-1] for c in rec.calls if c[:3] == ["sudo", "rm", "-f"]}
-    assert {daemon, str(source), str(heal)} <= removed
+    assert {daemon, str(source), str(heal),
+            str(pwa.macos_heal_log(BRAVE_PLIST))} <= removed
+
+
+def test_remove_daemon_unpins_the_policy_file() -> None:
+    """Teardown must leave nothing immutable behind, or a later uninstall --
+    or an OS upgrade -- trips over a file nothing can delete."""
+    rec = _Recorder()
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(pwa.subprocess, "run", rec)
+        pwa.remove_self_healing_daemon(BRAVE_PLIST)
+    assert ["sudo", "chflags", "noschg", str(BRAVE_PLIST)] in rec.calls
 
 
 def _force_darwin(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -157,6 +228,44 @@ def test_empty_entries_remove_daemon(
 
     assert installed == []
     assert removed == [policy_file]
+
+
+def test_darwin_write_unpins_before_writing_and_repins_after(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """`sudo tee` cannot overwrite an schg file either, so the privileged
+    writer owns the same lift-write-pin dance as the heal script."""
+    _force_darwin(monkeypatch)
+    rec = _Recorder()
+    monkeypatch.setattr(pwa.subprocess, "run", rec)
+    monkeypatch.setattr(pwa, "install_self_healing_daemon", lambda pf, c: None)
+
+    policy_file = tmp_path / "com.brave.Browser.plist"
+    pwa.sudo_write_policy(policy_file, "", [{"url": "https://a/"}])
+
+    flat = [" ".join(c) for c in rec.calls]
+    lift = flat.index(f"sudo chflags noschg {policy_file}")
+    write = next(i for i, f in enumerate(flat) if f.startswith("sudo tee"))
+    pin = flat.index(f"sudo chflags schg {policy_file}")
+    assert lift < write < pin
+
+
+def test_empty_table_leaves_the_policy_file_unpinned(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """An empty [pwa] table tears the daemon down; pinning the leftover file
+    would strand an immutable artifact with nothing left to maintain it."""
+    _force_darwin(monkeypatch)
+    rec = _Recorder()
+    monkeypatch.setattr(pwa.subprocess, "run", rec)
+    monkeypatch.setattr(pwa, "remove_self_healing_daemon", lambda pf: None)
+
+    policy_file = tmp_path / "com.brave.Browser.plist"
+    pwa.sudo_write_policy(policy_file, "", [])
+
+    flat = [" ".join(c) for c in rec.calls]
+    assert f"sudo chflags noschg {policy_file}" in flat
+    assert f"sudo chflags schg {policy_file}" not in flat
 
 
 def test_non_darwin_skips_daemon_calls(

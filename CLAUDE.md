@@ -81,6 +81,20 @@ Preserve these contracts unless a change explicitly redesigns them:
    privileged write; an empty `[pwa]` table removes the daemon and its
    support files. Keep `build_heal_script`/`build_launchd_plist` pure and
    `install_self_healing_daemon`/`remove_self_healing_daemon` patchable.
+   Two contracts defend the policy file against macOS itself. Some boots
+   run a `ManagedClient` reconcile that unlinks the orphan plist from
+   `/Library/Managed Preferences` (observed ~28s in; not every boot, and
+   not on every machine), and a browser auto-started as a login item that
+   reads the empty policy first will uninstall every managed PWA and never
+   reload the policy while running. So: `ThrottleInterval` stays pinned to
+   1 -- launchd's 10s default loses that race -- with `StartInterval` as
+   the dropped-notification safety net; and the policy file carries `schg`,
+   which makes the reconcile's `unlink` fail outright. `schg` also blocks
+   dotbrave's own writes, so every privileged write path lifts it, writes,
+   and re-pins, and teardown must unpin. Whether `schg` actually defeats
+   the reconcile is unverified -- the event is intermittent and resisted
+   every attempt to trigger it on demand -- so the heal log is the
+   instrument: a line in it means the pin failed that boot.
 5. Plain `apply` manages live apply. Endpoints bind to `127.0.0.1` and
    remain internal; no public endpoint or force-kill switch is exposed.
    Unsupported live settings and removals fall back to a normal close,

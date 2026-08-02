@@ -55,6 +55,16 @@ def macos_support_paths(policy_file: Path) -> tuple[Path, Path]:
     return source, heal
 
 
+def macos_heal_log(policy_file: Path) -> Path:
+    """Where the daemon records that it had to heal.
+
+    Boot-time heals are the ones that matter -- they mean the browser may
+    already have read an empty policy -- and at that point in boot there is no
+    user session to notify, so this file is the only evidence left to read
+    afterwards."""
+    return _MACOS_SUPPORT_DIR / f"{macos_bundle_id(policy_file)}.heal.log"
+
+
 def macos_daemon_label(policy_file: Path) -> str:
     """LaunchDaemon label for this browser, e.g. ``org.dotbrave.com.brave.Browser.pwa``."""
     return f"org.dotbrave.{macos_bundle_id(policy_file)}.pwa"
@@ -68,29 +78,64 @@ def macos_daemon_path(policy_file: Path) -> Path:
 def build_heal_script(source_plist: Path, managed_plist: Path) -> str:
     """Shell script the daemon runs. Idempotent: if the managed plist
     already matches the source it exits without writing, which prevents a
-    WatchPaths write->notify->write loop."""
+    WatchPaths write->notify->write loop.
+
+    Writing is a lift-write-pin dance because the policy file carries ``schg``
+    (see ``sudo_write_policy``), which blocks the daemon's own ``cp`` just as
+    surely as it blocks the reconcile it is there to defeat. Every heal is
+    logged, and -- when someone is logged in to see it -- announced."""
+    bundle = macos_bundle_id(managed_plist)
+    note = (
+        f"Managed PWA policy for {bundle} was restored. "
+        "Restart the browser to reinstall the apps."
+    )
     return (
         "#!/bin/sh\n"
         "# dotbrave self-healing PWA policy. Managed automatically; do not edit.\n"
         f'SRC="{source_plist}"\n'
         f'DEST="{managed_plist}"\n'
+        f'LOG="{macos_heal_log(managed_plist)}"\n'
         '[ -f "$SRC" ] || exit 0\n'
         'if cmp -s "$SRC" "$DEST"; then exit 0; fi\n'
         f'/bin/mkdir -p "{managed_plist.parent}"\n'
-        '/bin/cp "$SRC" "$DEST"\n'
+        '/usr/bin/chflags noschg "$DEST" 2>/dev/null\n'
+        # Bail rather than log a heal that did not happen -- the log is
+        # evidence, and evidence that lies is worse than none.
+        '/bin/cp "$SRC" "$DEST" || exit 1\n'
+        '/usr/bin/chflags schg "$DEST" 2>/dev/null\n'
         "/usr/bin/killall cfprefsd 2>/dev/null\n"
+        '/bin/echo "$(/bin/date -u +%Y-%m-%dT%H:%M:%SZ) healed" >> "$LOG"\n'
+        # Before login /dev/console belongs to root, so there is nobody to
+        # tell; the log above already caught it.
+        'uid=$(/usr/bin/stat -f%u /dev/console 2>/dev/null)\n'
+        'if [ -n "$uid" ] && [ "$uid" -ge 501 ] 2>/dev/null; then\n'
+        '  /bin/launchctl asuser "$uid" /usr/bin/osascript'
+        f" -e 'display notification \"{note}\" with title \"dotbrave\"'"
+        " 2>/dev/null\n"
+        "fi\n"
         "exit 0\n"
     )
 
 
 def build_launchd_plist(label: str, heal_script: Path, watch_dir: str) -> bytes:
-    """Serialize a WatchPaths LaunchDaemon plist that runs the heal script."""
+    """Serialize a WatchPaths LaunchDaemon plist that runs the heal script.
+
+    macOS prunes plists it does not own from ``/Library/Managed Preferences``
+    during boot, so the daemon is racing the browser's own login-item launch:
+    a browser that starts first reads an empty policy, uninstalls every
+    managed PWA, and never reloads the policy while running. ``ThrottleInterval``
+    is therefore pinned to 1 -- launchd's default of 10 seconds is enough of a
+    delay to lose that race -- and ``StartInterval`` re-checks periodically so
+    a dropped WatchPaths notification still heals on its own. The heal script's
+    ``cmp -s`` guard keeps both triggers cheap and loop-free.
+    """
     payload = {
         "Label": label,
         "ProgramArguments": ["/bin/sh", str(heal_script)],
         "WatchPaths": [watch_dir],
         "RunAtLoad": True,
-        "ThrottleInterval": 10,
+        "ThrottleInterval": 1,
+        "StartInterval": 60,
     }
     return plistlib.dumps(payload, fmt=plistlib.FMT_XML)
 
@@ -107,6 +152,24 @@ def _sudo_install_file(path: Path, content: bytes, mode: str) -> None:
     )
     subprocess.run(["sudo", "chown", "root:wheel", str(path)], check=True)
     subprocess.run(["sudo", "chmod", mode, str(path)], check=True)
+
+
+def _darwin_clear_immutable(path: Path) -> None:
+    """Lift ``schg`` so a privileged writer can replace or delete ``path``."""
+    subprocess.run(
+        ["sudo", "chflags", "noschg", str(path)],
+        check=False, stderr=subprocess.DEVNULL,
+    )
+
+
+def _darwin_set_immutable(path: Path) -> None:
+    """Pin ``path`` against macOS's boot-time reconcile of the managed
+    preferences directory, which unlinks plists no configuration profile
+    claims."""
+    subprocess.run(
+        ["sudo", "chflags", "schg", str(path)],
+        check=False, stderr=subprocess.DEVNULL,
+    )
 
 
 def install_self_healing_daemon(policy_file: Path, managed_content: bytes) -> None:
@@ -144,7 +207,11 @@ def remove_self_healing_daemon(policy_file: Path) -> None:
         ["sudo", "launchctl", "bootout", "system", str(daemon_path)],
         check=False, stderr=subprocess.DEVNULL,
     )
-    for p in (daemon_path, heal_script, source_plist):
+    # Nothing is left to maintain the policy file, so it must not stay pinned:
+    # an immutable orphan would outlive the uninstall.
+    _darwin_clear_immutable(policy_file)
+    for p in (daemon_path, heal_script, source_plist,
+              macos_heal_log(policy_file)):
         subprocess.run(["sudo", "rm", "-f", str(p)], check=False)
 
 
@@ -353,6 +420,8 @@ def sudo_write_policy(
         ["sudo", "mkdir", "-p", "-m", "0755", str(policy_file.parent)],
         check=True,
     )
+    if sys.platform == "darwin":
+        _darwin_clear_immutable(policy_file)
     subprocess.run(
         ["sudo", "tee", str(policy_file)],
         input=content,
@@ -360,6 +429,8 @@ def sudo_write_policy(
         check=True,
     )
     if sys.platform == "darwin":
+        if entries:
+            _darwin_set_immutable(policy_file)
         subprocess.run(
             ["sudo", "killall", "cfprefsd"],
             check=False,
