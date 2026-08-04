@@ -85,7 +85,20 @@ def heal_script_source() -> Path:
 
 
 def build_heal_script(source_plist: Path, managed_plist: Path) -> str:
-    """Shell wrapper that feeds the packaged heal script its paths."""
+    """Self-contained shell script the daemon runs.
+
+    Inlines the packaged data file's contents rather than ``exec``-ing its
+    path, so the installed script keeps healing even if the dotbrave
+    package that generated it is later upgraded, moved to a different
+    venv, or uninstalled -- none of which should silently stop a
+    root-owned daemon that already exists on disk.
+    """
+    heal_body = heal_script_source().read_text()
+    # The data file carries its own `#!/bin/sh` for standalone use (e.g. by
+    # the Nix module). This script already opens with one, so drop the
+    # data file's copy rather than leave a second shebang sitting mid-file
+    # as a stray comment.
+    _, _, heal_body = heal_body.partition("\n")
     return (
         "#!/bin/sh\n"
         "# dotbrave self-healing PWA policy. Managed automatically; do not edit.\n"
@@ -93,8 +106,11 @@ def build_heal_script(source_plist: Path, managed_plist: Path) -> str:
         f'DEST="{managed_plist}"\n'
         f'LOG="{macos_heal_log(managed_plist)}"\n'
         f'BUNDLE="{macos_bundle_id(managed_plist)}"\n'
+        # Exported for parity with the data file's own contract (it may run
+        # standalone, e.g. from the Nix module) even though inlining here
+        # already puts SRC/DEST/LOG/BUNDLE in the same shell.
         "export SRC DEST LOG BUNDLE\n"
-        f'exec /bin/sh "{heal_script_source()}"\n'
+        f"{heal_body}"
     )
 
 

@@ -351,11 +351,33 @@ def test_heal_script_reads_paths_from_environment() -> None:
         assert hardcoded not in text
 
 
-def test_built_script_sets_env_and_execs_the_data_file() -> None:
+def test_built_script_sets_exports_and_inlines_the_data_file() -> None:
     built = pwa.build_heal_script(SOURCE, BRAVE_PLIST)
     assert f'SRC="{SOURCE}"' in built
     assert f'DEST="{BRAVE_PLIST}"' in built
-    assert str(pwa.heal_script_source()) in built
+    assert f'LOG="{pwa.macos_heal_log(BRAVE_PLIST)}"' in built
+    assert f'BUNDLE="{pwa.macos_bundle_id(BRAVE_PLIST)}"' in built
+    # `exec` only propagates *exported* variables into the replacement
+    # process image; inlining no longer needs that for correctness, but
+    # dropping this line would still be a bug worth catching -- it is what
+    # keeps the data file usable standalone (e.g. from the Nix module).
+    assert "export SRC DEST LOG BUNDLE" in built
+    # The healing logic itself must be genuinely inlined, not merely
+    # referenced by path.
+    assert 'cmp -s "$SRC" "$DEST"' in built
+    assert "chflags noschg" in built
+    assert "chflags schg" in built
+    assert "killall cfprefsd" in built
+    assert built.rstrip().endswith("exit 0")
+
+
+def test_built_script_has_no_runtime_dependency_on_the_package() -> None:
+    """Self-contained: moving, upgrading, or uninstalling dotbrave after
+    install must not silently stop the already-installed daemon from
+    healing."""
+    built = pwa.build_heal_script(SOURCE, BRAVE_PLIST)
+    assert str(pwa.heal_script_source()) not in built
+    assert "exec" not in built
 
 
 def test_heal_script_creates_its_log_directory() -> None:
