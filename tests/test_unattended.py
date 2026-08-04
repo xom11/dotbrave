@@ -420,3 +420,19 @@ def test_already_privileged_reads_euid_not_sudo_cache(monkeypatch):
     assert orchestrator._already_privileged() is True
     monkeypatch.setattr(orchestrator.os, "geteuid", lambda: 501, raising=False)
     assert orchestrator._already_privileged() is False
+
+
+def test_already_privileged_returns_false_when_geteuid_is_absent(monkeypatch):
+    """`os.geteuid` không tồn tại trên Windows -- và trên runner Windows thật,
+    `sys.platform` bị một test khác monkeypatch thành "linux" để test nhánh
+    POSIX của `process.py`, nên helper này vẫn bị gọi với platform giả mà
+    không có `os.geteuid` thật đi kèm. Đây chính là cái CI đã gặp
+    (`AttributeError: module 'os' has no attribute 'geteuid'`), không phải
+    giả thuyết.
+
+    An toàn là trả `False` ("chưa có sẵn quyền"), để caller đi tiếp nhánh
+    escalate-or-skip sẵn có thay vì tưởng nhầm là ghi thẳng được.
+    """
+    monkeypatch.setattr(orchestrator.sys, "platform", "linux")
+    monkeypatch.delattr(orchestrator.os, "geteuid", raising=False)
+    assert orchestrator._already_privileged() is False

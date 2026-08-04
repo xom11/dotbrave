@@ -198,7 +198,16 @@ def _already_privileged() -> bool:
             return bool(ctypes.windll.shell32.IsUserAnAdmin())
         except Exception:
             return False
-    return os.geteuid() == 0
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is None:
+        # A platform that is neither win32 nor has os.geteuid -- e.g. a
+        # Windows runner where a test has monkeypatched sys.platform to
+        # steer another code path, which also steers this one.  False is
+        # the safe answer: it means "not already privileged", so the
+        # caller falls back to its existing escalate-or-skip behaviour
+        # instead of assuming it can write.
+        return False
+    return geteuid() == 0
 
 
 def _partial_note(applied: list[str], pending: list[Plan]) -> str:
