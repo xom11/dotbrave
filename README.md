@@ -76,13 +76,56 @@ privilege:
 |---|---|---|
 | `homeManagerModules.default` | `[shortcuts]` + `[settings]` at activation | you |
 | `nixosModules.default` | `[pwa]` via `/etc/brave/policies/managed/` | root |
-| `darwinModules.default` | `[pwa]` via a managed plist + self-healing LaunchDaemon | root |
+| `darwinModules.default` | `[pwa]` via a managed plist + self-healing LaunchDaemon — **exclusive owner of that plist**, see below | root |
 
 Because the system modules already run as root, `[pwa]` never prompts for
 sudo. The home-manager module defaults to `skip = [ "pwa" ]` to match.
 Note the asymmetry: `[shortcuts]`/`[settings]` are read at activation
 time, but `[pwa]` is read at **evaluation** time — changing the PWA list
 needs a rebuild.
+
+**`--impure` is required.** The system modules read `[pwa].urls` with
+`builtins.readFile` on an absolute-path string, so evaluation is impure and
+`nixos-rebuild`/`darwin-rebuild --flake` (pure by default) will refuse:
+
+```bash
+nixos-rebuild  switch --impure --flake ~/.nix#hostname
+darwin-rebuild switch --impure --flake ~/.nix#hostname
+```
+
+A path literal would evaluate purely but would copy `brave.toml` into the
+store and freeze it there, losing the "edit your working tree" property.
+
+**The `[pwa]` table must exist** in a config passed to `services.dotbrave`.
+The CLI reads a missing table as "don't manage this namespace", but a module
+that writes the *whole* force-list cannot express that — it would install an
+empty policy, and Brave uninstalls every PWA not named in the list it is
+given. So an absent `[pwa]` is a hard eval error. Write `urls = []` if you
+really do mean "uninstall all", or leave `services.dotbrave.enable = false`.
+
+**macOS: the darwin module owns the managed plist outright.** It writes
+`/Library/Managed Preferences/com.brave.Browser.plist` from scratch with
+`WebAppInstallForceList` as its only key, pins it `schg`, and re-asserts it
+every 60 seconds. Any other `com.brave.Browser` policy key already in that
+file — homepage, extension forcelist, proxy, anything an MDM profile set — is
+dropped and stays dropped. `dotbrave apply` does *not* do this: it reads the
+existing payload and merges. The Nix module cannot, because the plist is
+runtime state and the file is built at evaluation time. **Do not enable the
+darwin module on a Mac whose MDM profile sets other Brave policy keys** — use
+`dotbrave apply` there instead.
+
+**macOS: there is no automatic teardown.** Setting
+`services.dotbrave.enable = false` removes the LaunchDaemon but leaves the
+plist on disk, still immutable, so even `sudo rm` fails. Undo it by hand:
+
+```bash
+sudo chflags noschg "/Library/Managed Preferences/com.brave.Browser.plist"
+sudo rm "/Library/Managed Preferences/com.brave.Browser.plist"
+```
+
+Until you do, Brave keeps enforcing the stale force-list. (`dotbrave apply`
+with an empty `[pwa]` table performs the same teardown automatically; the Nix
+module has no on-disable hook to hang it on.)
 
 ## Build your own config
 

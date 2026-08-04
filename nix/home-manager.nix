@@ -42,6 +42,16 @@ in
         A string (not a path literal) so the file is read from your working
         tree at activation time -- editing it takes effect on the next
         activation with no rebuild.
+
+        This module itself does not read the file at evaluation time, so it
+        alone does not make evaluation impure. Its companions do:
+        {option}`services.dotbrave.config` (NixOS/darwin) reads `[pwa].urls`
+        with `builtins.readFile` on this same absolute-path string, so any
+        host that enables both must rebuild with `--impure`:
+
+        ```
+        nixos-rebuild switch --impure --flake ~/.nix#hostname
+        ```
       '';
     };
 

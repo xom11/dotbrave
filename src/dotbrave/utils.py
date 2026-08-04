@@ -85,6 +85,13 @@ def _brave_proc_name() -> str:
 
 
 def brave_running() -> bool:
+    """True if Brave is running.
+
+    Raises :class:`dotbrave._base.process.ProcessStateUnknown` when the OS
+    process-listing tool (``pgrep`` on POSIX, ``tasklist`` on Windows) is not
+    on PATH -- "cannot tell" is never reported as "not running", because a
+    Preferences write made underneath a live Brave is silently undone.
+    """
     return BROWSER_PROCESS.running()
 
 
