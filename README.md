@@ -66,8 +66,23 @@ pip install dotbrave      # into the active environment
 ```
 
 Run from a branch: `uvx --from git+https://github.com/xom11/dotbrave dotbrave <args>`.
-Local dev: `pip install -e ".[test]"`. Nix users: the repo ships a flake
-(`nix run github:xom11/dotbrave`).
+Local dev: `pip install -e ".[test]"`.
+
+Nix users: the repo ships a flake — `nix run github:xom11/dotbrave`, an
+overlay (`overlays.default`), and three modules that split the work by
+privilege:
+
+| Output | Manages | Runs as |
+|---|---|---|
+| `homeManagerModules.default` | `[shortcuts]` + `[settings]` at activation | you |
+| `nixosModules.default` | `[pwa]` via `/etc/brave/policies/managed/` | root |
+| `darwinModules.default` | `[pwa]` via a managed plist + self-healing LaunchDaemon | root |
+
+Because the system modules already run as root, `[pwa]` never prompts for
+sudo. The home-manager module defaults to `skip = [ "pwa" ]` to match.
+Note the asymmetry: `[shortcuts]`/`[settings]` are read at activation
+time, but `[pwa]` is read at **evaluation** time — changing the PWA list
+needs a rebuild.
 
 ## Build your own config
 

@@ -17,6 +17,13 @@
         src = ./.;
         build-system = [ pkgs.python3Packages.hatchling ];
         nativeCheckInputs = [ pkgs.python3Packages.pytestCheckHook ];
+        # The darwin module execs this script directly out of the store, so
+        # it has to be installed as a file rather than only shipped inside
+        # the wheel's package data.
+        postInstall = ''
+          install -Dm755 src/dotbrave/data/heal.sh \
+            $out/share/dotbrave/heal.sh
+        '';
         disabledTests = [
           # touches the real on-disk Brave profile, skipped via env in CI too
           "test_dump_real_profile_succeeds"
@@ -35,6 +42,13 @@
       overlays.default = final: _prev: {
         dotbrave = mkDotbrave final;
       };
+
+      # Split by privilege: the CLI writes [shortcuts]+[settings] as you at
+      # home-manager activation, the system modules write [pwa] where the
+      # rebuild is already root.
+      homeManagerModules.default = import ./nix/home-manager.nix;
+      nixosModules.default = import ./nix/nixos.nix;
+      darwinModules.default = import ./nix/darwin.nix;
 
       packages = forAllSystems (system:
         let
