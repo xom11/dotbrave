@@ -74,9 +74,14 @@ in
         sudo rm "/Library/Managed Preferences/com.brave.Browser.plist"
         ```
 
-        Do that BEFORE, or right after, the rebuild that disables the module;
-        with the daemon gone nothing else will ever touch that file. (Brave
-        keeps enforcing the stale force-list until it is removed.)
+        Do that right after the rebuild that disables the module -- never
+        before it. While the daemon is still loaded, `WatchPaths` fires on the
+        `rm` and heal.sh reinstalls the plist and re-applies `schg` within
+        about a second (and `StartInterval` would catch it a minute later
+        even if the watch missed), so you get the immutable file straight back
+        with nothing to say why. Once the daemon is gone, nothing else will
+        ever touch that file. (Brave keeps enforcing the stale force-list
+        until it is removed.)
         :::
       '';
     };
