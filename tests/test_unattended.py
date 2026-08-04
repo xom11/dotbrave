@@ -1,0 +1,164 @@
+"""`apply --unattended`: không prompt, không đóng Brave, luôn exit 0.
+
+Chế độ này tồn tại cho home-manager activation. Ba lối thoát được kiểm
+riêng vì mỗi lối là một câu lệnh khác nhau trong cmd_apply.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+import pytest
+
+from dotbrave import browser as brave_pkg
+from dotbrave._base import orchestrator
+from dotbrave._base.utils import Plan
+
+
+@pytest.fixture
+def prefs_root(tmp_path: Path) -> Path:
+    profile = tmp_path / "Default"
+    profile.mkdir()
+    (profile / "Preferences").write_text(
+        json.dumps({"brave": {"tabs": {"vertical_tabs_enabled": False}}})
+    )
+    return tmp_path
+
+
+def _args(prefs_root: Path, config: Path, **kw) -> argparse.Namespace:
+    base = dict(
+        profile_root=prefs_root,
+        profile="Default",
+        config=str(config),
+        dry_run=False,
+        unattended=True,
+    )
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+def _plan(namespace: str, *, empty: bool, external: bool) -> Plan:
+    return Plan(
+        namespace=namespace,
+        diff_lines=[] if empty else [f"  {namespace}: change"],
+        apply_fn=lambda prefs: None,
+        verify_fn=lambda prefs: None,
+        external_apply_fn=(lambda: None) if external else None,
+    )
+
+
+def test_unattended_skips_privileged_plan_without_sudo(
+    prefs_root, tmp_path, monkeypatch, capsys
+):
+    """[pwa] cần root: bỏ qua, báo ra stderr, không gọi sudo, exit 0."""
+    called = []
+    monkeypatch.setattr(
+        orchestrator.subprocess, "run",
+        lambda *a, **k: called.append(a) or (_ for _ in ()).throw(
+            AssertionError("subprocess.run must not be called")
+        ),
+    )
+    cfg = tmp_path / "b.toml"
+    cfg.write_text('[pwa]\nurls = ["https://example.com"]\n')
+
+    orchestrator.cmd_apply(
+        _args(prefs_root, cfg),
+        display_name="Brave",
+        running_fn=lambda: False,
+        find_cmdline_fn=lambda: None,
+        restart_fn=lambda c: c,
+        build_plans_fn=lambda p, prefs, doc: [
+            _plan("pwa", empty=False, external=True)
+        ],
+    )
+
+    err = capsys.readouterr().err
+    assert "unattended" in err
+    assert "[pwa]" in err
+    assert called == []
+
+
+def test_unattended_still_applies_unprivileged_plans(
+    prefs_root, tmp_path, capsys
+):
+    """[pwa] bị bỏ không được kéo theo [settings]."""
+    applied = []
+    settings = _plan("settings", empty=False, external=False)
+    settings.apply_fn = lambda prefs: applied.append("settings")
+    cfg = tmp_path / "b.toml"
+    cfg.write_text('[settings]\n"a.b" = true\n[pwa]\nurls = []\n')
+
+    orchestrator.cmd_apply(
+        _args(prefs_root, cfg),
+        display_name="Brave",
+        running_fn=lambda: False,
+        find_cmdline_fn=lambda: None,
+        restart_fn=lambda c: c,
+        build_plans_fn=lambda p, prefs, doc: [
+            _plan("pwa", empty=False, external=True),
+            settings,
+        ],
+    )
+
+    assert applied == ["settings"]
+
+
+def test_unattended_does_not_close_running_browser(
+    prefs_root, tmp_path, monkeypatch, capsys
+):
+    """Brave đang chạy, không có live endpoint: bỏ qua chứ không đóng."""
+    monkeypatch.setattr(orchestrator, "find_devtools_port", lambda r, p: None)
+    closed = []
+    cfg = tmp_path / "b.toml"
+    cfg.write_text('[settings]\n"a.b" = true\n')
+
+    orchestrator.cmd_apply(
+        _args(prefs_root, cfg),
+        display_name="Brave",
+        running_fn=lambda: True,
+        find_cmdline_fn=lambda: None,
+        restart_fn=lambda c: c,
+        build_plans_fn=lambda p, prefs, doc: [
+            _plan("settings", empty=False, external=False)
+        ],
+        live_apply_fn=lambda *a: None,
+        graceful_close_fn=lambda: closed.append(True),
+        launch_live_fn=lambda *a: [],
+    )
+
+    assert closed == []
+    assert "unattended" in capsys.readouterr().err
+
+
+def test_without_unattended_behaviour_is_unchanged(
+    prefs_root, tmp_path, monkeypatch
+):
+    """Không hồi quy: bỏ cờ thì vẫn đóng Brave như cũ."""
+    monkeypatch.setattr(orchestrator, "find_devtools_port", lambda r, p: None)
+    monkeypatch.setattr(orchestrator, "pick_unused_port", lambda: 9222)
+    monkeypatch.setattr(
+        orchestrator, "wait_for_devtools_endpoint", lambda p, n: None
+    )
+    monkeypatch.setattr(
+        orchestrator, "remember_devtools_port", lambda r, p, port: None
+    )
+    closed = []
+    cfg = tmp_path / "b.toml"
+    cfg.write_text('[settings]\n"a.b" = true\n')
+
+    orchestrator.cmd_apply(
+        _args(prefs_root, cfg, unattended=False),
+        display_name="Brave",
+        running_fn=lambda: True,
+        find_cmdline_fn=lambda: None,
+        restart_fn=lambda c: c,
+        build_plans_fn=lambda p, prefs, doc: [
+            _plan("settings", empty=False, external=False)
+        ],
+        live_apply_fn=lambda *a: None,
+        graceful_close_fn=lambda: closed.append(True),
+        launch_live_fn=lambda *a: ["brave"],
+    )
+
+    assert closed == [True]

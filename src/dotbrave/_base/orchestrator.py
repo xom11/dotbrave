@@ -178,6 +178,23 @@ def cmd_apply(
         print("\n(dry-run, nothing written)")
         return
 
+    unattended = getattr(args, "unattended", False)
+
+    def _needs_root(p) -> bool:
+        return p.external_apply_fn is not None and not p.empty
+
+    if unattended and any(_needs_root(p) for p in plans):
+        names = ", ".join(f"[{p.namespace}]" for p in plans if _needs_root(p))
+        print(
+            f"unattended: skipping {names} -- it needs elevated privileges. "
+            f"Run `dotbrave apply` from a terminal to apply it.",
+            file=sys.stderr,
+        )
+        plans = [p for p in plans if not _needs_root(p)]
+        non_empty = [p for p in plans if not p.empty]
+        if not non_empty:
+            return
+
     needs_escalation = any(
         p.external_apply_fn is not None and not p.empty for p in plans
     )
@@ -227,6 +244,15 @@ def cmd_apply(
         if live_apply_fn is not None:
             live_port = find_devtools_port(args.profile_root, args.profile)
             if live_port is None:
+                if unattended:
+                    print(
+                        "unattended: Brave is running without a live "
+                        "endpoint; skipping rather than closing it. Run "
+                        "`dotbrave apply` from a terminal, or apply while "
+                        "Brave is closed.",
+                        file=sys.stderr,
+                    )
+                    return
                 if graceful_close_fn is None or launch_live_fn is None:
                     sys.exit(
                         f"error: {display_name} is running but cannot be "
@@ -250,6 +276,13 @@ def cmd_apply(
                 live_apply_fn(live_port, prefs_path, prefs, plans)
             except LiveApplyUnsupported as e:
                 settings = "\n".join(f"  {key}" for key in e.keys)
+                if unattended:
+                    print(
+                        "unattended: Brave cannot apply these settings live "
+                        "and closing it is not allowed:\n" + settings,
+                        file=sys.stderr,
+                    )
+                    return
                 if graceful_close_fn is None or launch_live_fn is None:
                     sys.exit(
                         f"error: {e.browser_name} cannot apply these settings "
@@ -274,6 +307,13 @@ def cmd_apply(
                 "request a normal close for offline apply."
             )
         elif relaunch_live_port is None:
+            if unattended:
+                print(
+                    "unattended: Brave is running and offline apply would "
+                    "close it; skipping.",
+                    file=sys.stderr,
+                )
+                return
             saved_cmdline = find_cmdline_fn()
             print(f"closing {display_name} normally for offline apply")
             graceful_close_fn()
@@ -638,6 +678,14 @@ Examples:
         help="allow fetching configs over plain http:// (NOT recommended; the "
         "response can be modified in transit and a malicious [pwa] table "
         "would run through sudo)",
+    )
+    a.add_argument(
+        "--unattended",
+        action="store_true",
+        help="never prompt and never close a running Brave. Anything that "
+        "would need elevated privileges or a browser restart is reported "
+        "on stderr and skipped, and the command still exits 0. Intended "
+        "for home-manager activation and other non-interactive runners.",
     )
     a.add_argument("-n", "--dry-run", action="store_true")
     a.set_defaults(func=cmd_apply_fn)
