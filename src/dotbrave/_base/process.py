@@ -10,6 +10,34 @@ import time
 from pathlib import Path
 
 
+class ProcessStateUnknown(RuntimeError):
+    """Whether the browser is running could not be determined.
+
+    Emphatically NOT "determined: nothing is running".  Raised out of
+    :meth:`BrowserProcess.running` when the OS process-listing tool is
+    absent altogether -- ``pgrep`` on POSIX, ``tasklist`` on Windows.
+    The tools' own non-zero exit for "nothing matched" is a real answer
+    and keeps returning an empty list.
+
+    The cause in practice is a constrained PATH.  A home-manager
+    activation script exports a PATH of Nix store paths only, and macOS
+    keeps ``pgrep`` in ``/usr/bin`` -- so the tool is missing exactly in
+    the environment dotbrave's Nix module targets.
+
+    Callers must not fold this into "not running".  Doing so sends an
+    ``apply`` down the offline path against a live browser, which then
+    flushes its in-memory Preferences back over the file: the write is
+    silently undone while the run reports success.
+    """
+
+    def __init__(self, tool: str):
+        self.tool = tool
+        super().__init__(
+            f"cannot determine whether the browser is running: {tool} was "
+            f"not found on PATH"
+        )
+
+
 def _is_macos() -> bool:
     return sys.platform == "darwin"
 
@@ -236,6 +264,12 @@ class BrowserProcess:
         return self.proc_name_linux
 
     def _pids_windows(self) -> list[str]:
+        """Pids via ``tasklist``; raises ProcessStateUnknown if it is gone.
+
+        Same split as :meth:`_pids_unix`: a non-zero exit is ``tasklist``
+        telling us it found nothing, while a missing ``tasklist`` tells
+        us nothing at all.
+        """
         name = self.proc_name()
         try:
             out = subprocess.check_output(
@@ -243,7 +277,9 @@ class BrowserProcess:
                  "/FO", "CSV", "/NH"],
                 stderr=subprocess.DEVNULL,
             )
-        except (subprocess.CalledProcessError, FileNotFoundError):
+        except FileNotFoundError as e:
+            raise ProcessStateUnknown("tasklist") from e
+        except subprocess.CalledProcessError:
             return []
         pids: list[str] = []
         for line in out.decode("utf-8", "replace").strip().splitlines():
@@ -254,9 +290,15 @@ class BrowserProcess:
         return pids
 
     def running(self) -> bool:
+        """``True``/``False``; raises ProcessStateUnknown if it can't tell.
+
+        Unlike :meth:`pids`, this one refuses to guess.  Callers branch
+        on it to decide whether writing Preferences offline is safe, and
+        a false negative there loses the write silently.
+        """
         if _is_windows():
             return bool(self._pids_windows())
-        return bool(self.pids())
+        return bool(self._pids_unix())
 
     def _linux_scoping_active(self) -> bool:
         """True when Linux pid selection must be narrowed.
@@ -303,19 +345,43 @@ class BrowserProcess:
     def _apply_linux_filter(self, pids: list[str]) -> list[str]:
         return [p for p in pids if self._pid_matches_scope(p)]
 
-    def pids(self) -> list[str]:
-        if _is_windows():
-            return self._pids_windows()
+    def _pids_unix(self) -> list[str]:
+        """Pids via ``pgrep``; raises ProcessStateUnknown if it is absent.
+
+        ``pgrep`` exits non-zero when nothing matched -- a real answer,
+        and the overwhelmingly common one.  A missing ``pgrep`` is not
+        an answer at all, so the two are kept apart here rather than
+        collapsed into one ``except`` clause.
+        """
         try:
             out = subprocess.check_output(
                 ["pgrep", "-x", self.proc_name()], stderr=subprocess.DEVNULL
             )
-        except (subprocess.CalledProcessError, FileNotFoundError):
+        except FileNotFoundError as e:
+            raise ProcessStateUnknown("pgrep") from e
+        except subprocess.CalledProcessError:
             return []
         raw = out.decode().split()
         if self._linux_scoping_active():
             return self._apply_linux_filter(raw)
         return raw
+
+    def pids(self) -> list[str]:
+        """Best-effort pid list; ``[]`` when the state can't be determined.
+
+        Deliberately lossy, and deliberately different from
+        :meth:`running`.  Every caller of this method iterates the
+        result -- find the main cmdline, kill the scoped set -- where
+        "do nothing" is the right response to "cannot enumerate".  Only
+        callers that must tell "none" from "unknown" apart use
+        :meth:`running`, which propagates instead.
+        """
+        try:
+            if _is_windows():
+                return self._pids_windows()
+            return self._pids_unix()
+        except ProcessStateUnknown:
+            return []
 
     def find_main_cmdline(self) -> list[str] | None:
         """The main browser process is the one without ``--type=...``."""

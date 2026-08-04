@@ -4,6 +4,23 @@
 { config, lib, pkgs, ... }:
 let
   cfg = config.programs.dotbrave;
+
+  # dotbrave shells out to the OS process-listing tool to decide whether Brave
+  # is running: `pgrep` on POSIX, `tasklist` on Windows. home-manager's
+  # activation script exports a PATH of Nix store paths ONLY -- no /usr/bin,
+  # no /bin -- and on darwin `pgrep` lives in /usr/bin. Without this, dotbrave
+  # cannot see a running Brave; it then writes Preferences offline and the
+  # live Brave flushes its in-memory copy back over the write.
+  #
+  # These are PATH *directories*, not hardcoded binary paths: dotbrave still
+  # calls `pgrep` by bare name and still gets whatever the machine provides.
+  # On darwin that has to be the OS copy (nixpkgs has no darwin procps, and
+  # macOS ships pgrep in /usr/bin on every machine); on Linux it comes from
+  # nixpkgs, so nothing outside the store is assumed.
+  processToolsPath =
+    if pkgs.stdenv.hostPlatform.isDarwin
+    then "/usr/bin:/bin"
+    else lib.makeBinPath [ pkgs.procps ];
 in
 {
   options.programs.dotbrave = {
@@ -41,11 +58,15 @@ in
   config = lib.mkIf cfg.enable {
     home.packages = [ cfg.package ];
 
+    # PATH is prepended, not replaced, and the whole thing runs in a subshell
+    # so no later activation entry inherits the change.
     home.activation.dotbrave = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
-      run ${lib.getExe cfg.package} apply --unattended \
-        ${lib.concatMapStringsSep " " (n: "--skip ${n}") cfg.skip} \
-        ${lib.escapeShellArg cfg.config} || \
-        echo "dotbrave: apply failed, continuing activation" >&2
+      (
+        export PATH="${processToolsPath}:$PATH"
+        run ${lib.getExe cfg.package} apply --unattended \
+          ${lib.concatMapStringsSep " " (n: "--skip ${n}") cfg.skip} \
+          ${lib.escapeShellArg cfg.config}
+      ) || echo "dotbrave: apply failed, continuing activation" >&2
     '';
   };
 }

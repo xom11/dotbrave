@@ -37,6 +37,7 @@ from dotbrave._base.live_apply import (
     apply_external_plans,
     write_state_files,
 )
+from dotbrave._base import process as _process
 from dotbrave._base.utils import (
     Plan,
     backup_prefs,
@@ -123,6 +124,60 @@ def load_toml_source(
             src, allow_http=allow_http, expect_sha256=expect_sha256
         )
     return _load_toml(Path(src))
+
+
+def _running_state(
+    running_fn: Callable[[], bool],
+    *,
+    display_name: str,
+    unattended: bool,
+) -> bool | None:
+    """``running_fn()``, with a third answer: None means "don't proceed".
+
+    ``running_fn`` raises :class:`ProcessStateUnknown` when the OS
+    process-listing tool is missing and the browser's state therefore
+    cannot be read.  Both callers commit a Preferences write shortly
+    after this point, and a write made underneath a live browser is
+    silently undone -- the browser flushes its own in-memory copy back
+    over the file.  So neither caller may guess:
+
+    - ``--unattended`` reports on stderr and returns None, which the
+      caller turns into an exit-0 skip.  That is the flag's standing
+      contract: report and skip anything it cannot do safely.
+    - otherwise this exits, naming the tool that is missing.
+
+    Both paths return *before* any backup is taken.  A backup for a
+    write that never happens is pure litter -- the observed failure left
+    16 of them, ~200 KB each, on one machine.
+    """
+    try:
+        return running_fn()
+    # Looked up through the module, not imported by name: several tests
+    # `importlib.reload` _base.process, which rebinds the class to a new
+    # object.  A name imported here would then be the pre-reload class and
+    # would stop matching what a reloaded BrowserProcess raises.
+    except _process.ProcessStateUnknown as e:
+        if unattended:
+            print(
+                f"unattended: cannot tell whether {display_name} is running "
+                f"({e.tool} was not found on PATH); skipping. Writing "
+                f"Preferences now could be silently undone by a running "
+                f"{display_name}.",
+                file=sys.stderr,
+            )
+            return None
+        sys.exit(
+            f"error: cannot determine whether {display_name} is running -- "
+            f"{e.tool} was not found on PATH.\n"
+            f"  Refusing to guess. Applying offline while {display_name} "
+            f"might be running is silently\n"
+            f"  undone: {display_name} holds Preferences in memory and "
+            f"flushes its own copy back over\n"
+            f"  the file, so the change disappears while the command reports "
+            f"success.\n"
+            f"  Put {e.tool} on PATH (macOS: /usr/bin; Linux: the procps "
+            f"package) and retry."
+        )
 
 
 def cmd_apply(
@@ -229,7 +284,12 @@ def cmd_apply(
     saved_cmdline: list[str] | None = None
     was_closed = False
     relaunch_live_port: int | None = None
-    if running_fn():
+    is_running = _running_state(
+        running_fn, display_name=display_name, unattended=unattended
+    )
+    if is_running is None:
+        return
+    if is_running:
         if all(p.external_apply_fn is not None for p in non_empty):
             # Every requested change lives in external managed policy
             # ([pwa]): nothing touches Preferences and nothing needs the
@@ -448,7 +508,18 @@ def cmd_restore(
 
     saved_cmdline: list[str] | None = None
     was_closed = False
-    if running_fn():
+    # `restore` copies a backup over Preferences, so it loses the same
+    # race `apply` does when the browser turns out to be running.  Same
+    # refusal, same wording; `--unattended` reaches here through
+    # `apply --undo`.
+    is_running = _running_state(
+        running_fn,
+        display_name=display_name,
+        unattended=getattr(args, "unattended", False),
+    )
+    if is_running is None:
+        return
+    if is_running:
         saved_cmdline = find_cmdline_fn()
         print(f"closing {display_name} normally for restore")
         graceful_close_fn()

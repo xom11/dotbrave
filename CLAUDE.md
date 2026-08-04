@@ -146,6 +146,19 @@ Preserve these contracts unless a change explicitly redesigns them:
   by Snap/Flatpak stable installs, whose paths a filter would exclude).
   macOS (`osascript quit`) and Windows (`taskkill /IM`) close by
   app/image name and remain instance-global.
+- "Cannot determine whether the browser is running" is a third state, not
+  a synonym for "not running". A missing `pgrep`/`tasklist` raises
+  `ProcessStateUnknown` out of `BrowserProcess.running()`; the tools' own
+  non-zero exit for "nothing matched" stays an empty list. `pids()` remains
+  best-effort and swallows it, because every caller of `pids()` iterates the
+  result. `apply`/`restore` refuse to guess: `--unattended` reports and skips
+  (exit 0), otherwise the run exits naming the tool — and neither path takes
+  a backup, since a backup for a write that never happens only accumulates.
+  This is not hypothetical: home-manager's activation PATH holds Nix store
+  paths only, so `/usr/bin/pgrep` is invisible there, and the old
+  conflated `except` made every activation write Preferences underneath a
+  live Brave, which flushed its own copy back over it. `nix/home-manager.nix`
+  prepends the process tools' directory for exactly this reason.
 - Windows: dotbrave may run outside the interactive desktop session (SSH
   commands land in session 0; the browser's windows live in session 1).
   Window messages and GUI launches do not cross sessions, so
