@@ -59,6 +59,15 @@
           default = dotbrave;
         });
 
+      # Eval-time tests for the [pwa] Nix path (nix/pwa-policy.nix). The
+      # derivation is trivial on purpose: importing nix/tests.nix IS the test,
+      # because a failing case throws while `builtins.toJSON` forces it.
+      checks = forAllSystems (system:
+        let pkgs = nixpkgs.legacyPackages.${system}; in {
+          pwa-policy = pkgs.writeText "dotbrave-pwa-policy-tests.json"
+            (builtins.toJSON (import ./nix/tests.nix { inherit (pkgs) lib; }));
+        });
+
       devShells = forAllSystems (system:
         let pkgs = nixpkgs.legacyPackages.${system}; in {
           default = pkgs.mkShell {

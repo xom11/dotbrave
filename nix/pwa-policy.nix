@@ -17,8 +17,27 @@ let
   validUrls = tomlPath: doc:
     let
       at = "dotbrave: ${tomlPath}: [pwa]";
-      raw = doc.pwa or { };
+
+      # An ABSENT [pwa] table and an EMPTY one are opposites, and defaulting
+      # the missing table to `{ }` would quietly collapse them into the
+      # destructive one. The CLI reads a missing table as "this namespace has
+      # another owner, leave it alone"; but this module can only ever write a
+      # COMPLETE force-list, so the same input here would install an empty
+      # policy -- and Brave uninstalls every PWA not named in the list it is
+      # given. There is no way to express "leave it alone" in a file whose
+      # whole content is the policy, so refuse instead of guessing.
+      raw = doc.pwa or (throw ''
+        ${at} table is missing, but services.dotbrave.enable = true.
+          This module writes the WHOLE force-list, so an absent table cannot
+          mean "leave PWAs alone" the way it does for the dotbrave CLI -- it
+          would install an empty policy and Brave would uninstall every PWA.
+          Either add a [pwa] table to ${tomlPath} (use `urls = []` if you
+          really do mean "uninstall all"), or set
+          services.dotbrave.enable = false.'');
+
       extra = builtins.attrNames (builtins.removeAttrs raw [ "urls" ]);
+      # A present-but-bare `[pwa]` keeps meaning "uninstall all", matching
+      # `raw.get("urls", [])` in validate_table(). Only ABSENT is refused.
       urls = raw.urls or [ ];
 
       checkUrl = u:
