@@ -208,11 +208,26 @@ def cmd_apply(
         sys.exit("error: TOML root must be a table")
 
     prefs = load_prefs(prefs_path)
-    plans = build_plans_fn(
-        prefs_path, prefs, doc, skip=tuple(getattr(args, "skip", ()) or ())
-    )
+    skip = tuple(getattr(args, "skip", ()) or ())
+    plans = build_plans_fn(prefs_path, prefs, doc, skip=skip)
 
     if not plans:
+        # Two very different situations produce zero plans, and collapsing
+        # them into one error breaks the `--skip` contract.  A config whose
+        # only table is one another owner manages (`[pwa]`, written by the
+        # Nix system module) is a *correct* config: there is genuinely
+        # nothing left for the CLI to do, and saying "config has no tables"
+        # would be a lie that fails every home-manager activation.
+        skipped_present = [n for n in skip if n in doc]
+        if skipped_present:
+            names = ", ".join(f"[{n}]" for n in skipped_present)
+            flags = " ".join(f"--skip {n}" for n in skipped_present)
+            print(
+                f"nothing to apply -- every table in {args.config} is "
+                f"skipped: {names} ({flags}). Another owner manages it "
+                f"(e.g. a Nix system module writing the managed policy)."
+            )
+            return
         sys.exit(
             "error: config has no [shortcuts], [settings] or [pwa] table "
             "-- nothing to apply"
