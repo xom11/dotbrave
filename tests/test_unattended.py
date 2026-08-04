@@ -131,6 +131,40 @@ def test_unattended_does_not_close_running_browser(
     assert "unattended" in capsys.readouterr().err
 
 
+def test_unattended_does_not_close_when_live_apply_is_unsupported(
+    prefs_root, tmp_path, monkeypatch, capsys
+):
+    """live_apply_fn từ chối [settings]: bỏ qua chứ không đóng Brave để
+    áp offline. Cần một live endpoint THẬT (khác None) để đường đi vào
+    được tới live_apply_fn -- test trên chỉ phủ nhánh "chưa có endpoint"."""
+    monkeypatch.setattr(orchestrator, "find_devtools_port", lambda r, p: 9555)
+    closed = []
+    cfg = tmp_path / "b.toml"
+    cfg.write_text('[settings]\n"a.b" = true\n')
+
+    def _unsupported_live_apply(*_args):
+        raise orchestrator.LiveApplyUnsupported("Brave", ["a.b"])
+
+    orchestrator.cmd_apply(
+        _args(prefs_root, cfg),
+        display_name="Brave",
+        running_fn=lambda: True,
+        find_cmdline_fn=lambda: None,
+        restart_fn=lambda c: c,
+        build_plans_fn=lambda p, prefs, doc: [
+            _plan("settings", empty=False, external=False)
+        ],
+        live_apply_fn=_unsupported_live_apply,
+        graceful_close_fn=lambda: closed.append(True),
+        launch_live_fn=lambda *a: [],
+    )
+
+    err = capsys.readouterr().err
+    assert closed == []
+    assert "unattended" in err
+    assert "a.b" in err
+
+
 def test_without_unattended_behaviour_is_unchanged(
     prefs_root, tmp_path, monkeypatch
 ):
