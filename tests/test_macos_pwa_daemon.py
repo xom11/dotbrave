@@ -45,14 +45,17 @@ def test_daemon_label_and_path() -> None:
 def test_heal_script_is_idempotent_and_refreshes_cfprefsd() -> None:
     source = Path("/Library/Application Support/dotbrave/com.brave.Browser.managed.plist")
     script = pwa.build_heal_script(source, BRAVE_PLIST)
-    # Idempotent guard: identical content must short-circuit before writing,
-    # which is what breaks the WatchPaths -> write -> WatchPaths loop.
-    assert "cmp -s" in script
     assert str(source) in script
     assert str(BRAVE_PLIST) in script
-    # Refresh cfprefsd so the running browser/CFPreferences sees the value.
-    assert "killall cfprefsd" in script
     assert script.startswith("#!/bin/sh")
+    # The idempotent guard and the cfprefsd refresh live in the shared data
+    # file now, not the per-browser wrapper.
+    heal_text = pwa.heal_script_source().read_text()
+    # Idempotent guard: identical content must short-circuit before writing,
+    # which is what breaks the WatchPaths -> write -> WatchPaths loop.
+    assert "cmp -s" in heal_text
+    # Refresh cfprefsd so the running browser/CFPreferences sees the value.
+    assert "killall cfprefsd" in heal_text
 
 
 def test_launchd_plist_watches_managed_prefs_and_runs_at_load() -> None:
@@ -97,7 +100,8 @@ def test_heal_script_lifts_the_immutable_flag_around_its_write() -> None:
     """The policy file is pinned `schg` so macOS's boot-time reconcile cannot
     unlink it. That same flag blocks the daemon's own `cp`, so the script must
     lift it, write, and re-pin -- in that order."""
-    script = pwa.build_heal_script(SOURCE, BRAVE_PLIST)
+    # The lift-write-pin dance lives in the shared data file now.
+    script = pwa.heal_script_source().read_text()
     lift = script.index("chflags noschg")
     write = script.index('/bin/cp "$SRC" "$DEST"')
     pin = script.index("chflags schg")
@@ -109,14 +113,17 @@ def test_heal_script_records_every_heal_for_post_boot_forensics() -> None:
     and uninstalled its PWAs. The log is the only evidence that survives to be
     read after the fact -- a notification at that point in boot has nobody to
     show itself to."""
-    script = pwa.build_heal_script(SOURCE, BRAVE_PLIST)
-    assert str(pwa.macos_heal_log(BRAVE_PLIST)) in script
-    # Only actual heals are logged: the cmp short-circuit comes first.
-    assert script.index("cmp -s") < script.index('>> "$LOG"')
+    built = pwa.build_heal_script(SOURCE, BRAVE_PLIST)
+    assert str(pwa.macos_heal_log(BRAVE_PLIST)) in built
+    # Only actual heals are logged: the cmp short-circuit comes first. That
+    # ordering is data-file logic now, over the generic $LOG variable.
+    heal_text = pwa.heal_script_source().read_text()
+    assert heal_text.index("cmp -s") < heal_text.index('>> "$LOG"')
 
 
 def test_heal_script_warns_the_console_user_when_one_exists() -> None:
-    script = pwa.build_heal_script(SOURCE, BRAVE_PLIST)
+    # Notification logic lives in the shared data file now.
+    script = pwa.heal_script_source().read_text()
     # A root daemon cannot post to the user's session directly.
     assert "launchctl asuser" in script
     assert "osascript" in script
@@ -324,3 +331,33 @@ def test_non_darwin_skips_daemon_calls(
 
     assert installed == []
     assert removed == []
+
+
+def test_heal_script_ships_as_a_data_file() -> None:
+    """Nix module dùng chung file này, nên nó phải tồn tại trên đĩa."""
+    src = pwa.heal_script_source()
+    assert src.is_file()
+    text = src.read_text()
+    assert 'cmp -s "$SRC" "$DEST"' in text
+    assert "chflags noschg" in text
+    assert "chflags schg" in text
+    assert "killall cfprefsd" in text
+
+
+def test_heal_script_reads_paths_from_environment() -> None:
+    """Không hardcode đường dẫn -- Python và Nix truyền qua env."""
+    text = pwa.heal_script_source().read_text()
+    for hardcoded in ("/Library/Managed Preferences", "com.brave.Browser"):
+        assert hardcoded not in text
+
+
+def test_built_script_sets_env_and_execs_the_data_file() -> None:
+    built = pwa.build_heal_script(SOURCE, BRAVE_PLIST)
+    assert f'SRC="{SOURCE}"' in built
+    assert f'DEST="{BRAVE_PLIST}"' in built
+    assert str(pwa.heal_script_source()) in built
+
+
+def test_heal_script_creates_its_log_directory() -> None:
+    """LOG có thể nằm trong thư mục Nix chưa tạo."""
+    assert 'mkdir -p "$(dirname "$LOG")"' in pwa.heal_script_source().read_text()

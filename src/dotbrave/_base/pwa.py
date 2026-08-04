@@ -75,45 +75,26 @@ def macos_daemon_path(policy_file: Path) -> Path:
     return _MACOS_LAUNCHD_DIR / f"{macos_daemon_label(policy_file)}.plist"
 
 
-def build_heal_script(source_plist: Path, managed_plist: Path) -> str:
-    """Shell script the daemon runs. Idempotent: if the managed plist
-    already matches the source it exits without writing, which prevents a
-    WatchPaths write->notify->write loop.
+def heal_script_source() -> Path:
+    """Path to the packaged self-healing script.
 
-    Writing is a lift-write-pin dance because the policy file carries ``schg``
-    (see ``sudo_write_policy``), which blocks the daemon's own ``cp`` just as
-    surely as it blocks the reconcile it is there to defeat. Every heal is
-    logged, and -- when someone is logged in to see it -- announced."""
-    bundle = macos_bundle_id(managed_plist)
-    note = (
-        f"Managed PWA policy for {bundle} was restored. "
-        "Restart the browser to reinstall the apps."
-    )
+    Shipped as a data file rather than an f-string because the darwin Nix
+    module runs the same script; two copies of this shell would drift.
+    """
+    return Path(__file__).resolve().parent.parent / "data" / "heal.sh"
+
+
+def build_heal_script(source_plist: Path, managed_plist: Path) -> str:
+    """Shell wrapper that feeds the packaged heal script its paths."""
     return (
         "#!/bin/sh\n"
         "# dotbrave self-healing PWA policy. Managed automatically; do not edit.\n"
         f'SRC="{source_plist}"\n'
         f'DEST="{managed_plist}"\n'
         f'LOG="{macos_heal_log(managed_plist)}"\n'
-        '[ -f "$SRC" ] || exit 0\n'
-        'if cmp -s "$SRC" "$DEST"; then exit 0; fi\n'
-        f'/bin/mkdir -p "{managed_plist.parent}"\n'
-        '/usr/bin/chflags noschg "$DEST" 2>/dev/null\n'
-        # Bail rather than log a heal that did not happen -- the log is
-        # evidence, and evidence that lies is worse than none.
-        '/bin/cp "$SRC" "$DEST" || exit 1\n'
-        '/usr/bin/chflags schg "$DEST" 2>/dev/null\n'
-        "/usr/bin/killall cfprefsd 2>/dev/null\n"
-        '/bin/echo "$(/bin/date -u +%Y-%m-%dT%H:%M:%SZ) healed" >> "$LOG"\n'
-        # Before login /dev/console belongs to root, so there is nobody to
-        # tell; the log above already caught it.
-        'uid=$(/usr/bin/stat -f%u /dev/console 2>/dev/null)\n'
-        'if [ -n "$uid" ] && [ "$uid" -ge 501 ] 2>/dev/null; then\n'
-        '  /bin/launchctl asuser "$uid" /usr/bin/osascript'
-        f" -e 'display notification \"{note}\" with title \"dotbrave\"'"
-        " 2>/dev/null\n"
-        "fi\n"
-        "exit 0\n"
+        f'BUNDLE="{macos_bundle_id(managed_plist)}"\n'
+        "export SRC DEST LOG BUNDLE\n"
+        f'exec /bin/sh "{heal_script_source()}"\n'
     )
 
 
