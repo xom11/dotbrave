@@ -56,6 +56,22 @@ def test_no_skip_builds_every_present_namespace(prefs):
     assert sorted(p.namespace for p in plans) == ["pwa", "settings"]
 
 
+def test_cli_accepts_known_namespaces_and_is_repeatable(tmp_path):
+    from dotbrave.cli import build_parser
+
+    args = build_parser().parse_args(
+        [
+            "apply",
+            "--skip",
+            "settings",
+            "--skip",
+            "pwa",
+            str(tmp_path / "b.toml"),
+        ]
+    )
+    assert args.skip == ["settings", "pwa"]
+
+
 def test_cli_rejects_unknown_namespace(tmp_path):
     from dotbrave.cli import build_parser
 
