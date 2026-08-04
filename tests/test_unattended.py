@@ -52,6 +52,7 @@ def test_unattended_skips_privileged_plan_without_sudo(
     prefs_root, tmp_path, monkeypatch, capsys
 ):
     """[pwa] cần root: bỏ qua, báo ra stderr, không gọi sudo, exit 0."""
+    monkeypatch.setattr(orchestrator, "_already_privileged", lambda: False)
     called = []
     monkeypatch.setattr(
         orchestrator.subprocess, "run",
@@ -196,3 +197,78 @@ def test_without_unattended_behaviour_is_unchanged(
     )
 
     assert closed == [True]
+
+
+def test_unattended_applies_privileged_plan_when_already_root(
+    prefs_root, tmp_path, monkeypatch, capsys
+):
+    """Đã là root/admin: --unattended phải ÁP [pwa], không phải bỏ qua.
+
+    Đây là đường của apply.ps1 trên Windows -- nó chạy sẵn quyền
+    Administrator, nên bỏ qua [pwa] là bỏ đúng thứ duy nhất nó cần làm.
+    """
+    monkeypatch.setattr(orchestrator, "_already_privileged", lambda: True)
+    monkeypatch.setattr(
+        orchestrator.subprocess, "run",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("must not shell out when already privileged")
+        ),
+    )
+    applied = []
+    pwa = _plan("pwa", empty=False, external=True)
+    pwa.external_apply_fn = lambda: applied.append("pwa")
+    cfg = tmp_path / "b.toml"
+    cfg.write_text('[pwa]\nurls = ["https://example.com"]\n')
+
+    orchestrator.cmd_apply(
+        _args(prefs_root, cfg),
+        display_name="Brave",
+        running_fn=lambda: False,
+        find_cmdline_fn=lambda: None,
+        restart_fn=lambda c: c,
+        build_plans_fn=lambda p, prefs, doc, **kw: [pwa],
+    )
+
+    assert applied == ["pwa"]
+    assert "skipping" not in capsys.readouterr().err
+
+
+def test_attended_privileged_apply_skips_the_sudo_preflight(
+    prefs_root, tmp_path, monkeypatch
+):
+    """Đã là root thì gọi sudo là thừa, và chết trong môi trường không tương tác."""
+    monkeypatch.setattr(orchestrator, "_already_privileged", lambda: True)
+    monkeypatch.setattr(
+        orchestrator.subprocess, "run",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("must not call sudo when euid is already 0")
+        ),
+    )
+    applied = []
+    pwa = _plan("pwa", empty=False, external=True)
+    pwa.external_apply_fn = lambda: applied.append("pwa")
+    cfg = tmp_path / "b.toml"
+    cfg.write_text('[pwa]\nurls = ["https://example.com"]\n')
+
+    orchestrator.cmd_apply(
+        _args(prefs_root, cfg, unattended=False),
+        display_name="Brave",
+        running_fn=lambda: False,
+        find_cmdline_fn=lambda: None,
+        restart_fn=lambda c: c,
+        build_plans_fn=lambda p, prefs, doc, **kw: [pwa],
+    )
+
+    assert applied == ["pwa"]
+
+
+def test_already_privileged_reads_euid_not_sudo_cache(monkeypatch):
+    """`sudo -n true` thành công nghĩa là credential còn cache, KHÁC với đang là root.
+
+    Chỉ cái sau mới cho ghi thẳng, nên helper phải đọc euid.
+    """
+    monkeypatch.setattr(orchestrator.sys, "platform", "linux")
+    monkeypatch.setattr(orchestrator.os, "geteuid", lambda: 0)
+    assert orchestrator._already_privileged() is True
+    monkeypatch.setattr(orchestrator.os, "geteuid", lambda: 501)
+    assert orchestrator._already_privileged() is False

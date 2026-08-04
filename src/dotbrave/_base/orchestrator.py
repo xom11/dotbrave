@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import urllib.error
@@ -180,6 +181,26 @@ def _running_state(
         )
 
 
+def _already_privileged() -> bool:
+    """True when this process can already write the managed policy itself.
+
+    Windows: an elevated (Administrator) token.  POSIX: euid 0.
+
+    Deliberately NOT `sudo -n true`: a cached sudo credential means we
+    *could* escalate, not that we already hold the privilege, and only the
+    latter lets us write without shelling out.  The distinction matters in
+    non-interactive runners -- home-manager activation runs as you, while
+    Windows `apply.ps1` runs elevated, and the two need opposite answers.
+    """
+    if sys.platform == "win32":
+        import ctypes
+        try:
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return False
+    return os.geteuid() == 0
+
+
 def cmd_apply(
     args: argparse.Namespace,
     *,
@@ -255,7 +276,11 @@ def cmd_apply(
     def _needs_root(p) -> bool:
         return p.external_apply_fn is not None and not p.empty
 
-    if unattended and any(_needs_root(p) for p in plans):
+    if (
+        unattended
+        and not _already_privileged()
+        and any(_needs_root(p) for p in plans)
+    ):
         names = ", ".join(f"[{p.namespace}]" for p in plans if _needs_root(p))
         print(
             f"unattended: skipping {names} -- it needs elevated privileges. "
@@ -270,7 +295,7 @@ def cmd_apply(
     needs_escalation = any(
         p.external_apply_fn is not None and not p.empty for p in plans
     )
-    if needs_escalation:
+    if needs_escalation and not _already_privileged():
         if sys.platform == "win32":
             import ctypes
             if not ctypes.windll.shell32.IsUserAnAdmin():
