@@ -84,6 +84,7 @@ def test_sudo_preflight_handles_missing_sudo(
     raises FileNotFoundError. The orchestrator must surface a clean
     error, not a traceback.
     """
+    monkeypatch.setattr(orch, "_already_privileged", lambda: False)
     profile = tmp_path / "Default"
     profile.mkdir()
     (profile / "Preferences").write_text("{}")
@@ -119,6 +120,7 @@ def test_sudo_preflight_handles_calledprocesserror(
     is not in sudoers), the same clean error must fire."""
     import subprocess as sp
 
+    monkeypatch.setattr(orch, "_already_privileged", lambda: False)
     profile = tmp_path / "Default"
     profile.mkdir()
     (profile / "Preferences").write_text("{}")

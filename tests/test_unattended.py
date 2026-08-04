@@ -268,7 +268,11 @@ def test_already_privileged_reads_euid_not_sudo_cache(monkeypatch):
     Chỉ cái sau mới cho ghi thẳng, nên helper phải đọc euid.
     """
     monkeypatch.setattr(orchestrator.sys, "platform", "linux")
-    monkeypatch.setattr(orchestrator.os, "geteuid", lambda: 0)
+    # raising=False: os.geteuid doesn't exist on Windows, where this suite
+    # also runs (.github/workflows/ci.yml has a windows-latest job). The
+    # sys.platform patch above already forces the code under test past its
+    # win32 check, so the attribute is safe to fabricate here too.
+    monkeypatch.setattr(orchestrator.os, "geteuid", lambda: 0, raising=False)
     assert orchestrator._already_privileged() is True
-    monkeypatch.setattr(orchestrator.os, "geteuid", lambda: 501)
+    monkeypatch.setattr(orchestrator.os, "geteuid", lambda: 501, raising=False)
     assert orchestrator._already_privileged() is False
