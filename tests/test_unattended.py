@@ -68,7 +68,7 @@ def test_unattended_skips_privileged_plan_without_sudo(
         running_fn=lambda: False,
         find_cmdline_fn=lambda: None,
         restart_fn=lambda c: c,
-        build_plans_fn=lambda p, prefs, doc: [
+        build_plans_fn=lambda p, prefs, doc, **kw: [
             _plan("pwa", empty=False, external=True)
         ],
     )
@@ -95,7 +95,7 @@ def test_unattended_still_applies_unprivileged_plans(
         running_fn=lambda: False,
         find_cmdline_fn=lambda: None,
         restart_fn=lambda c: c,
-        build_plans_fn=lambda p, prefs, doc: [
+        build_plans_fn=lambda p, prefs, doc, **kw: [
             _plan("pwa", empty=False, external=True),
             settings,
         ],
@@ -119,7 +119,7 @@ def test_unattended_does_not_close_running_browser(
         running_fn=lambda: True,
         find_cmdline_fn=lambda: None,
         restart_fn=lambda c: c,
-        build_plans_fn=lambda p, prefs, doc: [
+        build_plans_fn=lambda p, prefs, doc, **kw: [
             _plan("settings", empty=False, external=False)
         ],
         live_apply_fn=lambda *a: None,
@@ -151,7 +151,7 @@ def test_unattended_does_not_close_when_live_apply_is_unsupported(
         running_fn=lambda: True,
         find_cmdline_fn=lambda: None,
         restart_fn=lambda c: c,
-        build_plans_fn=lambda p, prefs, doc: [
+        build_plans_fn=lambda p, prefs, doc, **kw: [
             _plan("settings", empty=False, external=False)
         ],
         live_apply_fn=_unsupported_live_apply,
@@ -187,7 +187,7 @@ def test_without_unattended_behaviour_is_unchanged(
         running_fn=lambda: True,
         find_cmdline_fn=lambda: None,
         restart_fn=lambda c: c,
-        build_plans_fn=lambda p, prefs, doc: [
+        build_plans_fn=lambda p, prefs, doc, **kw: [
             _plan("settings", empty=False, external=False)
         ],
         live_apply_fn=lambda *a: None,

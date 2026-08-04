@@ -153,7 +153,9 @@ def cmd_apply(
         sys.exit("error: TOML root must be a table")
 
     prefs = load_prefs(prefs_path)
-    plans = build_plans_fn(prefs_path, prefs, doc)
+    plans = build_plans_fn(
+        prefs_path, prefs, doc, skip=tuple(getattr(args, "skip", ()) or ())
+    )
 
     if not plans:
         sys.exit(
@@ -686,6 +688,16 @@ Examples:
         "would need elevated privileges or a browser restart is reported "
         "on stderr and skipped, and the command still exits 0. Intended "
         "for home-manager activation and other non-interactive runners.",
+    )
+    a.add_argument(
+        "--skip",
+        action="append",
+        choices=["shortcuts", "settings", "pwa"],
+        default=[],
+        metavar="NAMESPACE",
+        help="do not build a plan for this TOML table; repeatable. Use "
+        "when something else owns that namespace -- e.g. `--skip pwa` "
+        "when a Nix module writes the managed policy.",
     )
     a.add_argument("-n", "--dry-run", action="store_true")
     a.set_defaults(func=cmd_apply_fn)

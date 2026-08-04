@@ -49,7 +49,7 @@ def test_load_toml_well_formed_passes(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _build_pwa_only_plans(_prefs_path, _prefs, _doc):
+def _build_pwa_only_plans(_prefs_path, _prefs, _doc, **_kw):
     """Stand-in build_plans_fn that yields a single non-empty pwa-shaped
     plan -- enough to make the orchestrator hit the sudo preflight."""
     return [

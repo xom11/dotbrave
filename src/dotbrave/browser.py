@@ -97,20 +97,15 @@ DEFAULT_PROFILE_ROOT = _default_profile_root()
 # Plans
 # ---------------------------------------------------------------------------
 
-def _build_plans(prefs_path: Path, prefs: dict, doc: dict) -> list[Plan]:
+def _build_plans(
+    prefs_path: Path, prefs: dict, doc: dict, *, skip: tuple[str, ...] = ()
+) -> list[Plan]:
     plans: list[Plan] = []
-    if shortcuts_mod.NAMESPACE in doc:
-        plans.append(
-            shortcuts_mod.plan_apply(prefs_path, prefs, doc[shortcuts_mod.NAMESPACE])
-        )
-    if settings_mod.NAMESPACE in doc:
-        plans.append(
-            settings_mod.plan_apply(prefs_path, prefs, doc[settings_mod.NAMESPACE])
-        )
-    if pwa_mod.NAMESPACE in doc:
-        plans.append(
-            pwa_mod.plan_apply(prefs_path, prefs, doc[pwa_mod.NAMESPACE])
-        )
+    for mod in (shortcuts_mod, settings_mod, pwa_mod):
+        if mod.NAMESPACE in skip:
+            continue
+        if mod.NAMESPACE in doc:
+            plans.append(mod.plan_apply(prefs_path, prefs, doc[mod.NAMESPACE]))
     return plans
 
 

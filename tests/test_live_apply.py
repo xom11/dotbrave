@@ -32,7 +32,7 @@ def _profile(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def _build_plan(prefs_path: Path, _prefs: dict, _doc: dict) -> list[Plan]:
+def _build_plan(prefs_path: Path, _prefs: dict, _doc: dict, **_kw) -> list[Plan]:
     def apply_fn(prefs: dict) -> None:
         prefs["foo"]["bar"] = 1
 
@@ -191,7 +191,7 @@ def _sudo_preflight_ok(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _build_pwa_plan(calls: list[tuple[str, object]]):
-    def build(_prefs_path: Path, _prefs: dict, _doc: dict) -> list[Plan]:
+    def build(_prefs_path: Path, _prefs: dict, _doc: dict, **_kw) -> list[Plan]:
         return [
             Plan(
                 namespace="pwa",
@@ -280,7 +280,7 @@ def test_pwa_with_settings_changes_still_bootstraps_live_endpoint(
         orch, "remember_devtools_port", lambda root, profile, port: calls.append(("remember", port))
     )
 
-    def build(prefs_path: Path, _prefs: dict, _doc: dict) -> list[Plan]:
+    def build(prefs_path: Path, _prefs: dict, _doc: dict, **_kw) -> list[Plan]:
         def apply_fn(prefs: dict) -> None:
             prefs["foo"]["bar"] = 1
 
