@@ -201,6 +201,24 @@ def _already_privileged() -> bool:
     return os.geteuid() == 0
 
 
+def _partial_note(applied: list[str], pending: list[Plan]) -> str:
+    """Name both halves when a run only got half done.
+
+    A bare "skipping" hides the half that already landed.  Managed
+    policy needs no browser, so it is written even when the
+    Preferences-bound tables have to be left alone -- and the operator
+    must be able to tell that apart from "nothing happened".  Nothing
+    else in the output can carry that: ``--unattended`` exits 0 either
+    way, and the non-interactive runners that consume it (home-manager
+    activation, Windows ``apply.ps1``) report the exit code alone.
+    """
+    left = ", ".join(applied)
+    right = ", ".join(f"[{p.namespace}]" for p in pending)
+    if left:
+        return f"{left} applied; {right} not applied"
+    return f"{right} not applied"
+
+
 def cmd_apply(
     args: argparse.Namespace,
     *,
@@ -329,35 +347,67 @@ def cmd_apply(
     )
     if is_running is None:
         return
+    applied_external: list[str] = []
     if is_running:
-        if all(p.external_apply_fn is not None for p in non_empty):
-            # Every requested change lives in external managed policy
-            # ([pwa]): nothing touches Preferences and nothing needs the
-            # DevTools endpoint, so leave the running browser alone. The
-            # browser reads the policy on its next launch.
+        # An external plan writes managed policy ([pwa]): no Preferences
+        # write, no DevTools endpoint, nothing the running browser can
+        # undo.  So it is applied FIRST and unconditionally -- never
+        # gated on whether some *other* plan needs a live endpoint.
+        #
+        # This used to be gated on `all(external)`, so one dirty
+        # [shortcuts] dropped [pwa] entirely on every --unattended run:
+        # control fell through to the live branch, found no endpoint,
+        # and returned 0 without writing the policy.  That block was
+        # permanent, not transient -- [shortcuts] can only be cleaned by
+        # an apply with the browser closed, which --unattended never
+        # performs.
+        external = [
+            p for p in plans if p.external_apply_fn is not None and not p.empty
+        ]
+        browser_bound = [p for p in non_empty if p.external_apply_fn is None]
+        if external:
             apply_external_plans(plans)
-            write_state_files(plans)
-            names = ", ".join(f"[{p.namespace}]" for p in non_empty)
+            # Sidecars for what was actually applied.  When the external
+            # plans are the whole story that is every plan, exactly as
+            # before; in the mixed case it is deliberately only the
+            # external ones, because writing a [shortcuts] sidecar here
+            # would claim Preferences state that has not been written.
+            write_state_files(plans if not browser_bound else external)
+            applied_external = [f"[{p.namespace}]" for p in external]
+            names = ", ".join(applied_external)
             print(
                 f"ok -- {names} policy written without touching the "
                 f"running {display_name} (loaded at its next launch)"
             )
-            return
+            if not browser_bound:
+                # The whole story: nothing needs the browser.
+                return
+            # Drop them from the remaining work.  Both the live adapter
+            # and the offline block below run external_apply_fn
+            # themselves, so leaving them in would write the policy a
+            # second time.  Their apply_fn/verify_fn are no-ops against
+            # Preferences and their state files are already written.
+            plans = [p for p in plans if p.external_apply_fn is None]
+            non_empty = browser_bound
         if live_apply_fn is not None:
             live_port = find_devtools_port(args.profile_root, args.profile)
             if live_port is None:
                 if unattended:
                     print(
-                        "unattended: Brave is running without a live "
-                        "endpoint; skipping rather than closing it. Run "
-                        "`dotbrave apply` from a terminal, or apply while "
-                        "Brave is closed.",
+                        "unattended: "
+                        f"{_partial_note(applied_external, non_empty)} -- "
+                        f"{display_name} is running without a live endpoint "
+                        f"and unattended mode will not close it. Run "
+                        f"`dotbrave apply` from a terminal, or apply while "
+                        f"{display_name} is closed.",
                         file=sys.stderr,
                     )
                     return
                 if graceful_close_fn is None or launch_live_fn is None:
                     sys.exit(
-                        f"error: {display_name} is running but cannot be "
+                        "error: "
+                        f"{_partial_note(applied_external, non_empty)} -- "
+                        f"{display_name} is running but cannot be "
                         f"re-launched for live apply"
                     )
                 live_port = pick_unused_port()
@@ -380,8 +430,10 @@ def cmd_apply(
                 settings = "\n".join(f"  {key}" for key in e.keys)
                 if unattended:
                     print(
-                        "unattended: Brave cannot apply these settings live "
-                        "and closing it is not allowed:\n" + settings,
+                        "unattended: "
+                        f"{_partial_note(applied_external, non_empty)} -- "
+                        f"{display_name} cannot apply these settings live "
+                        f"and closing it is not allowed:\n" + settings,
                         file=sys.stderr,
                     )
                     return
@@ -405,14 +457,17 @@ def cmd_apply(
                 return
         elif graceful_close_fn is None:
             sys.exit(
-                f"error: {display_name} is running but dotbrave cannot "
+                f"error: {_partial_note(applied_external, non_empty)} -- "
+                f"{display_name} is running but dotbrave cannot "
                 "request a normal close for offline apply."
             )
         elif relaunch_live_port is None:
             if unattended:
                 print(
-                    "unattended: Brave is running and offline apply would "
-                    "close it; skipping.",
+                    "unattended: "
+                    f"{_partial_note(applied_external, non_empty)} -- "
+                    f"{display_name} is running and offline apply would "
+                    f"close it.",
                     file=sys.stderr,
                 )
                 return

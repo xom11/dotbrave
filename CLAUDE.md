@@ -102,9 +102,18 @@ Preserve these contracts unless a change explicitly redesigns them:
 5. Plain `apply` manages live apply. Endpoints bind to `127.0.0.1` and
    remain internal; no public endpoint or force-kill switch is exposed.
    Unsupported live settings and removals fall back to a normal close,
-   verified offline apply, and relaunch. A diff whose only changes are
-   `[pwa]` never touches the running browser: the policy is written
-   directly (no endpoint bootstrap) and Brave loads it at next launch.
+   verified offline apply, and relaunch. `[pwa]` never touches the
+   running browser and is never gated on what else is dirty: the policy
+   is written first and directly (no endpoint bootstrap), and Brave
+   loads it at next launch. Gating it on "the diff contains nothing but
+   `[pwa]`" made one dirty `[shortcuts]` drop the policy on every
+   `--unattended` run, and permanently -- `[shortcuts]` is only cleaned
+   by an apply with Brave closed, which `--unattended` never performs.
+   External plans are then dropped from the remaining work, because both
+   the live adapter and the offline block run `external_apply_fn`
+   themselves. When the browser-bound tables are skipped afterwards, the
+   stderr line names both halves (`[pwa] applied; [shortcuts] not
+   applied`) -- exit 0 is the same either way, so nothing else can.
 6. The CLI surface is exactly two actions, `apply` and `export`; new
    capabilities become flags on one of them, not new actions. `export`
    emits `[shortcuts]` diffs against `brave.default_accelerators`,

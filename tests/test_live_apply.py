@@ -309,16 +309,22 @@ def test_pwa_with_settings_changes_still_bootstraps_live_endpoint(
         find_cmdline_fn=lambda: ["brave"],
         restart_fn=lambda _cmd: [],
         build_plans_fn=build,
-        live_apply_fn=lambda port, *_a: calls.append(("live", port)),
+        live_apply_fn=lambda port, _path, _prefs, plans: calls.append(
+            ("live", (port, [p.namespace for p in plans]))
+        ),
         graceful_close_fn=lambda: calls.append(("close", None)),
         launch_live_fn=lambda root, profile, port, url: calls.append(("launch", port)) or ["brave"],
     )
 
+    # The managed policy needs no browser, so it is written before any of
+    # the close/relaunch dance -- and it must NOT reach the live adapter,
+    # which runs external_apply_fn itself and would write it twice.
     assert calls == [
+        ("external", None),
         ("close", None),
         ("launch", 9444),
         ("wait", 9444),
-        ("live", 9444),
+        ("live", (9444, ["settings"])),
         ("remember", 9444),
     ]
 

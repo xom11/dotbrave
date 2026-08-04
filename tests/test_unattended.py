@@ -262,6 +262,150 @@ def test_attended_privileged_apply_skips_the_sudo_preflight(
     assert applied == ["pwa"]
 
 
+def test_unattended_applies_pwa_even_when_another_table_is_dirty(
+    prefs_root, tmp_path, monkeypatch, capsys
+):
+    """[pwa] không cần trình duyệt, nên một [shortcuts] bẩn không được chặn nó.
+
+    Đây là trạng thái thật của máy Windows: `apply.ps1` chạy sẵn quyền
+    Administrator, Brave đang mở và không có live endpoint, [shortcuts]
+    bẩn vì lần cuối áp được là khi Brave đóng. Trước bản sửa này,
+    `all(external)` sai nên luồng rơi xuống nhánh live rồi return, và
+    [pwa] không bao giờ được ghi -- im lặng, exit 0.
+    """
+    monkeypatch.setattr(orchestrator, "_already_privileged", lambda: True)
+    monkeypatch.setattr(orchestrator, "find_devtools_port", lambda r, p: None)
+    calls = []
+    shortcuts = _plan("shortcuts", empty=False, external=False)
+    shortcuts.apply_fn = lambda prefs: calls.append("shortcuts")
+    pwa = _plan("pwa", empty=False, external=True)
+    pwa.external_apply_fn = lambda: calls.append("pwa")
+    cfg = tmp_path / "b.toml"
+    cfg.write_text('[shortcuts]\n"Ctrl+J" = "focusToolbar"\n[pwa]\nurls = []\n')
+
+    orchestrator.cmd_apply(
+        _args(prefs_root, cfg),
+        display_name="Brave",
+        running_fn=lambda: True,
+        find_cmdline_fn=lambda: None,
+        restart_fn=lambda c: c,
+        build_plans_fn=lambda p, prefs, doc, **kw: [shortcuts, pwa],
+        live_apply_fn=lambda *a: calls.append("live"),
+        graceful_close_fn=lambda: calls.append("close"),
+        launch_live_fn=lambda *a: calls.append("launch") or [],
+    )
+
+    # [pwa] applied; nothing touched the running browser.
+    assert calls == ["pwa"]
+
+
+def test_unattended_partial_apply_names_what_landed_and_what_did_not(
+    prefs_root, tmp_path, monkeypatch, capsys
+):
+    """Nửa vời phải đọc ra là nửa vời.
+
+    Một dòng "skipping" trơ trọi không cho biết [pwa] ĐÃ ghi; người vận
+    hành phải phân biệt được "áp hết" với "áp policy, bỏ phần còn lại".
+    """
+    monkeypatch.setattr(orchestrator, "_already_privileged", lambda: True)
+    monkeypatch.setattr(orchestrator, "find_devtools_port", lambda r, p: None)
+    cfg = tmp_path / "b.toml"
+    cfg.write_text('[shortcuts]\n"Ctrl+J" = "focusToolbar"\n[pwa]\nurls = []\n')
+
+    orchestrator.cmd_apply(
+        _args(prefs_root, cfg),
+        display_name="Brave",
+        running_fn=lambda: True,
+        find_cmdline_fn=lambda: None,
+        restart_fn=lambda c: c,
+        build_plans_fn=lambda p, prefs, doc, **kw: [
+            _plan("shortcuts", empty=False, external=False),
+            _plan("pwa", empty=False, external=True),
+        ],
+        live_apply_fn=lambda *a: None,
+        graceful_close_fn=lambda: None,
+        launch_live_fn=lambda *a: [],
+    )
+
+    captured = capsys.readouterr()
+    assert "[pwa] policy written without touching the running Brave" in captured.out
+    assert "[pwa] applied" in captured.err
+    assert "[shortcuts] not applied" in captured.err
+
+
+def test_unattended_applies_pwa_when_live_apply_refuses_the_rest(
+    prefs_root, tmp_path, monkeypatch, capsys
+):
+    """Cùng một lỗi ở lối thoát thứ hai: live endpoint có, nhưng từ chối
+    [settings]. [pwa] vẫn phải được ghi."""
+    monkeypatch.setattr(orchestrator, "_already_privileged", lambda: True)
+    monkeypatch.setattr(orchestrator, "find_devtools_port", lambda r, p: 9555)
+    calls = []
+    pwa = _plan("pwa", empty=False, external=True)
+    pwa.external_apply_fn = lambda: calls.append("pwa")
+    cfg = tmp_path / "b.toml"
+    cfg.write_text('[settings]\n"a.b" = true\n[pwa]\nurls = []\n')
+
+    def _unsupported_live_apply(*_args):
+        raise orchestrator.LiveApplyUnsupported("Brave", ["a.b"])
+
+    orchestrator.cmd_apply(
+        _args(prefs_root, cfg),
+        display_name="Brave",
+        running_fn=lambda: True,
+        find_cmdline_fn=lambda: None,
+        restart_fn=lambda c: c,
+        build_plans_fn=lambda p, prefs, doc, **kw: [
+            _plan("settings", empty=False, external=False),
+            pwa,
+        ],
+        live_apply_fn=_unsupported_live_apply,
+        graceful_close_fn=lambda: calls.append("close"),
+        launch_live_fn=lambda *a: [],
+    )
+
+    err = capsys.readouterr().err
+    assert calls == ["pwa"]
+    assert "[pwa] applied" in err
+    assert "[settings] not applied" in err
+    assert "a.b" in err
+
+
+def test_all_external_apply_is_unchanged_and_applies_once(
+    prefs_root, tmp_path, monkeypatch, capsys
+):
+    """Không hồi quy ở lối tắt cũ: [pwa] một mình vẫn áp đúng một lần,
+    vẫn in nguyên câu cũ, và không đụng tới trình duyệt đang chạy."""
+    monkeypatch.setattr(orchestrator, "_already_privileged", lambda: True)
+    monkeypatch.setattr(orchestrator, "find_devtools_port", lambda r, p: None)
+    calls = []
+    pwa = _plan("pwa", empty=False, external=True)
+    pwa.external_apply_fn = lambda: calls.append("pwa")
+    cfg = tmp_path / "b.toml"
+    cfg.write_text('[pwa]\nurls = ["https://example.com"]\n')
+
+    orchestrator.cmd_apply(
+        _args(prefs_root, cfg),
+        display_name="Brave",
+        running_fn=lambda: True,
+        find_cmdline_fn=lambda: None,
+        restart_fn=lambda c: c,
+        build_plans_fn=lambda p, prefs, doc, **kw: [pwa],
+        live_apply_fn=lambda *a: calls.append("live"),
+        graceful_close_fn=lambda: calls.append("close"),
+        launch_live_fn=lambda *a: calls.append("launch") or [],
+    )
+
+    captured = capsys.readouterr()
+    assert calls == ["pwa"]
+    assert (
+        "ok -- [pwa] policy written without touching the running Brave "
+        "(loaded at its next launch)" in captured.out
+    )
+    # The whole story: nothing was left undone, so nothing is reported as such.
+    assert "not applied" not in captured.err
+
+
 def test_already_privileged_reads_euid_not_sudo_cache(monkeypatch):
     """`sudo -n true` thành công nghĩa là credential còn cache, KHÁC với đang là root.
 
