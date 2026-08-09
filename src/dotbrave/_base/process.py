@@ -38,6 +38,14 @@ class ProcessStateUnknown(RuntimeError):
         )
 
 
+#: Where a macOS .app is looked for when no running process points at one.
+#: Module-level so tests can aim it at a fixture bundle.
+_MACOS_APP_DIRS: tuple[Path, ...] = (
+    Path("/Applications"),
+    Path.home() / "Applications",
+)
+
+
 def _is_macos() -> bool:
     return sys.platform == "darwin"
 
@@ -152,6 +160,30 @@ def _same_dir(a: str, b: str) -> bool:
     return os.path.realpath(a) == os.path.realpath(b)
 
 
+def _split_flat_cmdline(line: str) -> list[str]:
+    """Turn a one-line command string back into argv-ish tokens.
+
+    ``ps -o command=`` and Win32_Process both hand back a single string,
+    and callers need the individual flags: to forward them across a
+    relaunch, and to read ``--remote-debugging-port`` off a browser that
+    is already serving an endpoint.  Returning ``[line]`` silently
+    defeated both -- ``line[1:]`` is empty, so nothing was ever
+    forwarded and no port was ever found.
+
+    ``shlex.split`` is wrong here: neither source quotes anything, while
+    both ``/Applications/Brave Browser.app`` and ``Application Support``
+    contain spaces, so shlex chops them in half.  Chromium always writes
+    ``--flag=value``, which makes " --" the one dependable boundary.
+
+    Limits, accepted knowingly: a value containing " --" would split
+    early, and single-dash arguments (macOS ``-psn_0_…`` from a Finder
+    launch) stay glued to the token before them.  Both are harmless
+    here -- the flags dotbrave forwards or reads are all long-form.
+    """
+    parts = line.split(" --")
+    return [parts[0], *(f"--{p}" for p in parts[1:])]
+
+
 def _read_cmdline(pid: str) -> list[str] | None:
     """Recover the command-line argv for a running process.
 
@@ -169,7 +201,7 @@ def _read_cmdline(pid: str) -> list[str] | None:
         except (subprocess.CalledProcessError, FileNotFoundError):
             return None
         line = out.decode("utf-8", "replace").strip()
-        return [line] if line else None
+        return _split_flat_cmdline(line) if line else None
     if _is_macos():
         try:
             out = subprocess.check_output(
@@ -179,7 +211,7 @@ def _read_cmdline(pid: str) -> list[str] | None:
         except (subprocess.CalledProcessError, FileNotFoundError):
             return None
         line = out.decode("utf-8", "replace").strip()
-        return [line] if line else None
+        return _split_flat_cmdline(line) if line else None
     try:
         raw = Path(f"/proc/{pid}/cmdline").read_bytes()
     except (FileNotFoundError, PermissionError):
@@ -657,6 +689,40 @@ class BrowserProcess:
             )
         ]
 
+    def _macos_exe(self, captured_cmdline: list[str] | None) -> str | None:
+        """The executable inside the .app to exec directly.
+
+        ``open -a NAME --args …`` is not reliable straight after a close:
+        LaunchServices can still consider the app running and then drops
+        the arguments entirely, so the browser comes back with no
+        debugging port and the wait times out.  Measured on macOS
+        26.5/Brave 1.93: the same command failed once and worked on the
+        next attempt, while launching the binary by path brought the
+        endpoint up in about a second every time.
+
+        The best source is the command line of the process we just
+        closed -- that is the exact bundle in use, wherever it lives.
+        Falling back to the well-known Applications directories covers a
+        browser that was already closed before dotbrave ran.  TCC grants
+        follow the bundle, so exec'ing the inner binary keeps whatever
+        permissions the app already had.
+        """
+        if captured_cmdline and captured_cmdline[0].endswith(
+            f".app/Contents/MacOS/{self.macos_app_name}"
+        ):
+            return captured_cmdline[0]
+        for directory in _MACOS_APP_DIRS:
+            exe = (
+                Path(directory)
+                / f"{self.macos_app_name}.app"
+                / "Contents"
+                / "MacOS"
+                / self.macos_app_name
+            )
+            if exe.exists():
+                return str(exe)
+        return None
+
     def live_launch_cmdline(
         self,
         profile_root: Path,
@@ -683,7 +749,13 @@ class BrowserProcess:
                     raise FileNotFoundError(self.proc_name())
                 cmdline = [found, *flags]
         elif _is_macos():
-            cmdline = ["open", "-a", self.macos_app_name, "--args", *flags]
+            exe = self._macos_exe(captured_cmdline)
+            if exe is None:
+                # Nothing found to exec directly -- keep the old path
+                # rather than failing outright.
+                cmdline = ["open", "-a", self.macos_app_name, "--args", *flags]
+            else:
+                cmdline = [exe, *flags]
         else:
             wrapper = None
             for w in self.linux_wrappers:

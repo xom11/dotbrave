@@ -235,6 +235,14 @@ When Brave is closed, `dotbrave` patches the profile `Preferences` JSON
 directly. Each offline apply takes one timestamped backup, writes
 atomically (temp file + rename), and verifies the result by reloading.
 
+A running Brave is checked for an endpoint three ways before dotbrave
+concludes it has none: the port dotbrave itself launched and recorded, the
+browser's own `DevToolsActivePort`, and the `--remote-debugging-port` on
+the running process's command line. That last one matters more than it
+sounds — Brave writes `DevToolsActivePort` only when the port is dynamic
+(`--remote-debugging-port=0`), so a browser you started on a fixed port
+would otherwise be closed and relaunched for an endpoint it already had.
+
 When Brave is running, plain `apply` uses Brave's privileged UI APIs over
 a private loopback DevTools endpoint: ordinary settings go through
 `chrome.settingsPrivate`, New Tab settings through live New Tab UI

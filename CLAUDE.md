@@ -112,7 +112,30 @@ Preserve these contracts unless a change explicitly redesigns them:
    back; after a write that already printed `applied and verified` that
    failure is a stderr warning and exit 0, because a non-zero exit there
    tells callers the apply failed and invites a retry that closes and
-   reopens Brave for nothing. `[pwa]` never touches the
+   reopens Brave for nothing.
+
+   Two platform facts the relaunch path depends on, both measured rather
+   than assumed. **macOS launches the binary inside the bundle, not
+   `open -a`**: LaunchServices can still consider the app running right
+   after a close and then drops `--args` entirely, so the browser came
+   back with no debugging port — the same command failed once and worked
+   on the retry, while exec'ing the binary brought the endpoint up in
+   about a second every time. TCC grants follow the bundle, so nothing
+   is lost by doing it directly. And **`_read_cmdline` must split the
+   flat string** that `ps -o command=` / Win32_Process return: returning
+   `[line]` made `line[1:]` empty, which silently disabled both flag
+   forwarding and port discovery on macOS and Windows. `shlex` cannot do
+   that splitting (nothing is quoted, and both the app path and
+   `Application Support` contain spaces) — " --" is the boundary.
+
+   Endpoint discovery has three sources, in order: dotbrave's own
+   sidecar, `DevToolsActivePort`, then `--remote-debugging-port` off the
+   running command line. The third exists because Brave only writes
+   `DevToolsActivePort` for a *dynamic* port (`=0`) — verified on macOS
+   and Linux — so a browser started on a fixed port reads as having no
+   endpoint and gets closed for nothing.
+
+   `[pwa]` never touches the
    running browser and is never gated on what else is dirty: the policy
    is written first and directly (no endpoint bootstrap), and Brave
    loads it at next launch. Gating it on "the diff contains nothing but

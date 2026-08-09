@@ -17,6 +17,7 @@ from pathlib import Path
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from typing import Any
 
 _LIVE_PORT_SIDECAR = ".dotbrave.live.json"
@@ -277,7 +278,43 @@ def _read_devtools_active_port(profile_root: Path) -> int | None:
         return None
 
 
+_PORT_FLAG = "--remote-debugging-port"
+
+
+def _port_from_cmdline(args: list[str] | None) -> int | None:
+    """The debugging port a running browser was actually started with.
+
+    ``DevToolsActivePort`` is not a reliable source: the browser only
+    writes that file when the port is dynamic (``--remote-debugging-port=0``).
+    Started on a fixed port -- measured on both macOS and Linux -- the file
+    never appears, so a browser that *is* serving an endpoint reads as
+    having none, and gets closed for no reason. Its command line still
+    carries the number.
+    """
+    if not args:
+        return None
+    for i, arg in enumerate(args):
+        raw: str | None = None
+        if arg.startswith(_PORT_FLAG + "="):
+            raw = arg.split("=", 1)[1]
+        elif arg == _PORT_FLAG and i + 1 < len(args):
+            raw = args[i + 1]
+        if raw is None:
+            continue
+        try:
+            port = int(raw)
+        except ValueError:
+            return None
+        # 0 means "pick one for me": the real port lives in
+        # DevToolsActivePort, which the caller already tried.
+        return port or None
+    return None
+
+
 def find_devtools_port(profile_root, profile: str | None = None) -> int | None:
+    """Endpoint recorded on disk: dotbrave's own sidecar, then the
+    browser's ``DevToolsActivePort``.  See ``live_port_from_cmdline`` for
+    the case neither file covers."""
     root = Path(profile_root)
     sidecar_port = _read_dotbrave_live_port(root, profile)
     if sidecar_port is not None:
@@ -286,6 +323,29 @@ def find_devtools_port(profile_root, profile: str | None = None) -> int | None:
     if active_port is None:
         return None
     return active_port if devtools_endpoint_alive(active_port) else None
+
+
+def live_port_from_cmdline(
+    cmdline_fn: Callable[[], list[str] | None] | None,
+) -> int | None:
+    """Live endpoint of a browser started on a fixed debugging port.
+
+    Neither file source sees that case -- the browser writes
+    ``DevToolsActivePort`` only for a dynamic port, and dotbrave's
+    sidecar only exists for endpoints dotbrave itself started.  The
+    running process still knows, so ask it.  A port that does not answer
+    is discarded, and any failure to read the command line is treated as
+    "no endpoint": discovery must never be the thing that breaks apply.
+    """
+    if cmdline_fn is None:
+        return None
+    try:
+        port = _port_from_cmdline(cmdline_fn())
+    except Exception:  # noqa: BLE001 - discovery must never break apply
+        return None
+    if port is None:
+        return None
+    return port if devtools_endpoint_alive(port) else None
 
 
 def pick_unused_port() -> int:

@@ -29,6 +29,7 @@ else:
 
 from dotbrave._base.cdp import (
     find_devtools_port,
+    live_port_from_cmdline,
     pick_unused_port,
     remember_devtools_port,
     wait_for_devtools_endpoint,
@@ -159,12 +160,11 @@ def _running_state(
     # would stop matching what a reloaded BrowserProcess raises.
     except _process.ProcessStateUnknown as e:
         if unattended:
-            print(
+            _warn(
                 f"unattended: cannot tell whether {display_name} is running "
                 f"({e.tool} was not found on PATH); skipping. Writing "
                 f"Preferences now could be silently undone by a running "
-                f"{display_name}.",
-                file=sys.stderr,
+                f"{display_name}."
             )
             return None
         sys.exit(
@@ -226,6 +226,19 @@ def _partial_note(applied: list[str], pending: list[Plan]) -> str:
     if left:
         return f"{left} applied; {right} not applied"
     return f"{right} not applied"
+
+
+def _warn(message: str) -> None:
+    """Report on stderr without letting it overtake stdout.
+
+    stdout is block-buffered whenever it is not a terminal, stderr is
+    not.  A runner that merges both into one log -- home-manager
+    activation does exactly this -- therefore shows the warning *above*
+    the plan it refers to, which reads as if the plan below it had been
+    applied.  Flushing first keeps the log in the order things happened.
+    """
+    sys.stdout.flush()
+    print(message, file=sys.stderr)
 
 
 def _reopen_after_failed_relaunch(
@@ -342,10 +355,9 @@ def cmd_apply(
         and any(_needs_root(p) for p in plans)
     ):
         names = ", ".join(f"[{p.namespace}]" for p in plans if _needs_root(p))
-        print(
+        _warn(
             f"unattended: skipping {names} -- it needs elevated privileges. "
-            f"Run `dotbrave apply` from a terminal to apply it.",
-            file=sys.stderr,
+            f"Run `dotbrave apply` from a terminal to apply it."
         )
         plans = [p for p in plans if not _needs_root(p)]
         non_empty = [p for p in plans if not p.empty]
@@ -432,17 +444,27 @@ def cmd_apply(
             plans = [p for p in plans if p.external_apply_fn is None]
             non_empty = browser_bound
         if live_apply_fn is not None:
+            # Read the command line once, up front: it answers both
+            # questions below -- which endpoint this browser already
+            # serves, and which flags a relaunch has to keep -- and after
+            # the close there is no process left to ask.
+            saved_cmdline = find_cmdline_fn()
             live_port = find_devtools_port(args.profile_root, args.profile)
             if live_port is None:
+                # Neither file source covers a browser the user started
+                # with a fixed --remote-debugging-port; its command line
+                # does.  Without this, such a browser gets closed and
+                # relaunched for an endpoint it already had.
+                live_port = live_port_from_cmdline(lambda: saved_cmdline)
+            if live_port is None:
                 if unattended:
-                    print(
+                    _warn(
                         "unattended: "
                         f"{_partial_note(applied_external, non_empty)} -- "
                         f"{display_name} is running without a live endpoint "
                         f"and unattended mode will not close it. Run "
                         f"`dotbrave apply` from a terminal, or apply while "
-                        f"{display_name} is closed.",
-                        file=sys.stderr,
+                        f"{display_name} is closed."
                     )
                     return
                 if graceful_close_fn is None or launch_live_fn is None:
@@ -458,10 +480,6 @@ def cmd_apply(
                     f"closing it normally and relaunching once for live apply "
                     f"(no force-kill)."
                 )
-                # Capture BEFORE closing: afterwards there is no process to
-                # read the command line from, and the relaunch needs the
-                # flags this session was started with.
-                saved_cmdline = find_cmdline_fn()
                 graceful_close_fn()
                 used = launch_live_fn(
                     args.profile_root, args.profile, live_port, None, saved_cmdline
@@ -486,12 +504,11 @@ def cmd_apply(
             except LiveApplyUnsupported as e:
                 settings = "\n".join(f"  {key}" for key in e.keys)
                 if unattended:
-                    print(
+                    _warn(
                         "unattended: "
                         f"{_partial_note(applied_external, non_empty)} -- "
                         f"{display_name} cannot apply these settings live "
-                        f"and closing it is not allowed:\n" + settings,
-                        file=sys.stderr,
+                        f"and closing it is not allowed:\n" + settings
                     )
                     return
                 if graceful_close_fn is None or launch_live_fn is None:
@@ -506,9 +523,6 @@ def cmd_apply(
                     "(no force-kill)."
                 )
                 print(settings)
-                # Same reason as the branch above: the command line has to
-                # be read while the process still exists.
-                saved_cmdline = find_cmdline_fn()
                 graceful_close_fn()
                 relaunch_live_port = live_port
                 was_closed = True
@@ -523,12 +537,11 @@ def cmd_apply(
             )
         elif relaunch_live_port is None:
             if unattended:
-                print(
+                _warn(
                     "unattended: "
                     f"{_partial_note(applied_external, non_empty)} -- "
                     f"{display_name} is running and offline apply would "
-                    f"close it.",
-                    file=sys.stderr,
+                    f"close it."
                 )
                 return
             saved_cmdline = find_cmdline_fn()
@@ -595,10 +608,9 @@ def cmd_apply(
             note = _reopen_after_failed_relaunch(
                 saved_cmdline, restart_fn, display_name
             )
-            print(
+            _warn(
                 f"warning: config applied, but the live relaunch failed:\n"
-                f"{e}\n{note}",
-                file=sys.stderr,
+                f"{e}\n{note}"
             )
             return
         remember_devtools_port(
