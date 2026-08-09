@@ -84,14 +84,16 @@ def test_running_browser_without_endpoint_gracefully_relaunches_for_live_apply(
         build_plans_fn=_build_plan,
     live_apply_fn=live_apply_fn,
         graceful_close_fn=lambda: calls.append(("close", None)),
-        launch_live_fn=lambda root, profile, port, url: calls.append(
-            ("launch", (root, profile, port, url))
+        launch_live_fn=lambda root, profile, port, url, captured=None: calls.append(
+            ("launch", (root, profile, port, url, captured))
         ) or ["brave"],
     )
 
     assert calls == [
         ("close", None),
-        ("launch", (profile_root, "Default", 9444, None)),
+        # The captured command line rides along so the relaunch keeps the
+        # flags the closed session was started with.
+        ("launch", (profile_root, "Default", 9444, None, ["brave"])),
         ("wait", 9444),
         ("live", (9444, prefs_path, ["settings"])),
         ("remember", (profile_root, "Default", 9444)),
@@ -158,15 +160,15 @@ def test_plain_live_apply_unsupported_setting_falls_back_without_force_kill(
         build_plans_fn=_build_plan,
         live_apply_fn=unsupported_live_apply,
         graceful_close_fn=lambda: calls.append(("close", None)),
-        launch_live_fn=lambda root, profile, port, url: calls.append(
-            ("launch", (root, profile, port, url))
+        launch_live_fn=lambda root, profile, port, url, captured=None: calls.append(
+            ("launch", (root, profile, port, url, captured))
         ) or ["brave"],
     )
 
     assert json.loads(prefs_path.read_text()) == {"foo": {"bar": 1}}
     assert calls == [
         ("close", None),
-        ("launch", (profile_root, "Default", 9555, None)),
+        ("launch", (profile_root, "Default", 9555, None, ["brave"])),
         ("wait", (9555, "Brave")),
         ("remember", (profile_root, "Default", 9555)),
     ]
@@ -313,7 +315,9 @@ def test_pwa_with_settings_changes_still_bootstraps_live_endpoint(
             ("live", (port, [p.namespace for p in plans]))
         ),
         graceful_close_fn=lambda: calls.append(("close", None)),
-        launch_live_fn=lambda root, profile, port, url: calls.append(("launch", port)) or ["brave"],
+        launch_live_fn=lambda root, profile, port, url, captured=None: calls.append(
+            ("launch", port)
+        ) or ["brave"],
     )
 
     # The managed policy needs no browser, so it is written before any of

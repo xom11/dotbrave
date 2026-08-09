@@ -102,7 +102,17 @@ Preserve these contracts unless a change explicitly redesigns them:
 5. Plain `apply` manages live apply. Endpoints bind to `127.0.0.1` and
    remain internal; no public endpoint or force-kill switch is exposed.
    Unsupported live settings and removals fall back to a normal close,
-   verified offline apply, and relaunch. `[pwa]` never touches the
+   verified offline apply, and relaunch. Every close captures the running
+   command line *first* (`find_cmdline_fn`) and the relaunch forwards its
+   flags: rebuilding the command line from scratch drops whatever the
+   session needed to start at all, and a Brave launched with
+   `--ozone-platform=wayland` on a Wayland-only compositor then dies on
+   X11 with no `$DISPLAY` -- closed by us, unable to reopen. If the
+   relaunch does fail, `_reopen_after_failed_relaunch` puts the browser
+   back; after a write that already printed `applied and verified` that
+   failure is a stderr warning and exit 0, because a non-zero exit there
+   tells callers the apply failed and invites a retry that closes and
+   reopens Brave for nothing. `[pwa]` never touches the
    running browser and is never gated on what else is dirty: the policy
    is written first and directly (no endpoint bootstrap), and Brave
    loads it at next launch. Gating it on "the diff contains nothing but

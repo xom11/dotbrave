@@ -228,6 +228,37 @@ def _partial_note(applied: list[str], pending: list[Plan]) -> str:
     return f"{right} not applied"
 
 
+def _reopen_after_failed_relaunch(
+    saved_cmdline: list[str] | None,
+    restart_fn: Callable[[list[str]], list[str]],
+    display_name: str,
+) -> str:
+    """Put the browser back after a relaunch that never came up.
+
+    Closing the browser is dotbrave's doing, so leaving the user without
+    one is dotbrave's bug -- and the relaunch really can fail for reasons
+    that have nothing to do with the config: the live command line drops
+    down to the flags dotbrave knows about, so a session that needed
+    something else (a Wayland-only compositor needing
+    ``--ozone-platform=wayland``) dies on startup.
+
+    Returns a sentence for the caller to report; never raises, because
+    every caller is already on an error or warning path.
+    """
+    if not saved_cmdline:
+        return (
+            f"{display_name} is closed and its original command line was "
+            f"not captured -- restart it manually."
+        )
+    try:
+        restart_fn(saved_cmdline)
+    except Exception as e:  # noqa: BLE001 - reporting beats masking
+        return (
+            f"could not reopen {display_name} ({e}) -- restart it manually."
+        )
+    return f"{display_name} was reopened with its original command line."
+
+
 def cmd_apply(
     args: argparse.Namespace,
     *,
@@ -238,7 +269,9 @@ def cmd_apply(
     build_plans_fn: Callable,
     live_apply_fn: Callable[[int, Path, dict, list], None] | None = None,
     graceful_close_fn: Callable[[], None] | None = None,
-    launch_live_fn: Callable[[Path, str, int, str | None], list[str]] | None = None,
+    launch_live_fn: (
+        Callable[[Path, str, int, str | None, list[str] | None], list[str]] | None
+    ) = None,
 ) -> None:
     """Unified apply orchestrator.
 
@@ -425,13 +458,28 @@ def cmd_apply(
                     f"closing it normally and relaunching once for live apply "
                     f"(no force-kill)."
                 )
+                # Capture BEFORE closing: afterwards there is no process to
+                # read the command line from, and the relaunch needs the
+                # flags this session was started with.
+                saved_cmdline = find_cmdline_fn()
                 graceful_close_fn()
-                used = launch_live_fn(args.profile_root, args.profile, live_port, None)
+                used = launch_live_fn(
+                    args.profile_root, args.profile, live_port, None, saved_cmdline
+                )
                 print(
                     f"relaunching {display_name} with live endpoint: "
                     f"{' '.join(map(str, used))}"
                 )
-                wait_for_devtools_endpoint(live_port, display_name)
+                try:
+                    wait_for_devtools_endpoint(live_port, display_name)
+                except SystemExit as e:
+                    # Nothing has been written yet, so this is a real
+                    # failure -- but the browser we closed is ours to
+                    # restore before reporting it.
+                    note = _reopen_after_failed_relaunch(
+                        saved_cmdline, restart_fn, display_name
+                    )
+                    sys.exit(f"{e}\n{note}")
             live_port = int(live_port)
             try:
                 live_apply_fn(live_port, prefs_path, prefs, plans)
@@ -458,6 +506,9 @@ def cmd_apply(
                     "(no force-kill)."
                 )
                 print(settings)
+                # Same reason as the branch above: the command line has to
+                # be read while the process still exists.
+                saved_cmdline = find_cmdline_fn()
                 graceful_close_fn()
                 relaunch_live_port = live_port
                 was_closed = True
@@ -523,13 +574,33 @@ def cmd_apply(
 
     if relaunch_live_port is not None and launch_live_fn is not None:
         used = launch_live_fn(
-            args.profile_root, args.profile, relaunch_live_port, None
+            args.profile_root,
+            args.profile,
+            relaunch_live_port,
+            None,
+            saved_cmdline,
         )
         print(
             f"relaunching {display_name} with live endpoint: "
             f"{' '.join(map(str, used))}"
         )
-        wait_for_devtools_endpoint(relaunch_live_port, display_name)
+        try:
+            wait_for_devtools_endpoint(relaunch_live_port, display_name)
+        except SystemExit as e:
+            # The config IS applied and verified by now -- the write above
+            # said so.  Exiting non-zero here would tell every caller the
+            # apply failed, and a runner that retries would close and
+            # reopen the browser again for a run with nothing left to do.
+            # Report the relaunch on stderr, put the browser back, exit 0.
+            note = _reopen_after_failed_relaunch(
+                saved_cmdline, restart_fn, display_name
+            )
+            print(
+                f"warning: config applied, but the live relaunch failed:\n"
+                f"{e}\n{note}",
+                file=sys.stderr,
+            )
+            return
         remember_devtools_port(
             args.profile_root, args.profile, relaunch_live_port
         )

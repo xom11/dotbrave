@@ -621,18 +621,56 @@ class BrowserProcess:
             start_new_session=True,
         )
 
+    #: Flags this method owns.  A captured command line may carry its own
+    #: copies -- the browser was possibly already running under a different
+    #: profile root, or under a debugging port we are about to replace -- so
+    #: they are dropped from the forwarded set rather than emitted twice.
+    _LIVE_OWNED_FLAGS = (
+        "--user-data-dir",
+        "--profile-directory",
+        "--remote-debugging-address",
+        "--remote-debugging-port",
+    )
+
+    def _forwardable_flags(self, captured_cmdline: list[str] | None) -> list[str]:
+        """Flags from a running browser worth carrying into the relaunch.
+
+        Losing these is not cosmetic: a session started with
+        ``--ozone-platform=wayland`` that is relaunched without it falls
+        back to X11, finds no ``$DISPLAY`` under a Wayland-only compositor
+        and exits immediately -- so dotbrave would have closed the browser
+        and failed to bring it back.
+
+        Only ``-``-prefixed arguments are forwarded.  Positionals are URLs
+        the user already has open; the relaunched browser restores its own
+        session, and re-passing them would resurrect tabs that were closed.
+        """
+        if not captured_cmdline:
+            return []
+        return [
+            arg
+            for arg in captured_cmdline[1:]
+            if arg.startswith("-")
+            and not any(
+                arg == owned or arg.startswith(owned + "=")
+                for owned in self._LIVE_OWNED_FLAGS
+            )
+        ]
+
     def live_launch_cmdline(
         self,
         profile_root: Path,
         profile: str,
         port: int,
         url: str | None = None,
+        captured_cmdline: list[str] | None = None,
     ) -> list[str]:
         flags = [
             f"--user-data-dir={profile_root}",
             f"--profile-directory={profile}",
             "--remote-debugging-address=127.0.0.1",
             f"--remote-debugging-port={port}",
+            *self._forwardable_flags(captured_cmdline),
         ]
         if _is_windows():
             local = os.environ.get("LOCALAPPDATA", "")
@@ -665,7 +703,10 @@ class BrowserProcess:
         profile: str,
         port: int,
         url: str | None = None,
+        captured_cmdline: list[str] | None = None,
     ) -> list[str]:
-        cmdline = self.live_launch_cmdline(profile_root, profile, port, url)
+        cmdline = self.live_launch_cmdline(
+            profile_root, profile, port, url, captured_cmdline
+        )
         self._spawn_detached(cmdline)
         return cmdline

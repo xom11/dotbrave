@@ -241,11 +241,17 @@ a private loopback DevTools endpoint: ordinary settings go through
 actions, and shortcuts through the Settings `CommandsService`. Supported
 changes take effect without restarting. A Brave not yet carrying the
 endpoint closes normally and relaunches once; a setting without a live
-route falls back to the same normal-close + verified offline write. A
-config whose only diff is `[pwa]` skips the endpoint entirely — the
-managed policy is written while Brave keeps running, and Brave loads it
-at its next launch. The endpoint binds to `127.0.0.1` only, and there is
-no force-kill switch.
+route falls back to the same normal-close + verified offline write. Any
+such relaunch reuses the flags the closed session was running with, so a
+Brave started as `brave-browser --ozone-platform=wayland` comes back the
+same way. If the relaunch still fails to come up, dotbrave reopens Brave
+with its original command line rather than leaving you without a browser
+— and when the config was already applied and verified by then, that
+relaunch failure is a warning on stderr, not a non-zero exit. A config
+whose only diff is `[pwa]` skips the endpoint entirely — the managed
+policy is written while Brave keeps running, and Brave loads it at its
+next launch. The endpoint binds to `127.0.0.1` only, and there is no
+force-kill switch.
 
 `[shortcuts]` and `[settings]` track managed entries in sidecar files
 (`Preferences.dotbrave.{shortcuts,settings}.json`), so removing a key from
