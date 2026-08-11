@@ -600,9 +600,19 @@ def cmd_apply(
         # Everything below mutates and rewrites `prefs`, so it has to be
         # the post-close copy or the write reverts the flush -- including
         # `profile.exit_type`, which then reads as an unclean shutdown.
-        # Plans stay valid: their apply_fn closures carry the target from
-        # the config and the removals from the sidecar, not a prefs
-        # snapshot.
+        #
+        # The write itself is correct without rebuilding: apply_fn,
+        # verify_fn, and the removals close over the target from the
+        # config and the removals from the sidecar, not a prefs snapshot.
+        # But state_payload["prior_values"] (`_capture_prior_values` in
+        # settings.py) *is* one, captured from `prefs` back when plans
+        # were built, before this close's flush. For a key first managed
+        # by this run, that records the value from before the user's
+        # in-session change rather than the value immediately before
+        # dotbrave's write -- a later live removal would restore that
+        # older value. Known, deferred: unlike the live-relaunch path
+        # above, which rebuilds plans against the post-close `prefs` for
+        # exactly this reason, this path does not rebuild.
         prefs = load_prefs(prefs_path)
 
     if not backup_taken:
@@ -958,9 +968,9 @@ Safety:
 
 Undo:
   `apply --undo` restores the most recent timestamped Preferences backup
-  (each real apply creates one, next to Preferences) and clears dotbrave's
-  shortcut/settings sidecars. [pwa] policy and the `export --snapshot`
-  baseline are left untouched.
+  (taken next to Preferences by any apply that changes it) and clears
+  dotbrave's shortcut/settings sidecars. [pwa] policy and the
+  `export --snapshot` baseline are left untouched.
 
 Execution:
   {apply_execution_text}""",
