@@ -162,9 +162,13 @@ mechanism behind the earlier incident where a real apply/relaunch cycle
 destroyed profile state. **Fix:** re-read prefs after `graceful_close_fn()` and
 rebuild the plans against the fresh copy.
 
-**B2 — two backups in one run.** `live.py:264` takes one before the live
-attempt; on fallback `orchestrator.py:555` takes a second. Invariant 1 says at
-most one per offline apply.
+**B2 — two backups in one run: not a bug today, but 1.1 creates one.**
+`live.py:264` backs up only *after* preflight succeeds, and every
+`LiveApplyUnsupported` is raised earlier (`live.py:248` and `:257`), so a run
+cannot currently take both that backup and the orchestrator's at
+`orchestrator.py:555`. The split runs introduced by 1.1 do apply live *and*
+fall back in the same run, which would take two. The rule 1.1 must honour:
+take the live backup only when there is no offline remainder.
 
 **B3 — `[settings]` accepts keys that live in `Local State`.** `[settings]`
 addresses `<root>/<profile>/Preferences` only, but `settingsPrivate` is
