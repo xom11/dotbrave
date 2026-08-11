@@ -364,6 +364,64 @@ be swept afterwards by `CrAppModeUserDataDir`.
 
 Steps 3–6 green justifies the agent. Any red means stop after Phase 2.
 
+### Result — run 2026-08-12, the gate passes
+
+Run without touching the real policy at all. The steps above call for removing a
+URL from `/Library/Managed Preferences`, tearing down the LaunchDaemon and the
+`schg` pin, and restarting — that needs sudo and mutates a working setup, and it
+turns out to be unnecessary. Every load-bearing question is about *user-level*
+installs, which a URL the policy has never heard of answers just as well.
+`https://excalidraw.com/` was used against a throwaway `--user-data-dir`, with
+the user's Brave closed first (macOS refuses a second instance of the bundle).
+
+| Question | Result |
+|---|---|
+| Does `PWA.install` produce a real app? | Yes — 1.9s, real shim in `~/Applications/Brave Browser Apps.localized/`, `getOsAppState` reports it |
+| Does it survive a browser restart? | Yes |
+| Does the policy leave it alone? | Yes — not force-removed, no duplicate shim |
+| Does `PWA.uninstall` remove it for good? | Yes — shim gone, `getOsAppState` errors |
+| Still gone after another restart? | Yes |
+
+Step 1 — whether CDP can uninstall an app the *policy* installed — was not
+settled by the run: `Page.getAppManifest` on `https://keep.google.com` resolved
+to a Google sign-in redirect rather than the app's own manifest id, so the
+`PWA.uninstall` that followed acted on an id that was never installed and
+proved nothing. Upstream source settles it instead, and more definitively than
+a probe could: `WebAppManagement::kPolicy` is listed in
+`kNotUserUninstallableSources` (`chrome/browser/web_applications/web_app_management_type.cc`),
+whose counterpart `kUserUninstallableSources` (`…/web_app_management_type.h`)
+does not contain it, with a `static_assert` requiring every management type to
+appear in exactly one of the two. A policy-installed app is therefore
+un-uninstallable by any user-level path, CDP included.
+
+So the two mechanisms cannot share a URL, which is not a limitation to work
+around but the thing that decides the design: if `[pwa]` moves to CDP, the
+managed policy becomes an **explicit opt-in mode** for enforcement, and the
+existing forced entries must be removed wholesale rather than migrated one at a
+time. There is no coexistence path.
+
+The macOS side effect stands and is worth restating for whoever runs this next:
+the policy is machine-wide, so the throwaway root still received all 12 forced
+installs and minted 12 duplicate shims. They were swept afterwards by
+`CrAppModeUserDataDir`; expect to do the same.
+
+**Phase 3 is unblocked.** What remains before building it are product decisions,
+not technical unknowns — see below.
+
+### Open decisions before Phase 3 is worth building
+
+- **Does `[pwa]` switch wholesale, or is CDP opt-in?** Switching means removing
+  the 12 forced entries, the LaunchDaemon, the `schg` pin and the sudo prompts —
+  and giving up enforcement: the user can then remove an app by hand and
+  dotbrave will not put it back until the next apply.
+- **What happens to the 12 apps already installed by policy?** They cannot be
+  converted in place. The migration is: remove the policy, restart once, then
+  install them again over CDP.
+- **Is a browser whose lifetime is owned by a LaunchAgent acceptable day to
+  day?** The pipe dies with its owner and the browser dies with the pipe, so
+  the agent must outlive Brave, and Brave must be started by it. A Brave the
+  user opens from the Dock has no pipe and no live `[pwa]`.
+
 ### Shape, if it proceeds
 
 Not a pure relay. When the agent owns the browser process, the CLI must stop
