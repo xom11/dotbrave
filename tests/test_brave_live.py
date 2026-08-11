@@ -41,6 +41,13 @@ class FakeCdpClient:
 
     def evaluate(self, target: dict, expression: str):
         self.evaluations.append(expression)
+        if "readyState" in expression:
+            # Recognize the page-readiness probe by its expression text
+            # and answer it directly, rather than consuming a scripted
+            # result meant for the real preflight/mutation call that
+            # follows -- production polls this in a loop, and tests
+            # should not have to script a value for every poll.
+            return True
         return next(self.evaluation_results, [])
 
 
@@ -254,3 +261,37 @@ def test_live_apply_falls_back_to_existing_tab_without_closing(
     assert fake.created == []
     assert fake.closed == []  # never close a tab we did not open
     assert "chrome://settings/appearance" in fake.navigations
+
+
+def test_shortcuts_preflight_reports_unsupported_instead_of_failing_hard(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A renamed commands bundle must degrade to the offline path."""
+    from dotbrave.command_ids import NAME_TO_ID
+
+    prefs_path = tmp_path / "Default" / "Preferences"
+    prefs_path.parent.mkdir()
+    new_tab = str(NAME_TO_ID["new_tab"])
+    prefs = {"brave": {"accelerators": {new_tab: ["Control+KeyT"]},
+                       "default_accelerators": {new_tab: ["Control+KeyT"]}}}
+    prefs_path.write_text(json.dumps(prefs))
+
+    def apply_fn(target: dict) -> None:
+        target["brave"]["accelerators"][new_tab] = ["Control+Shift+KeyY"]
+
+    plan = Plan(namespace="shortcuts", diff_lines=["changed"],
+                apply_fn=apply_fn, verify_fn=lambda _p: None)
+
+    # settings preflight returns [], shortcuts preflight reports itself broken
+    fake = FakeCdpClient(9333, evaluation_results=[["shortcuts"]])
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake)
+
+    with pytest.raises(shared_live.LiveApplyUnsupported) as excinfo:
+        live.apply_live(9333, prefs_path, prefs, [plan])
+    assert any("shortcut" in k for k in excinfo.value.keys)
+
+
+def test_scripts_guard_against_an_unloaded_settings_page() -> None:
+    """The probe must degrade like the NTP one, not throw on a cold page."""
+    script = live._settings_preflight_script([("foo.bar", 1)])
+    assert "chrome?.settingsPrivate" in script or "typeof chrome" in script

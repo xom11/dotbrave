@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -40,7 +39,7 @@ def _page_target(client: CdpClient) -> dict:
     for target in client.list_targets():
         if target.get("type") == "page":
             return target
-    sys.exit("error: live apply found no page target to drive Brave")
+    raise CdpError("live apply found no page target to drive Brave")
 
 
 def _worker_target(client: CdpClient) -> tuple[dict, bool]:
@@ -54,6 +53,27 @@ def _worker_target(client: CdpClient) -> tuple[dict, bool]:
         return client.create_page("about:blank"), True
     except RuntimeError:
         return _page_target(client), False
+
+
+_READY_EXPR = "document.readyState === 'complete'"
+
+
+def _await_page(client: CdpClient, target: dict, timeout: float = 10.0) -> None:
+    """Poll until the page has a live JS context.
+
+    ``Page.navigate`` returns when navigation *starts*, not once the page
+    has loaded; the old fixed 0.5s sleep turned a cold profile or a slow
+    machine into a failed live apply. If the deadline passes without the
+    page reporting ready, proceed anyway rather than hang the run forever
+    -- the guarded scripts that follow report themselves unsupported
+    instead of crashing against a half-loaded page, so the run still
+    degrades to the offline fallback.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if client.evaluate(target, _READY_EXPR) is True:
+            return
+        time.sleep(0.1)
 
 
 def _is_shortcut_path(parts: tuple[str, ...]) -> bool:
@@ -121,12 +141,17 @@ def _shortcut_script(before: dict, target: dict) -> str | None:
 def _settings_script(changes: list[tuple[str, Any]]) -> str | None:
     if not changes:
         return None
+    keys_json = json.dumps([key for key, _value in changes], separators=(",", ":"))
     calls = "\n".join(
         f"await setPref({json.dumps(key)}, {json.dumps(value)});"
         for key, value in changes
     )
     return (
         "(async () => {"
+        f"const keys = {keys_json};"
+        "if (typeof chrome === 'undefined' || !chrome.settingsPrivate) "
+        "throw new Error("
+        "'chrome.settingsPrivate unavailable for ' + keys.join(', '));"
         "const setPref = (key, value) => new Promise((resolve, reject) => {"
         "chrome.settingsPrivate.setPref(key, value, '', ok => {"
         "const err = chrome.runtime.lastError;"
@@ -187,6 +212,8 @@ def _settings_preflight_script(changes: list[tuple[str, Any]]) -> str | None:
     return (
         "(async () => {"
         f"const keys = {keys_json};"
+        "if (typeof chrome === 'undefined' || !chrome.settingsPrivate) "
+        "return keys.slice();"
         "const exists = key => new Promise(resolve => {"
         "chrome.settingsPrivate.getPref(key, pref => {"
         "const err = chrome.runtime.lastError;"
@@ -198,6 +225,23 @@ def _settings_preflight_script(changes: list[tuple[str, Any]]) -> str | None:
         "if (!(await exists(key))) unsupported.push(key);"
         "}"
         "return unsupported;"
+        "})()"
+    )
+
+
+def _shortcuts_preflight_script() -> str:
+    """Probe the commands bundle the way the NTP probe works: report
+    unusable rather than throwing, so a renamed export degrades to an
+    offline apply instead of aborting the run."""
+    return (
+        "(async () => {"
+        "try {"
+        "const m = await import('/commands.bundle.js');"
+        "const c = m.commandsCache;"
+        "if (!c || typeof c.assignAccelerator !== 'function' "
+        "|| typeof c.unassignAccelerator !== 'function') return ['shortcuts'];"
+        "return [];"
+        "} catch (e) { return ['shortcuts']; }"
         "})()"
     )
 
@@ -228,7 +272,7 @@ def _preflight_settings(
     newtab_script = _newtab_preflight_script(newtab_changes)
     if newtab_script is not None:
         client.navigate(target, _NEWTAB_URL)
-        time.sleep(0.5)
+        _await_page(client, target)
         result = client.evaluate(target, newtab_script)
         if isinstance(result, list):
             unsupported.extend(key for key in result if isinstance(key, str))
@@ -236,17 +280,27 @@ def _preflight_settings(
     settings_script = _settings_preflight_script(ordinary_changes)
     if settings_script is not None:
         client.navigate(target, _SETTINGS_URL)
-        time.sleep(0.5)
+        _await_page(client, target)
         result = client.evaluate(target, settings_script)
         if isinstance(result, list):
             unsupported.extend(key for key in result if isinstance(key, str))
     return unsupported
 
 
+def _preflight_shortcuts(client: CdpClient, target: dict) -> list[str]:
+    client.navigate(target, _SHORTCUTS_URL)
+    _await_page(client, target)
+    result = client.evaluate(target, _shortcuts_preflight_script())
+    if isinstance(result, list):
+        return [key for key in result if isinstance(key, str)]
+    return []
+
+
 def apply_live(port: int, prefs_path: Path, prefs: dict, plans: list[Plan]) -> None:
     target_prefs = _live.compute_target_prefs(prefs, plans)
     changes = _setting_changes(prefs, target_prefs)
     newtab_changes, ordinary_changes = _route_settings(changes)
+    shortcut_script = _shortcut_script(prefs, target_prefs)
     client = CdpClient(port)
     target: dict = {}
     created = False
@@ -255,6 +309,8 @@ def apply_live(port: int, prefs_path: Path, prefs: dict, plans: list[Plan]) -> N
         unsupported = _preflight_settings(
             client, target, newtab_changes, ordinary_changes
         )
+        if shortcut_script is not None:
+            unsupported.extend(_preflight_shortcuts(client, target))
         if unsupported:
             raise _live.LiveApplyUnsupported("Brave", unsupported)
 
@@ -270,19 +326,18 @@ def apply_live(port: int, prefs_path: Path, prefs: dict, plans: list[Plan]) -> N
         newtab_script = _newtab_script(newtab_changes)
         if newtab_script is not None:
             client.navigate(target, _NEWTAB_URL)
-            time.sleep(0.5)
+            _await_page(client, target)
             client.evaluate(target, newtab_script)
 
         settings_script = _settings_script(ordinary_changes)
         if settings_script is not None:
             client.navigate(target, _SETTINGS_URL)
-            time.sleep(0.5)
+            _await_page(client, target)
             client.evaluate(target, settings_script)
 
-        shortcut_script = _shortcut_script(prefs, target_prefs)
         if shortcut_script is not None:
             client.navigate(target, _SHORTCUTS_URL)
-            time.sleep(0.5)
+            _await_page(client, target)
             client.evaluate(target, shortcut_script)
 
         _live.write_state_files(plans)
