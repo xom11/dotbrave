@@ -373,6 +373,12 @@ def test_offline_fallback_does_not_discard_what_the_browser_flushed_on_close(
         prefs_path.write_text(json.dumps(data))
 
     monkeypatch.setattr(orch, "find_devtools_port", lambda _root, _profile: 9444)
+    # This test is about the post-close re-read, not the relaunch that
+    # follows it -- without this, the real wait_for_devtools_endpoint
+    # busy-polls the (nonexistent) endpoint for the full default timeout.
+    monkeypatch.setattr(
+        orch, "wait_for_devtools_endpoint", lambda port, display_name: None
+    )
 
     def live_apply_fn(port, got_prefs_path, _prefs, plans):
         raise live_apply.LiveApplyUnsupported("Brave", ["foo.bar"])
