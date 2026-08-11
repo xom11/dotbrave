@@ -242,7 +242,9 @@ _NO_ENTRY = object()
 
 
 def _enrich_prior_values(
-    plans: list[Plan], learned: dict[str, Any], managed_before: set[str],
+    plans: list[Plan],
+    learned: dict[str, tuple[Any, Any]],
+    managed_before: set[str],
 ) -> None:
     """Record the values the preflight read, where they are the *prior* ones.
 
@@ -253,17 +255,38 @@ def _enrich_prior_values(
     route can do better, because ``getPref`` returned that default
     before this run wrote anything.
 
-    Only for keys this run is the first to manage, though.  Once dotbrave
-    has written a key, ``getPref`` returns dotbrave's own value; recording
-    that would make a later removal restore dotbrave's setting instead of
-    the user's.  So all three must hold: the key was applied live in this
-    run (the caller passes only those), it was not in the sidecar's
-    ``managed_keys`` before the run, and its recorded entry is missing or
-    does not already say ``present: true``.  The last condition keeps
-    ``merge_prior_values``'s first-seen-wins property intact -- this is
-    not a back door around it, it fills in entries that recorded no value
-    at all.  A malformed entry is left exactly as found: we do not know
-    what wrote it.
+    ``learned`` maps each key to ``(value, target_value)`` -- what
+    ``getPref`` read, and what this run is about to write for that key.
+    Four conditions gate recording it, all must hold:
+
+    1. the key was applied live in this run (the caller passes only
+       those);
+    2. it was not in the sidecar's ``managed_keys`` before the run --
+       once dotbrave has written a key, ``getPref`` normally returns
+       dotbrave's own value, and recording that would make a later
+       removal restore dotbrave's setting instead of the user's;
+    3. its recorded entry is missing or does not already say
+       ``present: true``.  This keeps ``merge_prior_values``'s
+       first-seen-wins property intact -- this is not a back door
+       around it, it fills in entries that recorded no value at all.
+       A malformed entry is left exactly as found: we do not know
+       what wrote it;
+    4. the value ``getPref`` read differs from ``target_value``.
+       Condition 2 alone has a gap: inside Chromium's ~10s pref-commit
+       window, a second apply of the same key can see the on-disk
+       ``Preferences`` -- and hence ``managed_keys``, which is read
+       from the same disk state -- still lag a write dotbrave itself
+       already made on the previous run.  ``getPref`` then answers with
+       dotbrave's own value even though nothing on disk yet says the
+       key is managed, so conditions 1-3 alone would learn it as though
+       it were the pre-dotbrave default. When the learned value already
+       equals the value being written, there is nothing trustworthy to
+       learn either way -- it may be a genuine coincidence, in which
+       case the key's real default is simply still unknown and the next
+       removal costs a restart, same as before this enrichment existed.
+       Learning nothing is cheap; learning wrongly would let a later
+       removal silently restore dotbrave's setting instead of the
+       user's.
 
     The plan's ``state_payload`` is mutated in place, which is also what
     gets written: the sidecar cannot diverge from what ``plan_apply``
@@ -283,8 +306,10 @@ def _enrich_prior_values(
         prior = payload.get("prior_values")
         if not isinstance(prior, dict):
             continue
-        for key, value in learned.items():
+        for key, (value, target_value) in learned.items():
             if key in managed_before:
+                continue
+            if value == target_value:
                 continue
             entry = prior.get(key, _NO_ENTRY)
             if entry is _NO_ENTRY or (
@@ -510,11 +535,22 @@ def _read_preflight_result(
     Two entry shapes are accepted, deliberately: a bare string names an
     unsupported key (what the New Tab probe returns, and the shape a
     half-loaded page can still produce), while a mapping carries the
-    settings probe's per-key answer.  Anything else is ignored rather
-    than trusted -- a malformed answer must not silently look like a
-    supported key.  ``value`` is only kept when the entry actually has
-    one: ``pref.value`` may be dropped in serialisation when undefined,
-    and a null value is not a value any pref can be set back to.
+    settings probe's per-key answer.
+
+    The *support* answer and the *value* answer fail in opposite
+    directions. Support fails open: an entry that is neither a string
+    nor a dict, or a dict whose ``key`` is not a string, is dropped
+    rather than added to ``unsupported`` -- there is no key name to
+    record the entry under, so there is no list it could join. The key
+    is therefore treated as supported by omission, same as the parser
+    this replaced; if it genuinely is not, the mutating script still
+    raises and the run degrades to the offline fallback, so nothing
+    silently gets a live write it cannot handle. Value fails closed:
+    ``value`` is only kept when the entry actually has one, because
+    ``pref.value`` can be dropped in serialisation when it is
+    ``undefined``, and a null value is not a value any pref could be
+    set back to -- a missing or null value just leaves the key out of
+    ``values`` rather than recording something unusable.
     """
     if not isinstance(result, list):
         return
@@ -596,12 +632,19 @@ def apply_live(
     # only the preflight can tell us that.
     removal_writes, unresolved_removals = _resolve_removals(prefs_path, removals)
     ordinary_changes = ordinary_changes + removal_writes
-    # What dotbrave managed *before* this run.  The sidecar is only
-    # rewritten once the run succeeds, so reading it here still answers
-    # that question -- and the answer is what keeps the preflight's
+    # What dotbrave managed *before* this run.  The sidecar is normally
+    # only rewritten once the run succeeds, so reading it here usually
+    # answers that question -- and the answer is what keeps the preflight's
     # `getPref` values from being recorded for a key dotbrave has already
     # written (where `getPref` returns dotbrave's own value, not the
     # user's).  Same source `plan_apply` read at build time.
+    #
+    # "Normally", because of the gap the CdpError handler documents below
+    # ("Known gap, accepted"): a run can mutate a key live and then fail
+    # before the sidecar is rewritten, leaving this read stale for that
+    # key on the next apply. `_enrich_prior_values`'s fourth condition --
+    # the value read must differ from the value this run is about to
+    # write -- is the backstop for exactly that case.
     managed_before = _base_settings.get_managed_keys(prefs_path)
     shortcut_script = _shortcut_script(prefs, target_prefs)
     if removals and not (newtab_changes or ordinary_changes or shortcut_script):
@@ -721,8 +764,11 @@ def apply_live(
         # from disk on the next run, as before.
         _enrich_prior_values(
             plans,
-            {key: learned_values[key] for key, _v in live_ordinary
-             if key in learned_values},
+            {
+                key: (learned_values[key], write_value)
+                for key, write_value in live_ordinary
+                if key in learned_values
+            },
             managed_before,
         )
         _live.write_state_files(plans)
