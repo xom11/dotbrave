@@ -356,6 +356,44 @@ def test_running_browser_without_live_adapter_closes_normally_and_restarts(
     assert calls == [("close", None), ("restart", ["chrome"])]
 
 
+def test_offline_fallback_does_not_discard_what_the_browser_flushed_on_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Closing Brave flushes its own Preferences copy; the offline write
+    must build on that file, not on the snapshot read before the close."""
+    profile_root = _profile(tmp_path)
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("[settings]\nfoo.bar = 1\n")
+    prefs_path = profile_root / "Default" / "Preferences"
+
+    def flush_on_close() -> None:
+        # What Brave writes as it exits: a key dotbrave never saw.
+        data = json.loads(prefs_path.read_text())
+        data["profile"] = {"exit_type": "Normal"}
+        prefs_path.write_text(json.dumps(data))
+
+    monkeypatch.setattr(orch, "find_devtools_port", lambda _root, _profile: 9444)
+
+    def live_apply_fn(port, got_prefs_path, _prefs, plans):
+        raise live_apply.LiveApplyUnsupported("Brave", ["foo.bar"])
+
+    orch.cmd_apply(
+        _args(profile_root, cfg),
+        display_name="Brave",
+        running_fn=lambda: True,
+        find_cmdline_fn=lambda: ["brave"],
+        restart_fn=lambda _cmd: [],
+        build_plans_fn=_build_plan,
+        live_apply_fn=live_apply_fn,
+        graceful_close_fn=flush_on_close,
+        launch_live_fn=lambda root, profile, port, url, captured=None: ["brave"],
+    )
+
+    final = json.loads(prefs_path.read_text())
+    assert final["profile"]["exit_type"] == "Normal", "close-time flush was reverted"
+    assert final["foo"]["bar"] == 1, "the requested change was not applied"
+
+
 def test_live_setting_removal_signals_offline_fallback() -> None:
     with pytest.raises(live_apply.LiveApplyUnsupported) as exc:
         live_apply.refuse_live_removals(

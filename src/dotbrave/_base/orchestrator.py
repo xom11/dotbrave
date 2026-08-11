@@ -549,6 +549,16 @@ def cmd_apply(
             graceful_close_fn()
             was_closed = True
 
+    if was_closed:
+        # The close flushed the browser's own PrefService over this file.
+        # Everything below mutates and rewrites `prefs`, so it has to be
+        # the post-close copy or the write reverts the flush -- including
+        # `profile.exit_type`, which then reads as an unclean shutdown.
+        # Plans stay valid: their apply_fn closures carry the target from
+        # the config and the removals from the sidecar, not a prefs
+        # snapshot.
+        prefs = load_prefs(prefs_path)
+
     backup = prefs_path.with_suffix(
         prefs_path.suffix + f".bak.{datetime.now():%Y%m%d-%H%M%S}"
     )

@@ -68,6 +68,10 @@ Preserve these contracts unless a change explicitly redesigns them:
 1. `apply` uses module `Plan` objects and one orchestrated cycle. Validate
    all selected namespaces before committing profile changes; create at most
    one Preferences backup per offline apply.
+   When an apply closes the browser, it must re-read `Preferences` before
+   mutating and committing: the close flushes the browser's own in-memory
+   copy over the file, and writing the snapshot taken before the close
+   reverts that flush (`profile.exit_type` among it).
 2. Missing TOML table means "skip this namespace"; an empty table means
    "remove/reset entries previously managed by dotbrave".
 3. `[settings]` must refuse MAC-protected keys found in either `Preferences`
