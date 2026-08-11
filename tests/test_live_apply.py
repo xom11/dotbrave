@@ -406,6 +406,66 @@ def test_offline_fallback_does_not_discard_what_the_browser_flushed_on_close(
     assert final["foo"]["bar"] == 1, "the requested change was not applied"
 
 
+def test_endpoint_bootstrap_rebuilds_plans_from_what_the_browser_flushed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The close that bootstraps a debugging endpoint flushes Brave's own
+    Preferences copy exactly as the offline fallback's close does -- but this
+    path never reaches the post-close re-read, so the live half would diff a
+    snapshot the close invalidated.  A key changed in-session would compare
+    equal to it, produce no diff, and never be pushed, while the run reports
+    success."""
+    profile_root = _profile(tmp_path)
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("[settings]\nfoo.bar = 1\n")
+    prefs_path = profile_root / "Default" / "Preferences"
+    built_from: list[dict] = []
+    live_saw: list[dict] = []
+
+    def flush_on_close() -> None:
+        # What Brave writes as it exits: the in-session value of a key
+        # dotbrave's pre-close read never saw.
+        data = json.loads(prefs_path.read_text())
+        data["foo"]["baz"] = "changed in session"
+        prefs_path.write_text(json.dumps(data))
+
+    def build(path: Path, prefs: dict, doc: dict, **kw: object) -> list[Plan]:
+        built_from.append(json.loads(json.dumps(prefs)))
+        return _build_plan(path, prefs, doc)
+
+    monkeypatch.setattr(orch, "find_devtools_port", lambda _root, _profile: None)
+    monkeypatch.setattr(orch, "pick_unused_port", lambda: 9444)
+    monkeypatch.setattr(
+        orch, "wait_for_devtools_endpoint", lambda port, display_name: None
+    )
+    monkeypatch.setattr(
+        orch, "remember_devtools_port", lambda root, profile, port: None
+    )
+
+    orch.cmd_apply(
+        _args(profile_root, cfg),
+        display_name="Brave",
+        running_fn=lambda: True,
+        find_cmdline_fn=lambda: ["brave"],
+        restart_fn=lambda _cmd: [],
+        build_plans_fn=build,
+        live_apply_fn=lambda port, path, prefs, plans, **kw: live_saw.append(prefs),
+        graceful_close_fn=flush_on_close,
+        launch_live_fn=lambda root, profile, port, url, captured=None: ["brave"],
+    )
+
+    assert live_saw, "live apply never ran"
+    assert live_saw[0]["foo"].get("baz") == "changed in session", (
+        "live apply diffed the pre-close snapshot"
+    )
+    # Rebuilt, not merely re-read: the settings sidecar's prior-value capture
+    # runs at plan-construction time off the same dict, so a plan built before
+    # the close records a "value before dotbrave" that was never on disk --
+    # and that entry is first-seen-wins, so nothing later corrects it.
+    assert len(built_from) == 2, "plans were not rebuilt after the close"
+    assert built_from[-1]["foo"].get("baz") == "changed in session"
+
+
 def test_live_setting_removal_is_split_out_not_refused() -> None:
     """A removal has no single-pref reset, so it goes offline -- but on its
     own.  Refusing the whole batch dragged every applicable key with it."""

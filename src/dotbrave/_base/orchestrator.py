@@ -500,6 +500,36 @@ def cmd_apply(
                         saved_cmdline, restart_fn, display_name
                     )
                     sys.exit(f"{e}\n{note}")
+                # That close flushed the browser's own PrefService over this
+                # file, exactly as the offline fallback's close does -- but
+                # this path never reaches the `was_closed` re-read below, so
+                # without this the live half would diff the pre-close
+                # snapshot.  A key the user changed in-session would compare
+                # equal to that stale copy, produce no diff, never be pushed,
+                # and the run would still report `ok -- live applied`.
+                #
+                # Rebuild the plans rather than only re-reading `prefs`: the
+                # settings sidecar's prior-value capture reads the same dict
+                # at plan-construction time, so a stale copy would also record
+                # a "value before dotbrave" that was never on disk -- and that
+                # entry is first-seen-wins, so it would never be corrected.
+                # Plan construction is pure (it reads Preferences and the
+                # sidecars, writes nothing), so this is safe to redo.  The
+                # diff printed above can now be a hair stale; it is
+                # informational only, and reprinting it would be noisier than
+                # the discrepancy it describes.
+                prefs = load_prefs(prefs_path)
+                rebuilt = {
+                    p.namespace: p
+                    for p in build_plans_fn(prefs_path, prefs, doc, skip=skip)
+                }
+                # Keep the run's shape: external plans applied above were
+                # deliberately dropped from `plans` and must not come back,
+                # or the policy would be written a second time.
+                plans = [
+                    rebuilt[p.namespace] for p in plans if p.namespace in rebuilt
+                ]
+                non_empty = [p for p in plans if not p.empty]
             live_port = int(live_port)
             try:
                 live_apply_fn(
