@@ -278,6 +278,15 @@ costs a close, an offline write and a relaunch. The common case it fixes is the
 one that mattered: on a fresh profile, keys first managed live now record the
 real default and can be removed live.
 
+A second asymmetry survives within the live route itself: `_preflight_settings`
+discards the New Tab probe's values (`live.py:591-593`) by design, because that
+route drives store actions, not `settingsPrivate` — there is no `getPref` call
+to read a value from. The ten keys in `_NEWTAB_ACTIONS` (`live.py:21-38` —
+`show_clock`, `show_stats`, `show_background_image`, and the rest of the
+widgets users actually toggle) therefore keep the `{"present": false}` marker
+permanently, however they are first managed. Removing one of them still costs
+a close, an offline write and a relaunch.
+
 This is a semantic change and must be documented: offline removal deletes the
 key, live removal *resets* it, leaving the key present in `Preferences` with a
 default-equal value. Invariant 2 has to say so.

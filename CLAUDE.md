@@ -101,7 +101,14 @@ Preserve these contracts unless a change explicitly redesigns them:
    dotbrave's value, and recording that would make removal restore
    dotbrave's setting instead of the user's. An entry already recorded
    `present: true` is never touched (`merge_prior_values` is
-   first-seen-wins).
+   first-seen-wins). That default-learning trick only covers keys the
+   settings preflight actually calls `getPref` for. The ten keys in
+   `_NEWTAB_ACTIONS` (`live.py`, e.g. `show_clock`, `show_stats`,
+   `show_background_image`) go through the New Tab store instead of
+   `settingsPrivate`, so there is no `getPref` value to learn from --
+   they keep the `{"present": false}` marker permanently, however they
+   are first managed, and removing one always costs a close, an
+   offline write and a relaunch.
 3. `[settings]` must refuse MAC-protected keys found in either `Preferences`
    or sibling `Secure Preferences`. Never make a write that Brave will
    silently reset on launch.
