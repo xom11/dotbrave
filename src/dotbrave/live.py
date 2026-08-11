@@ -60,6 +60,16 @@ def _worker_target(client: CdpClient) -> tuple[dict, bool]:
 
 _READY_EXPR = "document.readyState === 'complete'"
 
+# Poll budgets for values that arrive *after* readyState, in JS-side
+# attempts of `_POLL_INTERVAL_MS` each.  The New Tab bound is named once
+# because two scripts must agree on it: the preflight decides a key is
+# unsupported when the store never appears, and the mutating script throws
+# when it does not -- a shorter budget in the mutating script would turn a
+# key the preflight cleared into a CdpError.
+_POLL_INTERVAL_MS = 50
+_NTP_POLL_ATTEMPTS = 20
+_PROFILE_PATH_POLL_ATTEMPTS = 40
+
 
 def _await_page(client: CdpClient, target: dict, timeout: float = 10.0) -> None:
     """Poll until the page has a live JS context.
@@ -103,8 +113,9 @@ _PROFILE_PATH_SCRIPT = (
     "return el ? (el.textContent || '').trim() : '';"
     "};"
     "let value = read();"
-    "for (let attempt = 0; attempt < 40 && !value; attempt++) {"
-    "await new Promise(r => setTimeout(r, 50));"
+    f"for (let attempt = 0; attempt < {_PROFILE_PATH_POLL_ATTEMPTS} "
+    "&& !value; attempt++) {"
+    f"await new Promise(r => setTimeout(r, {_POLL_INTERVAL_MS}));"
     "value = read();"
     "}"
     "return value;"
@@ -330,8 +341,9 @@ def _newtab_preflight_script(changes: list[tuple[str, str, str, Any]]) -> str | 
         "typeof window._ntp?.[store]?.getState?.()?.actions?.[action] "
         "!== 'function').map(({key}) => key);"
         "let unsupported = missing();"
-        "for (let attempt = 0; attempt < 20 && unsupported.length; attempt++) {"
-        "await new Promise(r => setTimeout(r, 50));"
+        f"for (let attempt = 0; attempt < {_NTP_POLL_ATTEMPTS} "
+        "&& unsupported.length; attempt++) {"
+        f"await new Promise(r => setTimeout(r, {_POLL_INTERVAL_MS}));"
         "unsupported = missing();"
         "}"
         "return unsupported;"
@@ -404,8 +416,9 @@ def _newtab_script(changes: list[tuple[str, str, str, Any]]) -> str | None:
         "typeof window._ntp?.[store]?.getState?.()?.actions?.[action] "
         "!== 'function').map(({key}) => key);"
         "let unready = missing();"
-        "for (let attempt = 0; attempt < 20 && unready.length; attempt++) {"
-        "await new Promise(r => setTimeout(r, 50));"
+        f"for (let attempt = 0; attempt < {_NTP_POLL_ATTEMPTS} "
+        "&& unready.length; attempt++) {"
+        f"await new Promise(r => setTimeout(r, {_POLL_INTERVAL_MS}));"
         "unready = missing();"
         "}"
         "if (unready.length) throw new Error("
@@ -546,7 +559,12 @@ def apply_live(
             _live.backup_preferences(prefs_path)
             backup_taken = True
 
-        _live.apply_external_plans(plans)
+        # No external ([pwa]) plans are applied here, deliberately.  The
+        # orchestrator applies every non-empty one before this adapter is
+        # called and drops it from `plans`, so a call here could only ever
+        # be a no-op -- and it would sit *after* the backup, inverting the
+        # ordering the offline path keeps on purpose (privileged write
+        # first, so a sudo failure leaves Preferences untouched).
 
         newtab_script = _newtab_script(live_newtab)
         if newtab_script is not None:
@@ -582,6 +600,14 @@ def apply_live(
         # every plan idempotently.  Carry the backup flag for the same
         # reason the remainder path does -- a CdpError raised after the
         # backup must not earn the offline path a second one.
+        #
+        # Known gap, accepted: under --unattended the orchestrator warns
+        # and returns on LiveApplyUnsupported without closing the browser,
+        # so a CdpError raised after part of the live half already landed
+        # leaves those keys unrecorded in the sidecars -- the same hole the
+        # remainder path closes by refusing before it mutates.  Unlike that
+        # one it self-heals: a CdpError is transient, so the next
+        # successful apply reaches write_state_files and records them.
         raise _live.LiveApplyUnsupported(
             "Brave", [f"live apply failed: {e}"], backup_taken=backup_taken
         )
