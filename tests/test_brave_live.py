@@ -495,9 +495,6 @@ def test_removal_only_diff_never_opens_a_work_tab(
 def test_removal_with_a_recorded_prior_value_applies_live(
     tmp_path: Path, monkeypatch
 ) -> None:
-    from dotbrave._base.utils import Plan
-    from dotbrave import live
-
     prefs_path = tmp_path / "Default" / "Preferences"
     prefs_path.parent.mkdir()
     prefs = {"brave": {"location_bar_is_wide": True}}
@@ -529,11 +526,6 @@ def test_removal_without_a_usable_prior_value_still_goes_offline(
 ) -> None:
     """present: false means we never learned the default, so there is
     nothing to write and the key has to be deleted offline."""
-    import pytest
-    from dotbrave._base import live_apply as shared_live
-    from dotbrave._base.utils import Plan
-    from dotbrave import live
-
     prefs_path = tmp_path / "Default" / "Preferences"
     prefs_path.parent.mkdir()
     prefs = {"brave": {"location_bar_is_wide": True}}
@@ -555,6 +547,46 @@ def test_removal_without_a_usable_prior_value_still_goes_offline(
     with pytest.raises(shared_live.LiveApplyUnsupported) as excinfo:
         live.apply_live(9333, prefs_path, prefs, [plan])
     assert excinfo.value.keys == ["brave.location_bar_is_wide"]
+
+
+@pytest.mark.parametrize(
+    "sidecar_entry",
+    [
+        pytest.param("not-a-dict", id="entry-is-not-a-dict"),
+        pytest.param({"value": False}, id="entry-missing-present"),
+        pytest.param({"present": True}, id="entry-missing-value"),
+    ],
+)
+def test_removal_with_a_malformed_prior_value_entry_still_goes_offline(
+    tmp_path: Path, monkeypatch, sidecar_entry: object
+) -> None:
+    """A missing, malformed, or partially-written sidecar entry must be
+    treated as unresolvable, not as a recorded prior value.  In
+    particular, ``{"present": true}`` with no ``"value"`` key -- a
+    plausible shape for a truncated or hand-edited sidecar -- must not
+    be silently resolved into ``setPref(key, None)``."""
+    prefs_path = tmp_path / "Default" / "Preferences"
+    prefs_path.parent.mkdir()
+    prefs = {"brave": {"location_bar_is_wide": True}}
+    prefs_path.write_text(json.dumps(prefs))
+    prefs_path.with_name("Preferences.dotbrave.settings.json").write_text(json.dumps({
+        "managed_keys": ["brave.location_bar_is_wide"],
+        "prior_values": {"brave.location_bar_is_wide": sidecar_entry},
+    }))
+
+    def apply_fn(target: dict) -> None:
+        del target["brave"]["location_bar_is_wide"]
+
+    plan = Plan(namespace="settings", diff_lines=["removed"],
+                apply_fn=apply_fn, verify_fn=lambda _p: None)
+
+    fake = FakeCdpClient(9333, evaluation_results=[[]])
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake)
+
+    with pytest.raises(shared_live.LiveApplyUnsupported) as excinfo:
+        live.apply_live(9333, prefs_path, prefs, [plan])
+    assert excinfo.value.keys == ["brave.location_bar_is_wide"]
+    assert not any("setPref" in e for e in fake.evaluations)
 
 
 def test_settings_remainder_does_not_block_the_shortcut_script(

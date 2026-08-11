@@ -110,16 +110,23 @@ def _resolve_removals(
     browser's behaviour is concerned.  A key recorded ``present: false``
     was never set, so there is no value to write and it has to be deleted
     offline.  The sidecar entry is read defensively: a missing, malformed,
-    or partially-written entry (not a dict, or missing ``present``) is
-    treated the same as "no prior value recorded" rather than raising.
+    or partially-written entry (not a dict, missing ``present``, or missing
+    ``value``) is treated the same as "no prior value recorded" rather than
+    raising.
     """
+    if not removals:
+        return [], []
     prior = _base_settings.get_prior_values(prefs_path)
     writes: list[tuple[str, Any]] = []
     unresolved: list[str] = []
     for key in removals:
         entry = prior.get(key)
-        if isinstance(entry, dict) and entry.get("present") is True:
-            writes.append((key, entry.get("value")))
+        if (
+            isinstance(entry, dict)
+            and entry.get("present") is True
+            and "value" in entry
+        ):
+            writes.append((key, entry["value"]))
         else:
             unresolved.append(key)
     return writes, unresolved
