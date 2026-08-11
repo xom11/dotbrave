@@ -7,12 +7,24 @@ are global).  On Linux an explicitly-launched Brave keeps
 default-launched Brave (opened from the app menu) carries the flag
 nowhere -- so a pid's own cmdline is enough to tell which instance/root
 it belongs to.
+
+Also covers a finer-grained scope: a running browser can hold the
+*root* open without holding the specific *profile* dotbrave is asked to
+apply to.  Chromium only keeps a profile's Preferences in memory while
+that profile is loaded, so a profile that is not open can be written
+offline right now, with no close at all.
 """
 from __future__ import annotations
 
+import argparse
 import importlib
+import json
+from pathlib import Path
 
 import pytest
+
+from dotbrave._base import orchestrator as orch
+from dotbrave._base.utils import Plan
 
 
 def _linux_process_module(monkeypatch):
@@ -195,3 +207,146 @@ def test_scope_combines_with_channel_filter(monkeypatch) -> None:
     proc = _make_proc(bp, linux_pid_filter="/opt/brave.com/brave-beta/")
     proc.scope_to_profile(OTHER_ROOT, default_user_data_dir=DEFAULT_ROOT)
     assert proc.pids() == ["100"]
+
+
+# ---------------------------------------------------------------------------
+# `cmd_apply(profile_open_fn=...)`: skip the close for a profile that is
+# not open in a browser that IS running on the target --user-data-dir.
+# ---------------------------------------------------------------------------
+
+def _args(profile_root: Path, config: Path, **overrides) -> argparse.Namespace:
+    values = {
+        "profile_root": profile_root,
+        "profile": "Default",
+        "config": str(config),
+        "dry_run": False,
+        "allow_http": False,
+        "expect_sha256": None,
+    }
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+def _profile(tmp_path: Path) -> Path:
+    profile = tmp_path / "Default"
+    profile.mkdir()
+    (profile / "Preferences").write_text(json.dumps({"foo": {"bar": 0}}))
+    return tmp_path
+
+
+def _build_plan(prefs_path: Path, _prefs: dict, _doc: dict, **_kw) -> list[Plan]:
+    def apply_fn(prefs: dict) -> None:
+        prefs["foo"]["bar"] = 1
+
+    return [
+        Plan(
+            namespace="settings",
+            diff_lines=["  ~ foo.bar: 0 -> 1"],
+            apply_fn=apply_fn,
+            verify_fn=lambda _prefs: None,
+            state_path=prefs_path.with_name("Preferences.dotbrave.settings.json"),
+            state_payload={"managed_keys": ["foo.bar"]},
+        )
+    ]
+
+
+def test_apply_to_a_profile_that_is_not_open_never_closes_the_browser(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profile_root = _profile(tmp_path)
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("[settings]\nfoo.bar = 1\n")
+    closed: list[str] = []
+
+    orch.cmd_apply(
+        _args(profile_root, cfg),
+        display_name="Brave",
+        running_fn=lambda: True,          # a Brave IS running...
+        profile_open_fn=lambda: False,    # ...but not on this profile
+        find_cmdline_fn=lambda: ["brave"],
+        restart_fn=lambda _cmd: [],
+        build_plans_fn=_build_plan,
+        live_apply_fn=lambda *a, **k: pytest.fail("live apply not needed"),
+        graceful_close_fn=lambda: closed.append("closed"),
+        launch_live_fn=lambda *a, **k: ["brave"],
+    )
+
+    assert closed == [], "closed a browser that does not hold this profile"
+    prefs = json.loads((profile_root / "Default" / "Preferences").read_text())
+    assert prefs["foo"]["bar"] == 1
+
+
+def test_apply_when_profile_open_fn_reports_open_still_closes(
+    tmp_path: Path,
+) -> None:
+    """The conservative default: when `profile_open_fn` reports the
+    profile IS open, behavior is unchanged from a plain running browser
+    with no live adapter -- close normally and restart."""
+    profile_root = _profile(tmp_path)
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("[settings]\nfoo.bar = 1\n")
+    calls: list[tuple[str, object]] = []
+
+    orch.cmd_apply(
+        _args(profile_root, cfg),
+        display_name="Brave",
+        running_fn=lambda: True,
+        profile_open_fn=lambda: True,
+        find_cmdline_fn=lambda: ["brave"],
+        restart_fn=lambda cmd: calls.append(("restart", cmd)) or cmd,
+        build_plans_fn=_build_plan,
+        graceful_close_fn=lambda: calls.append(("close", None)),
+    )
+
+    assert calls == [("close", None), ("restart", ["brave"])]
+
+
+def test_apply_without_profile_open_fn_keeps_todays_behavior(
+    tmp_path: Path,
+) -> None:
+    """`profile_open_fn` defaults to None -- every existing caller that
+    doesn't pass it keeps closing a running browser exactly as before."""
+    profile_root = _profile(tmp_path)
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("[settings]\nfoo.bar = 1\n")
+    calls: list[tuple[str, object]] = []
+
+    orch.cmd_apply(
+        _args(profile_root, cfg),
+        display_name="Brave",
+        running_fn=lambda: True,
+        find_cmdline_fn=lambda: ["brave"],
+        restart_fn=lambda cmd: calls.append(("restart", cmd)) or cmd,
+        build_plans_fn=_build_plan,
+        graceful_close_fn=lambda: calls.append(("close", None)),
+    )
+
+    assert calls == [("close", None), ("restart", ["brave"])]
+
+
+def test_unattended_apply_to_a_profile_that_is_not_open_applies_fully(
+    tmp_path: Path,
+) -> None:
+    """`--unattended` normally reports-and-skips a running browser rather
+    than close it (exit 0, nothing written).  When the browser doesn't
+    hold this profile, there's nothing for that early-exit to protect --
+    the run should go all the way through, not skip."""
+    profile_root = _profile(tmp_path)
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("[settings]\nfoo.bar = 1\n")
+
+    orch.cmd_apply(
+        _args(profile_root, cfg, unattended=True),
+        display_name="Brave",
+        running_fn=lambda: True,
+        profile_open_fn=lambda: False,
+        find_cmdline_fn=lambda: ["brave"],
+        restart_fn=lambda _cmd: [],
+        build_plans_fn=_build_plan,
+        live_apply_fn=lambda *a, **k: pytest.fail("live apply not needed"),
+        graceful_close_fn=lambda: pytest.fail("must not close the browser"),
+        launch_live_fn=lambda *a, **k: ["brave"],
+    )
+
+    prefs = json.loads((profile_root / "Default" / "Preferences").read_text())
+    assert prefs["foo"]["bar"] == 1

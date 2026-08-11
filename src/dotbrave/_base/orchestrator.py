@@ -286,12 +286,23 @@ def cmd_apply(
     launch_live_fn: (
         Callable[[Path, str, int, str | None, list[str] | None], list[str]] | None
     ) = None,
+    profile_open_fn: Callable[[], bool] | None = None,
 ) -> None:
     """Unified apply orchestrator.
 
     Process callbacks are resolved at call time in each browser's
     ``cmd_apply`` wrapper, so test monkeypatching of the browser
     module's function names takes effect.
+
+    ``profile_open_fn``, when given, answers a narrower question than
+    ``running_fn``: not "is the browser running" but "does the running
+    browser hold *this* profile open right now".  Chromium only keeps a
+    profile's Preferences in memory -- and only flushes its own copy back
+    over the file on close -- while that profile is loaded, so a browser
+    running with a *different* profile open is not touching this
+    profile's Preferences at all.  ``None`` (the default) preserves
+    today's behavior: any running browser is treated as holding the
+    target profile.
     """
     prefs_path = find_preferences(args.profile_root, args.profile)
     doc = load_toml_source(
@@ -403,6 +414,15 @@ def cmd_apply(
     )
     if is_running is None:
         return
+    if is_running and profile_open_fn is not None and not profile_open_fn():
+        # The browser holds a different profile, so Chromium is not
+        # touching this profile's Preferences.  Writing it offline is
+        # safe, verifiable, and needs no close at all.
+        print(
+            f"{display_name} is running, but not on this profile -- "
+            f"applying offline without closing it"
+        )
+        is_running = False
     applied_external: list[str] = []
     if is_running:
         # An external plan writes managed policy ([pwa]): no Preferences
