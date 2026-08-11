@@ -662,6 +662,10 @@ class BrowserProcess:
         "--profile-directory",
         "--remote-debugging-address",
         "--remote-debugging-port",
+        # A relaunch spawns detached with stdin=DEVNULL and no fd 3/4, so a
+        # forwarded pipe flag makes the new process read EOF and quit in
+        # ~2s -- and the reopen retries the same command line.
+        "--remote-debugging-pipe",
     )
 
     def _forwardable_flags(self, captured_cmdline: list[str] | None) -> list[str]:

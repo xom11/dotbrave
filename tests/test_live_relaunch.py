@@ -120,6 +120,23 @@ def test_live_launch_cmdline_does_not_duplicate_managed_flags(
     assert "--ozone-platform=wayland" in cmdline
 
 
+def test_relaunch_drops_a_pipe_flag_it_cannot_honour() -> None:
+    """Relaunch chạy detached với stdin=DEVNULL, không có fd 3/4: một cờ
+    --remote-debugging-pipe được chuyển tiếp khiến tiến trình mới đọc EOF
+    và thoát ngay, nên cờ này không bao giờ được nằm trong tập chuyển tiếp."""
+    captured = [
+        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+        "--remote-debugging-pipe",
+        "--ozone-platform=wayland",
+        "--user-data-dir=/somewhere",
+    ]
+
+    flags = BROWSER_PROCESS._forwardable_flags(captured)
+
+    assert "--remote-debugging-pipe" not in flags
+    assert "--ozone-platform=wayland" in flags, "session flags must still ride along"
+
+
 def test_relaunch_for_live_apply_captures_cmdline_before_closing(
     prefs_root, tmp_path, monkeypatch
 ):
