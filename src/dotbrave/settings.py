@@ -27,7 +27,9 @@ diff_summary = _base.diff_summary
 
 
 def plan_apply(prefs_path: Path, prefs: dict, raw_table: object) -> Plan:
-    return _base.plan_apply("brave", prefs_path, prefs, raw_table)
+    return _base.plan_apply(
+        "brave", prefs_path, prefs, raw_table, local_state_keys=LOCAL_STATE_KEYS
+    )
 
 
 def cmd_dump(args: argparse.Namespace) -> None:
@@ -86,6 +88,18 @@ KNOWN_SETTINGS: tuple[str, ...] = (
     # Omnibox
     "omnibox.prevent_url_elisions",
 )
+
+
+# Prefs that live in `<profile-root>/Local State`, not in a profile's
+# `Preferences`.  dotbrave only addresses the latter, so writing these
+# there is a permanent no-op that `verify_fn` cannot catch -- it re-reads
+# the file dotbrave just wrote.  Exact keys, never prefixes:
+# `browser.show_home_button` is a profile pref.
+LOCAL_STATE_KEYS: frozenset[str] = frozenset({
+    "browser.enabled_labs_experiments",
+    "performance_tuning.high_efficiency_mode",
+    "hardware_acceleration_mode_previous",
+})
 
 
 def build_export_lines(

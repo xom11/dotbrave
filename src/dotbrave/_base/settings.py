@@ -443,13 +443,26 @@ def diff_summary(
     return lines
 
 
-def plan_apply(browser_name: str, prefs_path: Path, prefs: dict, raw_table: object) -> Plan:
+def plan_apply(
+    browser_name: str,
+    prefs_path: Path,
+    prefs: dict,
+    raw_table: object,
+    *,
+    local_state_keys: frozenset[str] = frozenset(),
+) -> Plan:
     target = _validate_table(raw_table)
 
     macs = _all_macs(prefs, prefs_path)
     rejected: list[str] = []
     for key in target:
         parts = _split_key(key)
+        if key in local_state_keys:
+            rejected.append(
+                f"{key} (lives in Local State, not this profile's Preferences; "
+                f"dotbrave cannot write it)"
+            )
+            continue
         if parts[0] == "protection":
             rejected.append(f"{key} (Chromium MAC bookkeeping subtree)")
             continue

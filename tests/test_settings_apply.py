@@ -395,3 +395,40 @@ def test_no_sync_warning_when_settings_table_empty(
     # Empty + no managed keys -> no changes; either succeeds with no
     # diff, or returns no-op -- either way, no sync warning.
     assert "Brave Sync" not in r.stdout
+
+
+def test_local_state_keys_are_refused_instead_of_silently_no_op(
+    fake_settings_profile_root: Path, capsys
+) -> None:
+    """These prefs live in <root>/Local State, not <root>/<profile>/Preferences.
+    Writing them to Preferences is a permanent no-op that verify_fn cannot
+    catch, because verify_fn re-reads the file dotbrave itself wrote."""
+    import pytest
+    from dotbrave._base import settings as base_settings
+    from dotbrave.settings import LOCAL_STATE_KEYS
+
+    prefs_path = fake_settings_profile_root / "Default" / "Preferences"
+    prefs = json.loads(prefs_path.read_text())
+
+    with pytest.raises(SystemExit) as excinfo:
+        base_settings.plan_apply(
+            "brave",
+            prefs_path,
+            prefs,
+            {"browser.enabled_labs_experiments": ["some-flag@1"]},
+            local_state_keys=LOCAL_STATE_KEYS,
+        )
+
+    message = str(excinfo.value)
+    assert "browser.enabled_labs_experiments" in message
+    assert "Local State" in message
+
+
+def test_profile_scoped_browser_key_is_still_accepted(
+    fake_settings_profile_root: Path
+) -> None:
+    """The denylist is exact, not prefixed: browser.* is not all Local State."""
+    from dotbrave.settings import LOCAL_STATE_KEYS
+
+    assert "browser.enabled_labs_experiments" in LOCAL_STATE_KEYS
+    assert "browser.show_home_button" not in LOCAL_STATE_KEYS
