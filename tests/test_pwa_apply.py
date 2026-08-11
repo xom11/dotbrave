@@ -467,3 +467,17 @@ def test_macos_uses_binary_plist_format(
 
     # Binary plist files start with the magic bytes "bplist00".
     assert fake_policy.read_bytes().startswith(b"bplist00")
+
+
+def test_generated_header_does_not_advertise_a_removed_subcommand() -> None:
+    """dotbrave registers only `apply` and `export` (browser.py passes
+    module_registers=[]), so no generated text may name `pwa dump`."""
+    import subprocess
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parents[1] / "src"
+    hits = subprocess.run(
+        ["grep", "-rn", "pwa dump", str(src), "--include=*.py"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    assert hits == "", f"removed subcommand still advertised:\n{hits}"
