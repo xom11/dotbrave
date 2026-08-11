@@ -269,6 +269,12 @@ def cmd_restore(args: argparse.Namespace) -> None:
     Linux non-stable channel filter (and macOS app-name distinction)
     are honored when killing the right Brave install.
     """
+    # Format policy location the same way pwa.py help text does
+    if sys.platform == "win32":
+        policy_location = f"HKLM\\{pwa_mod._WINDOWS_POLICY_KEY}"
+    else:
+        policy_location = pwa_mod.POLICY_FILE or "the managed-policy file"
+
     channel = getattr(args, "channel", "stable")
     if channel == "stable":
         BROWSER_PROCESS.scope_to_profile(
@@ -281,6 +287,7 @@ def cmd_restore(args: argparse.Namespace) -> None:
             find_cmdline_fn=find_main_brave_cmdline,
             restart_fn=restart_brave,
             graceful_close_fn=BROWSER_PROCESS.close_and_wait,
+            policy_location=str(policy_location),
         )
         return
 
@@ -294,6 +301,7 @@ def cmd_restore(args: argparse.Namespace) -> None:
         find_cmdline_fn=proc.find_main_cmdline,
         restart_fn=proc.restart,
         graceful_close_fn=proc.close_and_wait,
+        policy_location=str(policy_location),
     )
 
 

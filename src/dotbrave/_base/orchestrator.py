@@ -650,6 +650,7 @@ def cmd_restore(
     find_cmdline_fn: Callable[[], list[str] | None],
     restart_fn: Callable[[list[str]], list[str]],
     graceful_close_fn: Callable[[], None],
+    policy_location: str | None = None,
 ) -> None:
     """Restore Preferences from a backup created by a prior ``apply``.
 
@@ -734,11 +735,11 @@ def cmd_restore(
             sp.unlink()
             print(f"cleared {sidecar}")
 
-    print(
-        "note: [pwa] policy file is NOT affected by restore. "
-        "If you no longer want the installed PWAs, edit the "
-        "managed-policy file directly."
-    )
+    if policy_location:
+        msg = f"note: [pwa] policy file is NOT affected by restore. If you no longer want the installed PWAs, edit {policy_location}."
+    else:
+        msg = "note: [pwa] policy file is NOT affected by restore. If you no longer want the installed PWAs, edit the managed-policy file manually."
+    print(msg)
 
     if saved_cmdline:
         used = restart_fn(saved_cmdline)
