@@ -93,7 +93,15 @@ Preserve these contracts unless a change explicitly redesigns them:
    its pre-dotbrave value rather than gone. A key the sidecar recorded as
    `{"present": false}` was never set before dotbrave touched it -- there
    is no value to restore live, so that removal goes to the offline
-   remainder instead.
+   remainder instead. The live route avoids recording that marker where
+   it can: `getPref` returns a pref's *effective* value, so the settings
+   preflight reads the compiled default of a key that is still unset and
+   records it as the prior value. Only for a key this run is the first to
+   manage, though -- after dotbrave's own write `getPref` returns
+   dotbrave's value, and recording that would make removal restore
+   dotbrave's setting instead of the user's. An entry already recorded
+   `present: true` is never touched (`merge_prior_values` is
+   first-seen-wins).
 3. `[settings]` must refuse MAC-protected keys found in either `Preferences`
    or sibling `Secure Preferences`. Never make a write that Brave will
    silently reset on launch.

@@ -238,6 +238,61 @@ def _resolve_removals(
     return writes, unresolved
 
 
+_NO_ENTRY = object()
+
+
+def _enrich_prior_values(
+    plans: list[Plan], learned: dict[str, Any], managed_before: set[str],
+) -> None:
+    """Record the values the preflight read, where they are the *prior* ones.
+
+    ``_capture_prior_values`` reads the on-disk ``Preferences``, and
+    Chromium only persists prefs somebody explicitly set -- so a key
+    sitting at its compiled-in default is recorded ``{"present": false}``,
+    which ``_resolve_removals`` correctly refuses to act on.  The live
+    route can do better, because ``getPref`` returned that default
+    before this run wrote anything.
+
+    Only for keys this run is the first to manage, though.  Once dotbrave
+    has written a key, ``getPref`` returns dotbrave's own value; recording
+    that would make a later removal restore dotbrave's setting instead of
+    the user's.  So all three must hold: the key was applied live in this
+    run (the caller passes only those), it was not in the sidecar's
+    ``managed_keys`` before the run, and its recorded entry is missing or
+    does not already say ``present: true``.  The last condition keeps
+    ``merge_prior_values``'s first-seen-wins property intact -- this is
+    not a back door around it, it fills in entries that recorded no value
+    at all.  A malformed entry is left exactly as found: we do not know
+    what wrote it.
+
+    The plan's ``state_payload`` is mutated in place, which is also what
+    gets written: the sidecar cannot diverge from what ``plan_apply``
+    computed because there is only ever one dict.  A payload without a
+    ``prior_values`` mapping is left alone rather than grown one --
+    ``plan_apply`` always emits it, so a payload missing it did not come
+    from there and is not ours to reshape.
+    """
+    if not learned:
+        return
+    for plan in plans:
+        if plan.namespace != _base_settings.NAMESPACE:
+            continue
+        payload = plan.state_payload
+        if not isinstance(payload, dict):
+            continue
+        prior = payload.get("prior_values")
+        if not isinstance(prior, dict):
+            continue
+        for key, value in learned.items():
+            if key in managed_before:
+                continue
+            entry = prior.get(key, _NO_ENTRY)
+            if entry is _NO_ENTRY or (
+                isinstance(entry, dict) and entry.get("present") is not True
+            ):
+                prior[key] = {"present": True, "value": value}
+
+
 def _dict_at(prefs: dict, parts: tuple[str, ...]) -> dict[str, list[str]]:
     value = _live.get_path(prefs, parts)
     return value if isinstance(value, dict) else {}
@@ -352,6 +407,22 @@ def _newtab_preflight_script(changes: list[tuple[str, str, str, Any]]) -> str | 
 
 
 def _settings_preflight_script(changes: list[tuple[str, Any]]) -> str | None:
+    """Probe every ordinary key, and read the value it holds right now.
+
+    The existence answer is what the per-key split needs.  The value is
+    what a *later* removal needs: ``getPref`` returns the pref's
+    effective value, so for a key nobody has explicitly set it hands back
+    the compiled-in default -- the one thing ``_capture_prior_values``
+    can never see, because Chromium does not persist unset prefs.  This
+    runs on the settings page before any mutation, so the value read here
+    predates dotbrave's own write; the caller is responsible for only
+    keeping it where that still means "before dotbrave managed the key"
+    (see ``_enrich_prior_values``).
+
+    Per-key entries are returned rather than a bare list of unsupported
+    keys.  ``_preflight_settings`` still accepts plain strings, which is
+    what the New Tab probe returns.
+    """
     if not changes:
         return None
     keys_json = json.dumps([key for key, _value in changes], separators=(",", ":"))
@@ -359,18 +430,19 @@ def _settings_preflight_script(changes: list[tuple[str, Any]]) -> str | None:
         "(async () => {"
         f"const keys = {keys_json};"
         "if (typeof chrome === 'undefined' || !chrome.settingsPrivate) "
-        "return keys.slice();"
-        "const exists = key => new Promise(resolve => {"
+        "return keys.map(key => ({key: key, supported: false}));"
+        "const read = key => new Promise(resolve => {"
         "chrome.settingsPrivate.getPref(key, pref => {"
         "const err = chrome.runtime.lastError;"
-        "resolve(!err && !!pref);"
+        "if (err || !pref) resolve({key: key, supported: false});"
+        "else resolve({key: key, supported: true, value: pref.value});"
         "});"
         "});"
-        "const unsupported = [];"
+        "const out = [];"
         "for (const key of keys) {"
-        "if (!(await exists(key))) unsupported.push(key);"
+        "out.push(await read(key));"
         "}"
-        "return unsupported;"
+        "return out;"
         "})()"
     )
 
@@ -430,29 +502,68 @@ def _newtab_script(changes: list[tuple[str, str, str, Any]]) -> str | None:
     )
 
 
+def _read_preflight_result(
+    result: Any, unsupported: list[str], values: dict[str, Any],
+) -> None:
+    """Fold one preflight answer into the unsupported list and the values.
+
+    Two entry shapes are accepted, deliberately: a bare string names an
+    unsupported key (what the New Tab probe returns, and the shape a
+    half-loaded page can still produce), while a mapping carries the
+    settings probe's per-key answer.  Anything else is ignored rather
+    than trusted -- a malformed answer must not silently look like a
+    supported key.  ``value`` is only kept when the entry actually has
+    one: ``pref.value`` may be dropped in serialisation when undefined,
+    and a null value is not a value any pref can be set back to.
+    """
+    if not isinstance(result, list):
+        return
+    for entry in result:
+        if isinstance(entry, str):
+            unsupported.append(entry)
+            continue
+        if not isinstance(entry, dict):
+            continue
+        key = entry.get("key")
+        if not isinstance(key, str):
+            continue
+        if entry.get("supported") is not True:
+            unsupported.append(key)
+            continue
+        if entry.get("value") is not None:
+            values[key] = entry["value"]
+
+
 def _preflight_settings(
     client: CdpClient,
     target: dict,
     newtab_changes: list[tuple[str, str, str, Any]],
     ordinary_changes: list[tuple[str, Any]],
-) -> list[str]:
+) -> tuple[list[str], dict[str, Any]]:
+    """Return the unsupported keys, and the values the probe read.
+
+    The values come from the settings probe only: the New Tab route
+    drives store actions, not ``settingsPrivate``, so it has no pref
+    value to report.
+    """
     unsupported: list[str] = []
+    values: dict[str, Any] = {}
     newtab_script = _newtab_preflight_script(newtab_changes)
     if newtab_script is not None:
         client.navigate(target, _NEWTAB_URL)
         _await_page(client, target)
-        result = client.evaluate(target, newtab_script)
-        if isinstance(result, list):
-            unsupported.extend(key for key in result if isinstance(key, str))
+        _read_preflight_result(
+            client.evaluate(target, newtab_script), unsupported, {},
+        )
 
     settings_script = _settings_preflight_script(ordinary_changes)
     if settings_script is not None:
         client.navigate(target, _SETTINGS_URL)
         _await_page(client, target)
-        result = client.evaluate(target, settings_script)
-        if isinstance(result, list):
-            unsupported.extend(key for key in result if isinstance(key, str))
-    return unsupported
+        _read_preflight_result(
+            client.evaluate(target, settings_script), unsupported, values,
+        )
+    return unsupported, values
 
 
 def _preflight_shortcuts(client: CdpClient, target: dict) -> list[str]:
@@ -485,6 +596,13 @@ def apply_live(
     # only the preflight can tell us that.
     removal_writes, unresolved_removals = _resolve_removals(prefs_path, removals)
     ordinary_changes = ordinary_changes + removal_writes
+    # What dotbrave managed *before* this run.  The sidecar is only
+    # rewritten once the run succeeds, so reading it here still answers
+    # that question -- and the answer is what keeps the preflight's
+    # `getPref` values from being recorded for a key dotbrave has already
+    # written (where `getPref` returns dotbrave's own value, not the
+    # user's).  Same source `plan_apply` read at build time.
+    managed_before = _base_settings.get_managed_keys(prefs_path)
     shortcut_script = _shortcut_script(prefs, target_prefs)
     if removals and not (newtab_changes or ordinary_changes or shortcut_script):
         # A diff that is nothing but removals -- none of which had a prior
@@ -502,7 +620,7 @@ def apply_live(
         # mutated: prove this tab is the profile the rest of the run is
         # bound to.  Inside the try, so the `finally` still closes it.
         _confirm_profile(client, target, profile_dir, profile_name)
-        unsupported = _preflight_settings(
+        unsupported, learned_values = _preflight_settings(
             client, target, newtab_changes, ordinary_changes
         )
         shortcuts_unsupported: list[str] = []
@@ -593,6 +711,20 @@ def apply_live(
                 "Brave", remainder, backup_taken=backup_taken
             )
 
+        # Only now, past the remainder raise: the values learned above are
+        # written to disk in this run or not at all.  When a remainder
+        # sends the run offline, the offline apply writes the sidecar from
+        # what `plan_apply` computed, so the plan's payload must still be
+        # exactly that -- hence no mutation before the raise, and none on
+        # the `--unattended` refusal either.  The learned values are
+        # discarded in that case; `plan_apply` recomputes `prior_values`
+        # from disk on the next run, as before.
+        _enrich_prior_values(
+            plans,
+            {key: learned_values[key] for key, _v in live_ordinary
+             if key in learned_values},
+            managed_before,
+        )
         _live.write_state_files(plans)
     except CdpError as e:
         # Degrade to the offline path rather than aborting: in a mixed run

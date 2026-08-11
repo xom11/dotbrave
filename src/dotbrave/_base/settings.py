@@ -186,6 +186,17 @@ def merge_prior_values(existing: dict, captured: dict) -> dict:
     return merged
 
 
+def get_managed_keys(prefs_path: Path) -> set[str]:
+    """Public accessor for the settings sidecar's ``managed_keys``.
+
+    Same reasoning as ``get_prior_values`` below: browser-specific
+    live-apply adapters need the set dotbrave managed *before* this run
+    (the sidecar is only rewritten once the run succeeds), and they live
+    outside this module.
+    """
+    return _get_managed_keys(prefs_path)
+
+
 def _get_prior_values(prefs_path: Path) -> dict:
     state = _state_file(prefs_path)
     if not state.exists():

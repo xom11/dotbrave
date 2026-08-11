@@ -239,23 +239,44 @@ manages the key, and the difference matters:
   marker. `absent` means "we do not know the default", so a later live removal
   of that key is not possible and it joins the offline remainder under 1.1.
 
-**As built, only the second bullet exists.** The implementation plan narrowed
-this deliberately and the live `getPref` capture was never written:
-`_capture_prior_values` (`_base/settings.py:212`) reads the on-disk
-`Preferences` on every route, live or offline. This paragraph previously
-claimed the asymmetry self-heals once first-applies are live and that `absent`
-markers stop being produced; that is not what shipped.
+**Both bullets now exist.** `_capture_prior_values` (`_base/settings.py`) still
+reads the on-disk `Preferences` on every route — that is the offline bullet,
+and it is what a plan carries when it is built. The live bullet is layered on
+top of it, in `live.py` rather than in `_base/`, because `settingsPrivate` is
+Brave-specific knowledge: `_settings_preflight_script` already called `getPref`
+for every changed ordinary key, on the settings page, before any mutation, so
+it now returns each key's value alongside the existence answer it was written
+for — no extra round trip, no extra navigation. `_enrich_prior_values` folds
+those values into the settings plan's `state_payload["prior_values"]` just
+before `write_state_files`.
 
-The consequence, stated plainly: a key that is absent from `Preferences` when
-dotbrave first manages it records `{"present": false}` whatever route did the
-managing, and because the capture is first-seen-wins nothing later corrects it.
-Every future removal of such a key costs a close, an offline write and a
-relaunch — permanently. On a fresh profile, where most managed keys are absent
-until dotbrave writes them, that is the common case rather than the corner.
+The enrichment is deliberately narrow, because `getPref` returns the pref's
+*effective* value: for a key dotbrave has already written, that is dotbrave's
+own value, and recording it would make a later removal restore dotbrave's
+setting instead of the user's. So a value is kept only when all three hold: the
+key was applied live in this run, it was **not** in the sidecar's
+`managed_keys` before the run (this run is the first time dotbrave manages it),
+and its recorded entry is missing or does not already say `present: true`. The
+last condition keeps `merge_prior_values`'s first-seen-wins property intact —
+the enrichment fills in entries that recorded no value at all, it never
+replaces one. The values are merged into the very dict that gets written, so
+the sidecar cannot diverge from what `plan_apply` computed.
 
-Closing it means reading `getPref` for the keys about to be written, before
-writing them, and preferring that over the on-disk read. That remains open: a
-future decision, not part of this branch.
+Consequence for the split run: state files stay unwritten whenever a remainder
+exists (the offline apply writes them for the whole plan), so the enrichment
+runs *after* that raise and the values learned on a run that falls back are
+simply discarded — `plan_apply` recomputes `prior_values` from disk on the next
+run, exactly as before. The same holds for the `--unattended` early refusal,
+which mutates nothing.
+
+What is left of the old asymmetry: a key first managed by an *offline* apply
+(browser closed, or the run fell back) while absent from `Preferences` still
+records `{"present": false}`, and because the capture is first-seen-wins
+nothing later corrects it — a live apply that finds the key already in
+`managed_keys` will not re-capture it, by design. Removing such a key still
+costs a close, an offline write and a relaunch. The common case it fixes is the
+one that mattered: on a fresh profile, keys first managed live now record the
+real default and can be removed live.
 
 This is a semantic change and must be documented: offline removal deletes the
 key, live removal *resets* it, leaving the key present in `Preferences` with a

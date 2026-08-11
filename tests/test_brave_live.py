@@ -8,6 +8,7 @@ import pytest
 from dotbrave._base import live_apply as shared_live
 from dotbrave._base.utils import Plan
 from dotbrave import live
+from dotbrave import settings as settings_mod
 
 
 class FakeCdpClient:
@@ -619,6 +620,186 @@ def test_removal_with_a_malformed_prior_value_entry_still_goes_offline(
         live.apply_live(9333, prefs_path, prefs, [plan])
     assert excinfo.value.keys == ["brave.location_bar_is_wide"]
     assert not any("setPref" in e for e in fake.evaluations)
+
+
+# ---------------------------------------------------------------------------
+# Learning a key's real default when the live route first manages it.
+#
+# `getPref` returns the *effective* value, so for a key that is still unset
+# it hands back the compiled-in default -- the one thing a later live
+# removal needs and the on-disk capture can never see.  Read before the
+# mutating setPref, and only for keys this run is the first to manage.
+# ---------------------------------------------------------------------------
+
+_WIDE = "brave.location_bar_is_wide"
+_COLLAPSED = "brave.tabs.vertical_tabs_collapsed"
+
+
+def _pref_entry(key: str, value: object) -> dict:
+    """One settings-preflight answer: the key exists and holds ``value``."""
+    return {"key": key, "supported": True, "value": value}
+
+
+def _sidecar(prefs_path: Path) -> Path:
+    return prefs_path.with_name("Preferences.dotbrave.settings.json")
+
+
+def test_live_apply_records_the_default_getpref_returned_for_a_new_key(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A key absent from Preferences records `absent` when captured from
+    disk -- and `absent` means "no value to restore", so every later
+    removal of it costs a close/relaunch.  The live route can read the
+    real default before it writes, so it must record that instead."""
+    prefs_path = tmp_path / "Default" / "Preferences"
+    prefs_path.parent.mkdir()
+    prefs = {"brave": {}}
+    prefs_path.write_text(json.dumps(prefs))
+
+    plan = settings_mod.plan_apply(prefs_path, prefs, {_WIDE: True})
+    # What plan_apply could learn from disk alone: nothing.
+    assert plan.state_payload["prior_values"][_WIDE] == {
+        "present": False, "value": None,
+    }
+
+    fake = FakeCdpClient(9333, evaluation_results=[[_pref_entry(_WIDE, False)]])
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake)
+
+    live.apply_live(9333, prefs_path, prefs, [plan])
+
+    state = json.loads(_sidecar(prefs_path).read_text())
+    assert state["managed_keys"] == [_WIDE]
+    assert state["prior_values"][_WIDE] == {"present": True, "value": False}
+
+
+def test_an_already_managed_key_never_relearns_its_prior_value(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The regression this capture could silently cause.
+
+    Once dotbrave has written a key, `getPref` returns *dotbrave's* value.
+    Recording that would make a later removal restore dotbrave's setting
+    instead of the user's, inverting the whole point of prior_values.  So
+    a key already in `managed_keys` before this run is never re-captured,
+    even though the preflight now reads a value for it.
+    """
+    prefs_path = tmp_path / "Default" / "Preferences"
+    prefs_path.parent.mkdir()
+    prefs = {"brave": {"location_bar_is_wide": True}}  # dotbrave's own value
+    prefs_path.write_text(json.dumps(prefs))
+    _sidecar(prefs_path).write_text(json.dumps({
+        "managed_keys": [_WIDE],
+        "prior_values": {_WIDE: {"present": False, "value": None}},
+    }))
+
+    plan = settings_mod.plan_apply(prefs_path, prefs, {_WIDE: False})
+
+    fake = FakeCdpClient(9333, evaluation_results=[[_pref_entry(_WIDE, True)]])
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake)
+
+    live.apply_live(9333, prefs_path, prefs, [plan])
+
+    state = json.loads(_sidecar(prefs_path).read_text())
+    assert state["prior_values"][_WIDE] == {"present": False, "value": None}
+
+
+def test_a_recorded_prior_value_is_never_replaced_by_the_live_capture(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """merge_prior_values is first-seen-wins; the live capture must not
+    become a back door around it.  A key dropped from the config and
+    re-added is no longer in `managed_keys`, but its recorded entry still
+    holds the true pre-dotbrave value."""
+    prefs_path = tmp_path / "Default" / "Preferences"
+    prefs_path.parent.mkdir()
+    prefs = {"brave": {}}
+    prefs_path.write_text(json.dumps(prefs))
+    _sidecar(prefs_path).write_text(json.dumps({
+        "managed_keys": [],
+        "prior_values": {_WIDE: {"present": True, "value": True}},
+    }))
+
+    plan = settings_mod.plan_apply(prefs_path, prefs, {_WIDE: False})
+
+    # getPref answers with something *different* from the recorded value,
+    # so an overwrite would be visible.
+    fake = FakeCdpClient(9333, evaluation_results=[[_pref_entry(_WIDE, False)]])
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake)
+
+    live.apply_live(9333, prefs_path, prefs, [plan])
+
+    state = json.loads(_sidecar(prefs_path).read_text())
+    assert state["prior_values"][_WIDE] == {"present": True, "value": True}
+
+
+def test_a_run_with_a_remainder_writes_no_enriched_sidecar(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """State files stay unwritten whenever a remainder exists -- the
+    offline apply writes them for the whole plan, from what plan_apply
+    computed.  The values learned here are discarded, and the plan's own
+    payload must be left exactly as built."""
+    prefs_path = tmp_path / "Default" / "Preferences"
+    prefs_path.parent.mkdir()
+    prefs = {"brave": {"tabs": {}}}
+    prefs_path.write_text(json.dumps(prefs))
+
+    plan = settings_mod.plan_apply(
+        prefs_path, prefs, {_WIDE: True, _COLLAPSED: True}
+    )
+
+    fake = FakeCdpClient(9333, evaluation_results=[[
+        _pref_entry(_WIDE, False),
+        {"key": _COLLAPSED, "supported": False},
+    ]])
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake)
+
+    with pytest.raises(shared_live.LiveApplyUnsupported) as excinfo:
+        live.apply_live(9333, prefs_path, prefs, [plan])
+
+    # The new preflight shape still names the unsupported key, and only it.
+    assert excinfo.value.keys == [_COLLAPSED]
+    assert not _sidecar(prefs_path).exists()
+    # The offline path reuses this very Plan object, so its payload must
+    # still be what plan_apply computed.
+    assert plan.state_payload["prior_values"][_WIDE] == {
+        "present": False, "value": None,
+    }
+
+
+def test_a_default_learned_live_makes_a_later_removal_apply_live(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The end-to-end property this exists for: the key captured on the
+    first live apply is resolvable by `_resolve_removals` on the next
+    run, so dropping it from the config no longer costs a restart."""
+    prefs_path = tmp_path / "Default" / "Preferences"
+    prefs_path.parent.mkdir()
+    prefs = {"brave": {}}
+    prefs_path.write_text(json.dumps(prefs))
+
+    plan = settings_mod.plan_apply(prefs_path, prefs, {_WIDE: True})
+    first = FakeCdpClient(9333, evaluation_results=[[_pref_entry(_WIDE, False)]])
+    monkeypatch.setattr(live, "CdpClient", lambda port: first)
+    live.apply_live(9333, prefs_path, prefs, [plan])
+
+    # Second run: the key is gone from the config, and Preferences now
+    # holds what dotbrave wrote.
+    prefs = {"brave": {"location_bar_is_wide": True}}
+    prefs_path.write_text(json.dumps(prefs))
+    plan = settings_mod.plan_apply(prefs_path, prefs, {})
+    second = FakeCdpClient(9333, evaluation_results=[[_pref_entry(_WIDE, True)]])
+    monkeypatch.setattr(live, "CdpClient", lambda port: second)
+
+    live.apply_live(9333, prefs_path, prefs, [plan])  # must NOT raise
+
+    assert any(
+        _WIDE in e and "setPref" in e and "false" in e
+        for e in second.evaluations
+    ), "the removal should restore the default learned on the first run"
+    state = json.loads(_sidecar(prefs_path).read_text())
+    assert state["managed_keys"] == []
+    assert state["prior_values"][_WIDE] == {"present": True, "value": False}
 
 
 def test_settings_remainder_does_not_block_the_shortcut_script(
