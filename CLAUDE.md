@@ -131,14 +131,19 @@ Preserve these contracts unless a change explicitly redesigns them:
    removal itself applies live too, as `setPref` of the value the settings
    sidecar recorded before dotbrave first managed the key (see invariant
    2) -- resolved before the preflight so the written-back value is probed
-   like any other key. Three things and only those fall back to a normal
-   close, verified offline apply, and relaunch: the keys the browser does
-   not recognise, removals with no recorded prior value to write back
+   like any other key. Everything live apply cannot do falls back to the
+   same thing -- a normal close, a verified offline apply, a relaunch --
+   along five paths. Three are per key, and `LiveApplyUnsupported` names
+   exactly that remainder: the keys the browser does not recognise,
+   removals with no recorded prior value to write back
    (`chrome.settingsPrivate` has no single-pref reset, and a key never set
    before dotbrave touched it has no default to restore), and -- as a
    block, named by the marker `shortcuts` -- the whole `[shortcuts]` table
-   when its own preflight reports the commands bundle unusable.
-   `LiveApplyUnsupported` names exactly that remainder.
+   when its own preflight reports the commands bundle unusable. Two are
+   whole-run and carry a reason string instead of keys: a work tab whose
+   profile cannot be confirmed or does not match (below), and any
+   `CdpError`, which the adapter translates rather than letting it abort
+   the run, because the offline apply redoes every plan idempotently.
    One unknown key must never drag the keys that would have worked -- or
    `[shortcuts]`, which has nothing to do with it -- offline with it. So
    the shortcut script runs before the raise, and state files stay

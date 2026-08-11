@@ -950,7 +950,8 @@ Table semantics:
 
 Safety:
   --dry-run prints the planned diff without writing.
-  A real Preferences write creates one timestamped backup and verifies it.
+  Any apply that changes Preferences takes one timestamped backup, live or
+  offline; an offline write is also verified by reloading it.
   [settings] keys tracked by Chromium MAC integrity are refused.
   A changed [pwa] table writes managed policy and may require sudo or
   Administrator privileges.

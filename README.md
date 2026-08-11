@@ -232,8 +232,10 @@ Both actions have detailed `--help` with safety notes and examples.
 ## How it works
 
 When Brave is closed, `dotbrave` patches the profile `Preferences` JSON
-directly. Each offline apply takes one timestamped backup, writes
-atomically (temp file + rename), and verifies the result by reloading.
+directly, writing atomically (temp file + rename) and verifying the result
+by reloading. Any apply that changes `Preferences` takes exactly one
+timestamped backup first — a live apply takes it too, before its changes
+land, so one `apply --undo` reverts the whole run.
 
 A running Brave is checked for an endpoint three ways before dotbrave
 concludes it has none: the port dotbrave itself launched and recorded, the
@@ -281,9 +283,11 @@ actions, and shortcuts through the Settings `CommandsService`. Supported
 changes take effect without restarting. A Brave not yet carrying the
 endpoint closes normally and relaunches once. The fallback is per key,
 not per run: everything with a live route is applied first, and only the
-settings Brave does not recognise — plus any key you removed from the
-config, which has no live reset — fall back to the same normal-close +
-verified offline write, which then names exactly those keys. Any
+settings Brave does not recognise — plus removals of keys that were never
+set before dotbrave managed them, which have no recorded value to write
+back — fall back to the same normal-close + verified offline write, which
+then names exactly those keys. Dropping a key you had set before dotbrave
+touched it applies live like any other change. Any
 such relaunch reuses the flags the closed session was running with, so a
 Brave started as `brave-browser --ozone-platform=wayland` comes back the
 same way. If the relaunch still fails to come up, dotbrave reopens Brave
@@ -297,7 +301,11 @@ force-kill switch.
 
 `[shortcuts]` and `[settings]` track managed entries in sidecar files
 (`Preferences.dotbrave.{shortcuts,settings}.json`), so removing a key from
-your config restores Brave's default on the next apply. `[pwa]` state
+your config undoes it on the next apply. What it is restored to depends on
+the route: an offline removal deletes the key, leaving Brave's compiled
+default; a live removal writes back the value the sidecar recorded when
+dotbrave first managed that key, which is your own pre-dotbrave value.
+`[pwa]` state
 lives in Chromium's managed-policy storage (Linux JSON file, macOS plist,
 Windows Registry) — the policy *is* the state. `export --snapshot` stores
 its baseline in a third sidecar

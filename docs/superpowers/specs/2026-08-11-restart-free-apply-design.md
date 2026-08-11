@@ -228,19 +228,34 @@ effective default. Removing the key from TOML then becomes
 `setPref(key, recorded_value)` — live. Keep the first-seen value; do not
 overwrite it on later applies.
 
-Where the recorded value comes from depends on the route that first managed
-the key, and the difference matters:
+Where the recorded value could come from depends on the route that first
+manages the key, and the difference matters:
 
 - *Live first-apply* — `getPref` before the write returns the effective value,
-  which for a never-set key is the registry default. This is the good case:
-  the recorded value is exactly what a delete would fall back to.
+  which for a never-set key is the registry default. That would be the good
+  case: the recorded value is exactly what a delete would fall back to.
 - *Offline first-apply* — there is no `getPref`. Record the value present in
   `Preferences`, and when the key is absent record an explicit `absent`
   marker. `absent` means "we do not know the default", so a later live removal
   of that key is not possible and it joins the offline remainder under 1.1.
 
-That asymmetry is acceptable because it self-heals: once the endpoint plist is
-in place, first-applies are live, so `absent` markers stop being produced.
+**As built, only the second bullet exists.** The implementation plan narrowed
+this deliberately and the live `getPref` capture was never written:
+`_capture_prior_values` (`_base/settings.py:212`) reads the on-disk
+`Preferences` on every route, live or offline. This paragraph previously
+claimed the asymmetry self-heals once first-applies are live and that `absent`
+markers stop being produced; that is not what shipped.
+
+The consequence, stated plainly: a key that is absent from `Preferences` when
+dotbrave first manages it records `{"present": false}` whatever route did the
+managing, and because the capture is first-seen-wins nothing later corrects it.
+Every future removal of such a key costs a close, an offline write and a
+relaunch — permanently. On a fresh profile, where most managed keys are absent
+until dotbrave writes them, that is the common case rather than the corner.
+
+Closing it means reading `getPref` for the keys about to be written, before
+writing them, and preferring that over the on-disk read. That remains open: a
+future decision, not part of this branch.
 
 This is a semantic change and must be documented: offline removal deletes the
 key, live removal *resets* it, leaving the key present in `Preferences` with a

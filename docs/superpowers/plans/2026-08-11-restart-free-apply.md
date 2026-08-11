@@ -1273,6 +1273,12 @@ was never set before dotbrave managed it and there is no value to restore."
 
 ### Task 11: Apply offline with no restart when the target profile is not open
 
+> **REVERTED — see spec §1.7.** This task was implemented (commit `67057c3`)
+> and reverted (`733900a`). Reading `--profile-directory` off a running
+> command line is a lower bound on the set of loaded profiles and can never
+> prove one is closed, so the branch ships without it. The steps below are
+> kept only as the record of what was attempted; do not execute them.
+
 `running_fn` is scoped to the user-data-dir, not the profile. A profile that is not open in the running browser has its `Preferences` untouched by Chromium, so it can be written offline right now — with a real `verify_fn` and no close at all.
 
 **Files:**
@@ -1282,7 +1288,7 @@ was never set before dotbrave managed it and there is no value to restore."
 
 **Interfaces:**
 - Consumes: nothing from earlier tasks.
-- Produces: `cmd_apply` gains a keyword-only parameter `profile_open_fn: Callable[[], bool] | None = None`. When it returns `False`, the run skips the live path and every close, going straight to the offline block.
+- Produces: nothing — `cmd_apply` was to gain a keyword-only parameter `profile_open_fn: Callable[[], bool] | None = None`, but the task was reverted and no such parameter exists. No later task consumes it.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1456,5 +1462,5 @@ Checked against the spec:
 - Spec §Phase 2 → Task 1. §Phase 1.1 → Task 8. §1.2 → Tasks 9–10. §1.3 → Task 6. §1.4 and §1.5 → Task 7. §1.6 → Task 12. §1.7 → Task 11. §1.8 → Tasks 2–5 plus the flag change in Task 3.
 - B1 → Task 2, B2 → folded into Task 8 Step 4 (it is not a bug today; the split run would create it), B3 → Task 5, B4 → Task 12, B5 → Task 4.
 - Not covered here by design: Phase 3 and its gating experiment; the `getPref` sweep over `examples/all.toml`, which needs a real browser with the user's Brave closed and belongs with that experiment.
-- Interface names used across tasks and defined once: `CdpError` (6), `split_removals` (8), `merge_prior_values` / `_get_prior_values` (9), `_resolve_removals` (10), `profile_open_fn` (11).
+- Interface names used across tasks and defined once: `CdpError` (6), `split_removals` (8), `merge_prior_values` / `_get_prior_values` (9), `_resolve_removals` (10). `profile_open_fn` (11) was produced and then reverted — it exists nowhere in the shipped code (spec §1.7).
 - Task 12 is deliberately conditional; its Step 1 can close the task with no code change.
