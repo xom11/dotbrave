@@ -323,7 +323,14 @@ def _preflight_shortcuts(client: CdpClient, target: dict) -> list[str]:
     return []
 
 
-def apply_live(port: int, prefs_path: Path, prefs: dict, plans: list[Plan]) -> None:
+def apply_live(
+    port: int,
+    prefs_path: Path,
+    prefs: dict,
+    plans: list[Plan],
+    *,
+    unattended: bool = False,
+) -> None:
     target_prefs = _live.compute_target_prefs(prefs, plans)
     changes, removals = _setting_changes(prefs, target_prefs)
     newtab_changes, ordinary_changes = _route_settings(changes)
@@ -336,6 +343,7 @@ def apply_live(port: int, prefs_path: Path, prefs: dict, plans: list[Plan]) -> N
     client = CdpClient(port)
     target: dict = {}
     created = False
+    backup_taken = False
     try:
         target, created = _worker_target(client)
         unsupported = _preflight_settings(
@@ -354,15 +362,43 @@ def apply_live(port: int, prefs_path: Path, prefs: dict, plans: list[Plan]) -> N
         live_ordinary = [c for c in ordinary_changes if c[0] not in blocked]
         remainder = sorted(blocked | set(shortcuts_unsupported))
 
+        if remainder and unattended:
+            # Unattended keeps the old all-or-nothing semantics, and must
+            # refuse *before* mutating anything.  Nothing closes the
+            # browser for the remainder in this mode, so a live half
+            # applied here would never reach write_state_files -- the
+            # sidecar would not record the keys just pushed, [settings]
+            # emptying (invariant 2) and `export` (invariant 6) would both
+            # miss them, and it never self-heals: the same key is still
+            # unsupported on the next run, so there is still a remainder.
+            # A home-manager activation only ever runs --unattended, so
+            # that state would be permanent there.
+            raise _live.LiveApplyUnsupported("Brave", remainder)
+
         has_pref_changes = any(
             not plan.empty and plan.namespace in {"settings", "shortcuts"}
             for plan in plans
         )
-        # Only back up when this run finishes here.  A split run falls
-        # through to the offline path, which takes its own backup, and
-        # invariant 1 allows exactly one.
-        if has_pref_changes and not remainder:
+        will_mutate = bool(
+            live_newtab
+            or live_ordinary
+            or (shortcut_script is not None and not shortcuts_unsupported)
+        )
+        # Back up BEFORE the live half lands, whether or not a remainder
+        # follows it.  A split run's offline path is told (via
+        # LiveApplyUnsupported.backup_taken) not to take a second one, so
+        # invariant 1 still holds at exactly one -- and that one predates
+        # the live half, which is what makes `apply --undo` revert both
+        # halves.  Backing up afterwards snapshots a file the browser has
+        # already flushed the live changes into, so undo could only revert
+        # the offline remainder.
+        #
+        # When nothing lands live the offline path keeps its own backup:
+        # its snapshot is taken after the close, so it also captures the
+        # flush this one would predate.
+        if has_pref_changes and will_mutate:
             _live.backup_preferences(prefs_path)
+            backup_taken = True
 
         _live.apply_external_plans(plans)
 
@@ -389,17 +425,20 @@ def apply_live(port: int, prefs_path: Path, prefs: dict, plans: list[Plan]) -> N
         if remainder:
             # State files stay unwritten: the offline apply that handles
             # the remainder writes them for the whole plan.
-            raise _live.LiveApplyUnsupported("Brave", remainder)
+            raise _live.LiveApplyUnsupported(
+                "Brave", remainder, backup_taken=backup_taken
+            )
 
         _live.write_state_files(plans)
     except CdpError as e:
         # Degrade to the offline path rather than aborting: in a mixed run
         # [pwa] policy is already written, and the offline apply redoes
-        # every plan idempotently.  (A run with no remainder has taken its
-        # backup by this point, so the offline path's is a second file --
-        # pre-dates the per-key split and is left alone rather than
-        # deleting a backup we already printed.)
-        raise _live.LiveApplyUnsupported("Brave", [f"live apply failed: {e}"])
+        # every plan idempotently.  Carry the backup flag for the same
+        # reason the remainder path does -- a CdpError raised after the
+        # backup must not earn the offline path a second one.
+        raise _live.LiveApplyUnsupported(
+            "Brave", [f"live apply failed: {e}"], backup_taken=backup_taken
+        )
     finally:
         if created:
             client.close_page(target)

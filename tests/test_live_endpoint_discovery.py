@@ -122,7 +122,7 @@ def test_orchestrator_offers_the_running_cmdline_to_the_port_lookup(
                 verify_fn=lambda prefs: None,
             )
         ],
-        live_apply_fn=lambda *a: None,
+        live_apply_fn=lambda *a, **k: None,
         graceful_close_fn=lambda: None,
         launch_live_fn=lambda *a, **k: [],
     )
@@ -327,7 +327,7 @@ def test_unattended_skip_keeps_plan_and_warning_in_order(tmp_path, monkeypatch):
                 verify_fn=lambda prefs: None,
             )
         ],
-        live_apply_fn=lambda *a: None,
+        live_apply_fn=lambda *a, **k: None,
         graceful_close_fn=lambda: None,
         launch_live_fn=lambda *a, **k: [],
     )

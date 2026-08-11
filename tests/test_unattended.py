@@ -123,7 +123,7 @@ def test_unattended_does_not_close_running_browser(
         build_plans_fn=lambda p, prefs, doc, **kw: [
             _plan("settings", empty=False, external=False)
         ],
-        live_apply_fn=lambda *a: None,
+        live_apply_fn=lambda *a, **k: None,
         graceful_close_fn=lambda: closed.append(True),
         launch_live_fn=lambda *a: [],
     )
@@ -143,7 +143,7 @@ def test_unattended_does_not_close_when_live_apply_is_unsupported(
     cfg = tmp_path / "b.toml"
     cfg.write_text('[settings]\n"a.b" = true\n')
 
-    def _unsupported_live_apply(*_args):
+    def _unsupported_live_apply(*_args, **_kw):
         raise orchestrator.LiveApplyUnsupported("Brave", ["a.b"])
 
     orchestrator.cmd_apply(
@@ -164,6 +164,41 @@ def test_unattended_does_not_close_when_live_apply_is_unsupported(
     assert closed == []
     assert "unattended" in err
     assert "a.b" in err
+
+
+def test_unattended_flag_reaches_the_live_adapter(
+    prefs_root, tmp_path, monkeypatch
+):
+    """Adapter phải BIẾT đây là lượt chạy unattended.
+
+    Chia theo từng key nghĩa là nửa live được áp trước khi phần còn lại bị
+    từ chối -- nhưng ở chế độ này không có ai đóng Brave để làm nốt phần
+    kia, nên sidecar sẽ không bao giờ ghi lại những key vừa áp, và lần sau
+    vẫn y như vậy. Adapter chỉ tránh được bằng cách biết cờ này.
+    """
+    monkeypatch.setattr(orchestrator, "find_devtools_port", lambda r, p: 9555)
+    monkeypatch.setattr(
+        orchestrator, "remember_devtools_port", lambda *a, **k: None
+    )
+    seen: list[object] = []
+    cfg = tmp_path / "b.toml"
+    cfg.write_text('[settings]\n"a.b" = true\n')
+
+    orchestrator.cmd_apply(
+        _args(prefs_root, cfg),
+        display_name="Brave",
+        running_fn=lambda: True,
+        find_cmdline_fn=lambda: None,
+        restart_fn=lambda c: c,
+        build_plans_fn=lambda p, prefs, doc, **kw: [
+            _plan("settings", empty=False, external=False)
+        ],
+        live_apply_fn=lambda *a, unattended=None: seen.append(unattended),
+        graceful_close_fn=lambda: None,
+        launch_live_fn=lambda *a: [],
+    )
+
+    assert seen == [True]
 
 
 def test_without_unattended_behaviour_is_unchanged(
@@ -191,7 +226,7 @@ def test_without_unattended_behaviour_is_unchanged(
         build_plans_fn=lambda p, prefs, doc, **kw: [
             _plan("settings", empty=False, external=False)
         ],
-        live_apply_fn=lambda *a: None,
+        live_apply_fn=lambda *a, **k: None,
         graceful_close_fn=lambda: closed.append(True),
         launch_live_fn=lambda *a: ["brave"],
     )
@@ -290,7 +325,7 @@ def test_unattended_applies_pwa_even_when_another_table_is_dirty(
         find_cmdline_fn=lambda: None,
         restart_fn=lambda c: c,
         build_plans_fn=lambda p, prefs, doc, **kw: [shortcuts, pwa],
-        live_apply_fn=lambda *a: calls.append("live"),
+        live_apply_fn=lambda *a, **k: calls.append("live"),
         graceful_close_fn=lambda: calls.append("close"),
         launch_live_fn=lambda *a: calls.append("launch") or [],
     )
@@ -322,7 +357,7 @@ def test_unattended_partial_apply_names_what_landed_and_what_did_not(
             _plan("shortcuts", empty=False, external=False),
             _plan("pwa", empty=False, external=True),
         ],
-        live_apply_fn=lambda *a: None,
+        live_apply_fn=lambda *a, **k: None,
         graceful_close_fn=lambda: None,
         launch_live_fn=lambda *a: [],
     )
@@ -346,7 +381,7 @@ def test_unattended_applies_pwa_when_live_apply_refuses_the_rest(
     cfg = tmp_path / "b.toml"
     cfg.write_text('[settings]\n"a.b" = true\n[pwa]\nurls = []\n')
 
-    def _unsupported_live_apply(*_args):
+    def _unsupported_live_apply(*_args, **_kw):
         raise orchestrator.LiveApplyUnsupported("Brave", ["a.b"])
 
     orchestrator.cmd_apply(
@@ -391,7 +426,7 @@ def test_all_external_apply_is_unchanged_and_applies_once(
         find_cmdline_fn=lambda: None,
         restart_fn=lambda c: c,
         build_plans_fn=lambda p, prefs, doc, **kw: [pwa],
-        live_apply_fn=lambda *a: calls.append("live"),
+        live_apply_fn=lambda *a, **k: calls.append("live"),
         graceful_close_fn=lambda: calls.append("close"),
         launch_live_fn=lambda *a: calls.append("launch") or [],
     )

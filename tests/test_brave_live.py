@@ -195,7 +195,10 @@ def test_brave_live_preflight_names_unknown_settings_as_the_remainder(
     assert excinfo.value.keys == ["brave.tabs.vertical_tabs_collapsed"]
     assert any("chrome.settingsPrivate.getPref" in expr for expr in fake.evaluations)
     assert not any("chrome.settingsPrivate.setPref" in expr for expr in fake.evaluations)
+    # Nothing landed live, so the backup stays the offline path's: taken
+    # after the close, it also captures the browser's own flush.
     assert list(prefs_path.parent.glob("Preferences.bak.*")) == []
+    assert excinfo.value.backup_taken is False
 
 
 def _split_prefs(prefs_path: Path) -> tuple[dict, str]:
@@ -255,12 +258,16 @@ def test_one_unsupported_key_no_longer_drags_the_whole_run_offline(
 
     # the remainder is named, and only the remainder
     assert excinfo.value.keys == ["brave.tabs.vertical_tabs_collapsed"]
-    # ...but the supported key and the shortcut were applied live first
+    # ...but the supported key and the shortcut were applied live first.
+    # Match `commandsCache.assignAccelerator`, not the bare method name:
+    # the shortcuts *preflight* script also mentions `assignAccelerator`
+    # (`typeof c.assignAccelerator !== 'function'`), so the loose form
+    # would pass even if the mutation script never ran.
     assert any(
         "brave.location_bar_is_wide" in e and "setPref" in e
         for e in fake.evaluations
     )
-    assert any("assignAccelerator" in e for e in fake.evaluations)
+    assert any("commandsCache.assignAccelerator" in e for e in fake.evaluations)
     # and the unsupported key was never pushed through settingsPrivate
     assert not any(
         "vertical_tabs_collapsed" in e and "setPref" in e
@@ -268,21 +275,45 @@ def test_one_unsupported_key_no_longer_drags_the_whole_run_offline(
     )
 
 
-def test_split_run_takes_no_live_backup(tmp_path: Path, monkeypatch) -> None:
-    """The orchestrator backs up for the offline remainder; a second
-    backup here would violate invariant 1.  State files stay unwritten
-    for the same reason: the offline apply writes them for every plan."""
+def test_split_run_backs_up_once_before_the_live_half(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A split run's single backup is the *pre-live* one.
+
+    The orchestrator's own backup is taken after it closes the browser,
+    which flushes the live half into the file -- so an `apply --undo`
+    based on it could revert only the offline remainder.  Backing up
+    first, and telling the offline path (`backup_taken`) to skip its own,
+    keeps invariant 1 at exactly one backup and makes undo cover both
+    halves.  State files stay unwritten either way: the offline apply
+    writes them for every plan.
+    """
     prefs_path = tmp_path / "Default" / "Preferences"
     prefs_path.parent.mkdir()
     prefs, new_tab = _split_prefs(prefs_path)
     plan = _split_plan(prefs_path, new_tab)
 
-    fake = FakeCdpClient(
+    events: list[str] = []
+    real_backup = shared_live.backup_preferences
+
+    def _record_backup(path: Path):
+        events.append("backup")
+        return real_backup(path)
+
+    monkeypatch.setattr(shared_live, "backup_preferences", _record_backup)
+
+    class LoggingFake(FakeCdpClient):
+        def evaluate(self, target: dict, expression: str):
+            if "setPref(" in expression or "commandsCache.assign" in expression:
+                events.append("mutate")
+            return super().evaluate(target, expression)
+
+    fake = LoggingFake(
         9333, evaluation_results=[["brave.tabs.vertical_tabs_collapsed"]]
     )
     monkeypatch.setattr(live, "CdpClient", lambda port: fake)
 
-    with pytest.raises(shared_live.LiveApplyUnsupported):
+    with pytest.raises(shared_live.LiveApplyUnsupported) as excinfo:
         live.apply_live(9333, prefs_path, prefs, [plan])
 
     # This is a split run, not an early refusal: the live half really ran.
@@ -291,8 +322,102 @@ def test_split_run_takes_no_live_backup(tmp_path: Path, monkeypatch) -> None:
         for e in fake.evaluations
     )
     backups = list(prefs_path.parent.glob("Preferences.bak.*"))
-    assert backups == [], f"live path took a backup during a split run: {backups}"
+    assert len(backups) == 1, f"invariant 1: one backup per run, got {backups}"
+    assert events and events[0] == "backup", (
+        f"the backup must precede every live mutation, got {events}"
+    )
+    # ...and the offline path must be told not to take a second one.
+    assert excinfo.value.backup_taken is True
     assert not plan.state_path.exists(), "state file claims a plan not fully applied"
+
+
+def test_unattended_split_applies_nothing_and_backs_up_nothing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """--unattended keeps all-or-nothing semantics.
+
+    Nothing closes the browser for the remainder in that mode, so a live
+    half applied here would never be recorded in the sidecar and would
+    never self-heal (the same key is unsupported on the next run too) --
+    permanently so on a home-manager activation, which only ever runs
+    --unattended.  So the refusal comes before any mutation.
+    """
+    prefs_path = tmp_path / "Default" / "Preferences"
+    prefs_path.parent.mkdir()
+    prefs, new_tab = _split_prefs(prefs_path)
+    plan = _split_plan(prefs_path, new_tab)
+    before = prefs_path.read_text()
+
+    fake = FakeCdpClient(
+        9333, evaluation_results=[["brave.tabs.vertical_tabs_collapsed"]]
+    )
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake)
+
+    with pytest.raises(shared_live.LiveApplyUnsupported) as excinfo:
+        live.apply_live(9333, prefs_path, prefs, [plan], unattended=True)
+
+    # The remainder is still named exactly, so the warning stays truthful.
+    assert excinfo.value.keys == ["brave.tabs.vertical_tabs_collapsed"]
+    assert excinfo.value.backup_taken is False
+    # Nothing was pushed: not the supported key, not the shortcut.
+    assert not any("setPref(" in e for e in fake.evaluations)
+    assert not any("commandsCache.assign" in e for e in fake.evaluations)
+    assert list(prefs_path.parent.glob("Preferences.bak.*")) == []
+    assert not plan.state_path.exists()
+    assert prefs_path.read_text() == before
+    # The work tab it opened to run the preflight is still cleaned up.
+    assert fake.closed == fake.created
+
+
+def test_cdp_failure_after_the_backup_does_not_earn_a_second_one(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The backup now precedes the mutation scripts, so a CdpError raised
+    by one of them happens *after* it.  The translated
+    `LiveApplyUnsupported` must carry that fact or the offline fallback
+    takes a second backup."""
+    from dotbrave._base.cdp import CdpError
+
+    prefs_path = tmp_path / "Default" / "Preferences"
+    prefs_path.parent.mkdir()
+    prefs = {"brave": {"tabs": {"vertical_tabs_enabled": False}}}
+    prefs_path.write_text(json.dumps(prefs))
+
+    class ExplodesOnMutation(FakeCdpClient):
+        def evaluate(self, target: dict, expression: str):
+            if "setPref(" in expression:
+                raise CdpError("Runtime.evaluate lost the connection")
+            return super().evaluate(target, expression)
+
+    fake = ExplodesOnMutation(9333)
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake)
+
+    with pytest.raises(shared_live.LiveApplyUnsupported) as excinfo:
+        live.apply_live(9333, prefs_path, prefs, [_settings_plan(prefs_path)])
+
+    assert excinfo.value.backup_taken is True
+    assert len(list(prefs_path.parent.glob("Preferences.bak.*"))) == 1
+
+
+def test_unattended_without_a_remainder_still_applies_live(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The early refusal is about the *remainder*, not about unattended:
+    a run that finishes live must still finish live under --unattended."""
+    prefs_path = tmp_path / "Default" / "Preferences"
+    prefs_path.parent.mkdir()
+    prefs = {"brave": {"tabs": {"vertical_tabs_enabled": False}}}
+    prefs_path.write_text(json.dumps(prefs))
+
+    fake = FakeCdpClient(9333)  # preflight reports nothing unsupported
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake)
+
+    live.apply_live(
+        9333, prefs_path, prefs, [_settings_plan(prefs_path)], unattended=True
+    )
+
+    assert any("setPref(" in e for e in fake.evaluations)
+    assert len(list(prefs_path.parent.glob("Preferences.bak.*"))) == 1
 
 
 def test_removal_goes_offline_alone_while_the_rest_applies_live(
@@ -331,7 +456,10 @@ def test_removal_goes_offline_alone_while_the_rest_applies_live(
         "brave.location_bar_is_wide" in e and "setPref" in e
         for e in fake.evaluations
     )
-    assert list(prefs_path.parent.glob("Preferences.bak.*")) == []
+    # One backup, taken here because a live half landed, and flagged so the
+    # offline path that finishes the removal does not take a second.
+    assert len(list(prefs_path.parent.glob("Preferences.bak.*"))) == 1
+    assert excinfo.value.backup_taken is True
 
 
 def test_removal_only_diff_never_opens_a_work_tab(

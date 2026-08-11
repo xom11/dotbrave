@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+from dotbrave._base import live_apply
 from dotbrave._base import orchestrator
 from dotbrave._base import process as process_mod
 from dotbrave._base.utils import Plan
@@ -164,7 +165,7 @@ def test_relaunch_for_live_apply_captures_cmdline_before_closing(
         find_cmdline_fn=lambda: (events.append("capture"), ORIGINAL_CMDLINE)[1],
         restart_fn=lambda c: c,
         build_plans_fn=lambda p, prefs, doc, **kw: [_settings_plan()],
-        live_apply_fn=lambda *a: None,
+        live_apply_fn=lambda *a, **k: None,
         graceful_close_fn=lambda: events.append("close"),
         launch_live_fn=_launch_live,
     )
@@ -190,7 +191,7 @@ def test_failed_relaunch_after_apply_reopens_browser_and_succeeds(
     monkeypatch.setattr(orchestrator, "wait_for_devtools_endpoint", _boom)
     restarted: list[list[str]] = []
 
-    def _live_apply(port, prefs_path, prefs, plans):
+    def _live_apply(port, prefs_path, prefs, plans, **_kw):
         raise orchestrator.LiveApplyUnsupported(
             browser_name="Brave", keys=["brave.tabs.vertical_tabs_collapsed"]
         )
@@ -222,7 +223,9 @@ def test_split_apply_names_only_the_remainder_and_backs_up_once(
 ):
     """Live apply giờ chia theo từng key: nửa làm được đã áp xong trước khi
     ném. Thông báo phải nói đúng như vậy và chỉ liệt kê phần còn lại; cả
-    lượt chạy vẫn chỉ được tạo đúng MỘT bản backup (invariant 1)."""
+    lượt chạy vẫn chỉ được tạo đúng MỘT bản backup (invariant 1), và bản
+    đó phải là bản chụp TRƯỚC nửa live -- nếu không `apply --undo` chỉ lùi
+    được phần offline."""
     monkeypatch.setattr(orchestrator, "find_devtools_port", lambda r, p: 9555)
     monkeypatch.setattr(
         orchestrator, "wait_for_devtools_endpoint", lambda *a, **k: None
@@ -230,12 +233,19 @@ def test_split_apply_names_only_the_remainder_and_backs_up_once(
     monkeypatch.setattr(
         orchestrator, "remember_devtools_port", lambda *a, **k: None
     )
+    pre_live = (prefs_root / "Default" / "Preferences").read_text()
 
-    def _live_apply(port, prefs_path, prefs, plans):
-        # A split run: the live half landed, and precisely because it did
-        # the live path took no backup -- the offline half takes the one.
+    def _live_apply(port, prefs_path, prefs, plans, **_kw):
+        # A split run, as `live.apply_live` performs it: back up first,
+        # then apply the live half (the browser later flushes it into
+        # Preferences when the orchestrator closes it), then name the
+        # remainder and say the backup is already taken.
+        live_apply.backup_preferences(prefs_path)
+        prefs_path.write_text(json.dumps({"live": "half"}))
         raise orchestrator.LiveApplyUnsupported(
-            browser_name="Brave", keys=["brave.tabs.vertical_tabs_collapsed"]
+            browser_name="Brave",
+            keys=["brave.tabs.vertical_tabs_collapsed"],
+            backup_taken=True,
         )
 
     orchestrator.cmd_apply(
@@ -254,6 +264,44 @@ def test_split_apply_names_only_the_remainder_and_backs_up_once(
     assert "applied everything it could live" in out
     assert "cannot apply every requested setting" not in out
     assert "brave.tabs.vertical_tabs_collapsed" in out
+    backups = list((prefs_root / "Default").glob("Preferences.bak.*"))
+    assert len(backups) == 1, f"invariant 1: one backup per apply, got {backups}"
+    assert backups[0].read_text() == pre_live, (
+        "the surviving backup must predate the live half, or --undo cannot "
+        "revert it"
+    )
+
+
+def test_offline_fallback_without_a_live_backup_still_takes_one(
+    prefs_root, tmp_path, monkeypatch, capsys
+):
+    """Mặt còn lại: live apply chưa kịp backup (không áp được gì live, hoặc
+    hỏng trước khi backup) thì nhánh offline vẫn phải tạo đúng một bản."""
+    monkeypatch.setattr(orchestrator, "find_devtools_port", lambda r, p: 9555)
+    monkeypatch.setattr(
+        orchestrator, "wait_for_devtools_endpoint", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        orchestrator, "remember_devtools_port", lambda *a, **k: None
+    )
+
+    def _live_apply(port, prefs_path, prefs, plans, **_kw):
+        raise orchestrator.LiveApplyUnsupported(
+            browser_name="Brave", keys=["brave.tabs.vertical_tabs_collapsed"]
+        )
+
+    orchestrator.cmd_apply(
+        _args(prefs_root, _config(tmp_path)),
+        display_name="Brave",
+        running_fn=lambda: True,
+        find_cmdline_fn=lambda: ORIGINAL_CMDLINE,
+        restart_fn=lambda c: c,
+        build_plans_fn=lambda p, prefs, doc, **kw: [_settings_plan()],
+        live_apply_fn=_live_apply,
+        graceful_close_fn=lambda: None,
+        launch_live_fn=lambda *a, **k: ["brave-browser"],
+    )
+
     backups = list((prefs_root / "Default").glob("Preferences.bak.*"))
     assert len(backups) == 1, f"invariant 1: one backup per apply, got {backups}"
 
@@ -279,7 +327,7 @@ def test_failed_relaunch_before_apply_reopens_browser_then_fails(
             find_cmdline_fn=lambda: ORIGINAL_CMDLINE,
             restart_fn=lambda c: restarted.append(c) or c,
             build_plans_fn=lambda p, prefs, doc, **kw: [_settings_plan()],
-            live_apply_fn=lambda *a: None,
+            live_apply_fn=lambda *a, **k: None,
             graceful_close_fn=lambda: None,
             launch_live_fn=lambda *a, **k: ["brave-browser"],
         )

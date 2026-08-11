@@ -67,11 +67,17 @@ Preserve these contracts unless a change explicitly redesigns them:
 
 1. `apply` uses module `Plan` objects and one orchestrated cycle. Validate
    all selected namespaces before committing profile changes; create at most
-   one Preferences backup per offline apply. A live apply takes its backup
-   only when the run finishes live -- that is, only when the per-key split
-   of invariant 5 leaves no offline remainder. A split run therefore takes
-   exactly one backup, the offline path's. Backing up before the live half
-   as well would make two.
+   one Preferences backup per apply -- one file, wherever it was taken.
+   A live apply that is about to mutate takes that one backup *before* its
+   live half lands, whether or not the per-key split of invariant 5 leaves
+   an offline remainder, and reports it on the exception
+   (`LiveApplyUnsupported.backup_taken`) so the offline path skips its own.
+   The order is the point: closing the browser for the offline remainder
+   makes Brave flush the live half into `Preferences`, so a backup taken
+   after that could only ever undo the remainder. When the live path
+   mutates nothing (every key unsupported, or it failed before mutating)
+   it takes no backup, and the offline path's -- taken after the close, so
+   it captures that flush too -- stays the run's only one.
    When an apply closes the browser, it must re-read `Preferences` before
    mutating and committing: the close flushes the browser's own in-memory
    copy over the file, and writing the snapshot taken before the close
@@ -111,15 +117,27 @@ Preserve these contracts unless a change explicitly redesigns them:
    remain internal; no public endpoint or force-kill switch is exposed.
    The live/offline split is per key, not per run: everything
    `chrome.settingsPrivate` recognises is applied live, and `[shortcuts]`
-   is applied live independently of it, before anything is refused. Only
-   the keys the browser does not recognise and the removals (there is no
-   single-pref reset) fall back to a normal close, verified offline apply,
-   and relaunch, and `LiveApplyUnsupported` names exactly that remainder.
+   is applied live independently of it, before anything is refused. Three
+   things and only those fall back to a normal close, verified offline
+   apply, and relaunch: the keys the browser does not recognise, the
+   removals (there is no single-pref reset), and -- as a block, named by
+   the marker `shortcuts` -- the whole `[shortcuts]` table when its own
+   preflight reports the commands bundle unusable.
+   `LiveApplyUnsupported` names exactly that remainder.
    One unknown key must never drag the keys that would have worked -- or
    `[shortcuts]`, which has nothing to do with it -- offline with it. So
    the shortcut script runs before the raise, and state files stay
    unwritten whenever a remainder exists: the offline apply writes them
-   for the whole plan. Every close captures the running
+   for the whole plan.
+   `--unattended` is the exception, and keeps all-or-nothing semantics:
+   when a remainder exists it refuses *before* mutating anything (no
+   backup, no script, no state file). Nothing closes the browser to finish
+   the remainder in that mode, so a live half applied there would never be
+   recorded in the sidecars, would leak into invariants 2 and 6, and would
+   never self-heal -- the same key is still unsupported next run, so there
+   is still a remainder. On a home-manager activation, which only ever
+   runs `--unattended`, that state would be permanent.
+   Every close captures the running
    command line *first* (`find_cmdline_fn`) and the relaunch forwards its
    flags: rebuilding the command line from scratch drops whatever the
    session needed to start at all, and a Brave launched with
@@ -176,7 +194,10 @@ Preserve these contracts unless a change explicitly redesigns them:
    consumes the snapshot; `apply --undo` does not delete it.
 7. `apply --undo` restores the most recent Preferences backup and clears
    shortcut/settings sidecars. If Brave is running, it closes normally and
-   restarts; it does not roll back external `[pwa]` policy.
+   restarts; it does not roll back external `[pwa]` policy. After a split
+   run that backup is the pre-live one of invariant 1, so undo reverts
+   both halves -- the live keys and the offline remainder -- not just the
+   remainder.
 8. Profile flags (`--channel`, `-r`, `-p`) are accepted both before and
    after the action name: real defaults live on the root parser; action
    parsers re-declare them with `argparse.SUPPRESS` so the after-action

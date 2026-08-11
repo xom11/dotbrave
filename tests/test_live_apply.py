@@ -72,7 +72,13 @@ def test_running_browser_without_endpoint_gracefully_relaunches_for_live_apply(
         ),
     )
 
-    def live_apply_fn(port: int, got_prefs_path: Path, _prefs: dict, plans: list[Plan]) -> None:
+    def live_apply_fn(
+        port: int,
+        got_prefs_path: Path,
+        _prefs: dict,
+        plans: list[Plan],
+        **_kw: object,
+    ) -> None:
         calls.append(("live", (port, got_prefs_path, [p.namespace for p in plans])))
 
     orch.cmd_apply(
@@ -117,7 +123,7 @@ def test_running_browser_reuses_existing_devtools_endpoint(
         find_cmdline_fn=lambda: ["brave"],
         restart_fn=lambda _cmd: [],
         build_plans_fn=_build_plan,
-        live_apply_fn=lambda port, *_args: calls.append(f"live:{port}"),
+        live_apply_fn=lambda port, *_args, **_kw: calls.append(f"live:{port}"),
         graceful_close_fn=lambda: calls.append("close"),
         launch_live_fn=lambda *_args: calls.append("launch") or ["brave"],
     )
@@ -148,7 +154,7 @@ def test_plain_live_apply_unsupported_setting_falls_back_without_force_kill(
         ),
     )
 
-    def unsupported_live_apply(*_args: object) -> None:
+    def unsupported_live_apply(*_args: object, **_kw: object) -> None:
         raise live_apply.LiveApplyUnsupported("Brave", ["foo.bar"])
 
     orch.cmd_apply(
@@ -228,7 +234,7 @@ def test_pwa_only_apply_leaves_running_browser_untouched(
         find_cmdline_fn=lambda: ["brave"],
         restart_fn=lambda _cmd: [],
         build_plans_fn=_build_pwa_plan(calls),
-        live_apply_fn=lambda *_a: calls.append(("live", None)),
+        live_apply_fn=lambda *_a, **_kw: calls.append(("live", None)),
         graceful_close_fn=lambda: calls.append(("close", None)),
         launch_live_fn=lambda *_a: calls.append(("launch", None)) or ["brave"],
     )
@@ -311,7 +317,7 @@ def test_pwa_with_settings_changes_still_bootstraps_live_endpoint(
         find_cmdline_fn=lambda: ["brave"],
         restart_fn=lambda _cmd: [],
         build_plans_fn=build,
-        live_apply_fn=lambda port, _path, _prefs, plans: calls.append(
+        live_apply_fn=lambda port, _path, _prefs, plans, **_kw: calls.append(
             ("live", (port, [p.namespace for p in plans]))
         ),
         graceful_close_fn=lambda: calls.append(("close", None)),
@@ -380,7 +386,7 @@ def test_offline_fallback_does_not_discard_what_the_browser_flushed_on_close(
         orch, "wait_for_devtools_endpoint", lambda port, display_name: None
     )
 
-    def live_apply_fn(port, got_prefs_path, _prefs, plans):
+    def live_apply_fn(port, got_prefs_path, _prefs, plans, **_kw):
         raise live_apply.LiveApplyUnsupported("Brave", ["foo.bar"])
 
     orch.cmd_apply(

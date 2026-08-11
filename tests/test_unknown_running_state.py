@@ -186,7 +186,7 @@ def _run_apply(prefs_root: Path, tmp_path: Path, applied: list, **kw) -> None:
         find_cmdline_fn=proc.find_main_cmdline,
         restart_fn=lambda c: c,
         build_plans_fn=lambda p, prefs, doc, **k: [_writing_plan(applied)],
-        live_apply_fn=lambda *a: None,
+        live_apply_fn=lambda *a, **k: None,
         graceful_close_fn=lambda: pytest.fail("must not close Brave"),
         launch_live_fn=lambda *a: [],
     )

@@ -14,12 +14,29 @@ MISSING = object()
 
 
 class LiveApplyUnsupported(Exception):
-    """A live adapter cannot apply one or more settings without restarting."""
+    """A live adapter cannot apply one or more settings without restarting.
 
-    def __init__(self, browser_name: str, keys: list[str]) -> None:
+    ``backup_taken`` reports whether the adapter already took this run's
+    single Preferences backup before it mutated anything.  The offline
+    path that finishes the remainder must then skip its own backup: an
+    adapter that applied part of the run live has to back up *before*
+    that half lands, or the browser flushes it into the file the offline
+    path would snapshot and ``--undo`` can only revert the offline
+    remainder.  Defaults to False so a raiser that mutated nothing keeps
+    the offline backup.
+    """
+
+    def __init__(
+        self,
+        browser_name: str,
+        keys: list[str],
+        *,
+        backup_taken: bool = False,
+    ) -> None:
         super().__init__(browser_name, keys)
         self.browser_name = browser_name
         self.keys = keys
+        self.backup_taken = backup_taken
 
 
 def compute_target_prefs(prefs: dict, plans: list[Plan]) -> dict:

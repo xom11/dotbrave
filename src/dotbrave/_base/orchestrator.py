@@ -280,7 +280,8 @@ def cmd_apply(
     find_cmdline_fn: Callable[[], list[str] | None],
     restart_fn: Callable[[list[str]], list[str]],
     build_plans_fn: Callable,
-    live_apply_fn: Callable[[int, Path, dict, list], None] | None = None,
+    # (port, prefs_path, prefs, plans, *, unattended)
+    live_apply_fn: Callable[..., None] | None = None,
     graceful_close_fn: Callable[[], None] | None = None,
     launch_live_fn: (
         Callable[[Path, str, int, str | None, list[str] | None], list[str]] | None
@@ -395,6 +396,7 @@ def cmd_apply(
 
     saved_cmdline: list[str] | None = None
     was_closed = False
+    backup_taken = False
     relaunch_live_port: int | None = None
     is_running = _running_state(
         running_fn, display_name=display_name, unattended=unattended
@@ -500,9 +502,14 @@ def cmd_apply(
                     sys.exit(f"{e}\n{note}")
             live_port = int(live_port)
             try:
-                live_apply_fn(live_port, prefs_path, prefs, plans)
+                live_apply_fn(
+                    live_port, prefs_path, prefs, plans, unattended=unattended
+                )
             except LiveApplyUnsupported as e:
                 settings = "\n".join(f"  {key}" for key in e.keys)
+                # The adapter may already have taken this run's backup,
+                # before its live half landed.  Invariant 1 allows one.
+                backup_taken = e.backup_taken
                 if unattended:
                     _warn(
                         "unattended: "
@@ -559,11 +566,15 @@ def cmd_apply(
         # snapshot.
         prefs = load_prefs(prefs_path)
 
-    backup = prefs_path.with_suffix(
-        prefs_path.suffix + f".bak.{datetime.now():%Y%m%d-%H%M%S}"
-    )
-    backup_prefs(prefs_path, backup)
-    print(f"backup: {backup}")
+    if not backup_taken:
+        # Skipped only when live apply already backed up ahead of its own
+        # half of a split run; that file predates everything this run
+        # wrote, so a second one here would be strictly worse for --undo.
+        backup = prefs_path.with_suffix(
+            prefs_path.suffix + f".bak.{datetime.now():%Y%m%d-%H%M%S}"
+        )
+        backup_prefs(prefs_path, backup)
+        print(f"backup: {backup}")
 
     # In-memory mutate first; nothing is on disk yet.
     for plan in plans:
