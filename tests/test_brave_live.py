@@ -732,6 +732,32 @@ def test_a_recorded_prior_value_is_never_replaced_by_the_live_capture(
     assert state["prior_values"][_WIDE] == {"present": True, "value": True}
 
 
+def test_a_preflight_answer_without_a_value_learns_nothing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """`pref.value` is dropped in serialisation when it is undefined, and
+    no pref can be set back to null.  Such a key is still supported --
+    `getPref` answered -- so it must not join the remainder; it simply
+    keeps its `absent` marker rather than recording a value that
+    `_resolve_removals` would turn into `setPref(key, null)`."""
+    prefs_path = tmp_path / "Default" / "Preferences"
+    prefs_path.parent.mkdir()
+    prefs = {"brave": {}}
+    prefs_path.write_text(json.dumps(prefs))
+
+    plan = settings_mod.plan_apply(prefs_path, prefs, {_WIDE: True})
+
+    fake = FakeCdpClient(
+        9333, evaluation_results=[[{"key": _WIDE, "supported": True}]]
+    )
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake)
+
+    live.apply_live(9333, prefs_path, prefs, [plan])  # supported: no remainder
+
+    state = json.loads(_sidecar(prefs_path).read_text())
+    assert state["prior_values"][_WIDE] == {"present": False, "value": None}
+
+
 def test_a_run_with_a_remainder_writes_no_enriched_sidecar(
     tmp_path: Path, monkeypatch
 ) -> None:
