@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from dotbrave._base.cdp import CdpClient
+from dotbrave._base.cdp import CdpClient, CdpError
 from dotbrave._base import live_apply as _live
 from dotbrave._base.utils import Plan
 from dotbrave import shortcuts as shortcuts_mod
@@ -248,8 +248,10 @@ def apply_live(port: int, prefs_path: Path, prefs: dict, plans: list[Plan]) -> N
     changes = _setting_changes(prefs, target_prefs)
     newtab_changes, ordinary_changes = _route_settings(changes)
     client = CdpClient(port)
-    target, created = _worker_target(client)
+    target: dict = {}
+    created = False
     try:
+        target, created = _worker_target(client)
         unsupported = _preflight_settings(
             client, target, newtab_changes, ordinary_changes
         )
@@ -284,6 +286,10 @@ def apply_live(port: int, prefs_path: Path, prefs: dict, plans: list[Plan]) -> N
             client.evaluate(target, shortcut_script)
 
         _live.write_state_files(plans)
+    except CdpError as e:
+        # Degrade to the offline path rather than aborting: a backup has
+        # been taken by now, and in a mixed run [pwa] policy is written.
+        raise _live.LiveApplyUnsupported("Brave", [f"live apply failed: {e}"])
     finally:
         if created:
             client.close_page(target)

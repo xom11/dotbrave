@@ -23,11 +23,20 @@ from typing import Any
 _LIVE_PORT_SIDECAR = ".dotbrave.live.json"
 
 
+class CdpError(RuntimeError):
+    """A DevTools request failed.
+
+    Raised rather than exiting so a live adapter can fall back to an
+    offline apply.  Every `sys.exit` this replaced aborted the run after
+    a backup -- and possibly an external policy write -- had happened.
+    """
+
+
 class _WebSocket:
     def __init__(self, url: str, timeout: float = 5.0):
         parsed = urllib.parse.urlparse(url)
         if parsed.scheme != "ws":
-            sys.exit(f"error: unsupported DevTools websocket URL: {url}")
+            raise CdpError(f"unsupported DevTools websocket URL: {url}")
         self.host = parsed.hostname or "127.0.0.1"
         self.port = parsed.port or 80
         self.path = parsed.path or "/"
@@ -56,7 +65,7 @@ class _WebSocket:
             response += chunk
         header = response.decode("iso-8859-1", "replace")
         if " 101 " not in header.split("\r\n", 1)[0]:
-            sys.exit("error: DevTools websocket handshake failed")
+            raise CdpError("DevTools websocket handshake failed")
         expected = base64.b64encode(
             hashlib.sha1(
                 (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")
@@ -69,7 +78,7 @@ class _WebSocket:
             name, value = line.split(":", 1)
             headers[name.strip().lower()] = value.strip()
         if headers.get("sec-websocket-accept") != expected:
-            sys.exit("error: DevTools websocket accept header mismatch")
+            raise CdpError("DevTools websocket accept header mismatch")
 
     def close(self) -> None:
         try:
@@ -109,7 +118,7 @@ class _WebSocket:
             if masked:
                 payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
             if opcode == 0x8:
-                sys.exit("error: DevTools websocket closed")
+                raise CdpError("DevTools websocket closed")
             if opcode == 0x9:
                 self._send_pong(payload)
                 continue
@@ -124,7 +133,7 @@ class _WebSocket:
         while len(chunks) < n:
             chunk = self.sock.recv(n - len(chunks))
             if not chunk:
-                sys.exit("error: DevTools websocket ended unexpectedly")
+                raise CdpError("DevTools websocket ended unexpectedly")
             chunks.extend(chunk)
         return bytes(chunks)
 
@@ -140,8 +149,8 @@ class CdpClient:
             with urllib.request.urlopen(url, timeout=5) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as e:
-            sys.exit(
-                f"error: could not reach DevTools endpoint at "
+            raise CdpError(
+                f"could not reach DevTools endpoint at "
                 f"{self.host}:{self.port}: {e}"
             )
 
@@ -202,14 +211,14 @@ class CdpClient:
         if "exceptionDetails" in result:
             detail = result["exceptionDetails"]
             desc = detail.get("exception", {}).get("description") or detail.get("text")
-            sys.exit(f"error: DevTools evaluation failed: {desc}")
+            raise CdpError(f"DevTools evaluation failed: {desc}")
         value = result.get("result", {})
         return value.get("value")
 
     def _command(self, target: dict, method: str, params: dict | None = None) -> dict:
         ws_url = target.get("webSocketDebuggerUrl")
         if not isinstance(ws_url, str) or not ws_url:
-            sys.exit("error: DevTools target has no websocket URL")
+            raise CdpError("DevTools target has no websocket URL")
         ws = _WebSocket(ws_url)
         try:
             payload = {"id": 1, "method": method}
@@ -220,7 +229,7 @@ class CdpClient:
                 msg = json.loads(ws.recv_text())
                 if msg.get("id") == 1:
                     if "error" in msg:
-                        sys.exit(f"error: DevTools command failed: {msg['error']}")
+                        raise CdpError(f"DevTools command failed: {msg['error']}")
                     return msg
         finally:
             ws.close()
@@ -369,7 +378,7 @@ def wait_for_devtools_endpoint(
             targets = CdpClient(port).list_targets()
             if targets:
                 return
-        except SystemExit as e:
+        except CdpError as e:
             last_error = str(e)
         time.sleep(0.25)
     sys.exit(
