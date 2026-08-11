@@ -398,7 +398,7 @@ def test_no_sync_warning_when_settings_table_empty(
 
 
 def test_local_state_keys_are_refused_instead_of_silently_no_op(
-    fake_settings_profile_root: Path, capsys
+    fake_settings_profile_root: Path,
 ) -> None:
     """These prefs live in <root>/Local State, not <root>/<profile>/Preferences.
     Writing them to Preferences is a permanent no-op that verify_fn cannot
@@ -424,11 +424,40 @@ def test_local_state_keys_are_refused_instead_of_silently_no_op(
     assert "Local State" in message
 
 
-def test_profile_scoped_browser_key_is_still_accepted(
-    fake_settings_profile_root: Path
-) -> None:
-    """The denylist is exact, not prefixed: browser.* is not all Local State."""
+def test_profile_scoped_browser_key_is_still_accepted(tmp_path: Path) -> None:
+    """The denylist is exact, not prefixed: `browser.*` is not all Local
+    State. `browser.show_home_button` shares the `browser.` namespace
+    with `browser.enabled_labs_experiments` (a genuine Local State key)
+    but is itself a profile pref that belongs in this profile's
+    Preferences, so `plan_apply` must accept it rather than refuse the
+    whole `browser.` namespace.
+
+    Deliberately does not use `fake_settings_profile_root`: that shared
+    fixture mirrors `browser.show_home_button` under `protection.macs`
+    (to exercise the MAC-refusal tests elsewhere in this file), so
+    calling `plan_apply` with that key against it would raise SystemExit
+    for the unrelated MAC-protection reason and mask the
+    exact-keys-not-prefixes property this test pins.
+    """
+    from dotbrave._base import settings as base_settings
     from dotbrave.settings import LOCAL_STATE_KEYS
 
-    assert "browser.enabled_labs_experiments" in LOCAL_STATE_KEYS
-    assert "browser.show_home_button" not in LOCAL_STATE_KEYS
+    profile = tmp_path / "Default"
+    profile.mkdir()
+    prefs_path = profile / "Preferences"
+    prefs: dict = {"browser": {"show_home_button": False}}
+    prefs_path.write_text(json.dumps(prefs))
+
+    try:
+        base_settings.plan_apply(
+            "brave",
+            prefs_path,
+            prefs,
+            {"browser.show_home_button": True},
+            local_state_keys=LOCAL_STATE_KEYS,
+        )
+    except SystemExit as exc:  # pragma: no cover - only hit by a regression
+        pytest.fail(
+            "plan_apply refused a profile-scoped browser.* key that is "
+            f"not itself in LOCAL_STATE_KEYS: {exc}"
+        )
