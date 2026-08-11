@@ -249,12 +249,33 @@ def _shortcuts_preflight_script() -> str:
 def _newtab_script(changes: list[tuple[str, str, str, Any]]) -> str | None:
     if not changes:
         return None
+    # readyState only reflects resource loading, not SPA store hydration --
+    # window._ntp can still be absent right after navigate. Poll the same
+    # way _newtab_preflight_script already proves works, on this page's own
+    # navigation, rather than trusting the earlier preflight's readiness
+    # (that ran against a *different* navigate to the same URL).
+    routes = [
+        {"key": key, "store": store, "action": action}
+        for key, store, action, _value in changes
+    ]
+    routes_json = json.dumps(routes, separators=(",", ":"))
     calls = "".join(
         f"window._ntp.{store}.getState().actions.{action}({json.dumps(value)});"
         for _key, store, action, value in changes
     )
     return (
         "(async () => {"
+        f"const routes = {routes_json};"
+        "const missing = () => routes.filter(({store, action}) => "
+        "typeof window._ntp?.[store]?.getState?.()?.actions?.[action] "
+        "!== 'function').map(({key}) => key);"
+        "let unready = missing();"
+        "for (let attempt = 0; attempt < 20 && unready.length; attempt++) {"
+        "await new Promise(r => setTimeout(r, 50));"
+        "unready = missing();"
+        "}"
+        "if (unready.length) throw new Error("
+        "'NTP store actions unavailable for ' + unready.join(', '));"
         f"{calls}"
         "await new Promise(r => setTimeout(r, 300));"
         "return true;"

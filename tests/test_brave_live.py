@@ -295,3 +295,50 @@ def test_scripts_guard_against_an_unloaded_settings_page() -> None:
     """The probe must degrade like the NTP one, not throw on a cold page."""
     script = live._settings_preflight_script([("foo.bar", 1)])
     assert "chrome?.settingsPrivate" in script or "typeof chrome" in script
+
+
+def test_await_page_polls_until_ready() -> None:
+    """`_await_page` must actually poll, not just check once and return.
+
+    ``Page.navigate`` returns as soon as navigation starts, so a client
+    that answers "not ready" a few times before "ready" is the case this
+    task's fix exists for. An implementation that evaluated once and
+    returned (no loop) would call ``evaluate`` exactly once here; this
+    pins that it is called more than once.
+    """
+    calls = {"n": 0}
+
+    class ReadyAfterAFewClient:
+        def evaluate(self, target: dict, expression: str):
+            calls["n"] += 1
+            # Falsy answers on the first couple of polls, then ready.
+            return calls["n"] >= 3
+
+    live._await_page(ReadyAfterAFewClient(), {})
+
+    assert calls["n"] > 1
+
+
+def test_await_page_returns_after_timeout_instead_of_hanging(monkeypatch) -> None:
+    """A page that never reports ready must not hang or raise -- the
+    bounded wait gives up and lets the guarded scripts that follow
+    report themselves unsupported instead."""
+
+    class NeverReadyClient:
+        def evaluate(self, target: dict, expression: str):
+            return False
+
+    # First call establishes the deadline; the loop's own next check must
+    # already read past it, so the wait resolves without a real sleep.
+    ticks = iter([0.0, 0.5, 100.0])
+
+    def fake_monotonic() -> float:
+        try:
+            return next(ticks)
+        except StopIteration:
+            return 100.0
+
+    monkeypatch.setattr(live.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(live.time, "sleep", lambda seconds: None)
+
+    live._await_page(NeverReadyClient(), {}, timeout=1.0)  # must not raise
