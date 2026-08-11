@@ -69,8 +69,8 @@ def changed_leaf_paths(
     """Return changed leaves in ``after`` compared to ``before``.
 
     Deleted leaves are reported with ``MISSING`` as the value so browser
-    adapters can refuse live resets where the underlying API has no
-    single-pref reset operation.
+    adapters can split them out (see ``split_removals``) where the
+    underlying API has no single-pref reset operation.
     """
     if isinstance(after, dict) and not isinstance(before, dict):
         before = {}

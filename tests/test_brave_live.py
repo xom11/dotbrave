@@ -334,6 +334,36 @@ def test_removal_goes_offline_alone_while_the_rest_applies_live(
     assert list(prefs_path.parent.glob("Preferences.bak.*")) == []
 
 
+def test_removal_only_diff_never_opens_a_work_tab(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Nothing in this diff has a live route, so do not open (and close) a
+    tab in the user's browser just to refuse."""
+    prefs_path = tmp_path / "Default" / "Preferences"
+    prefs_path.parent.mkdir()
+    prefs = {"brave": {"tabs": {"vertical_tabs_enabled": False}}}
+    prefs_path.write_text(json.dumps(prefs))
+
+    def apply_fn(target: dict) -> None:
+        del target["brave"]["tabs"]["vertical_tabs_enabled"]
+
+    plan = Plan(
+        namespace="settings",
+        diff_lines=["changed"],
+        apply_fn=apply_fn,
+        verify_fn=lambda _prefs: None,
+    )
+    fake = FakeCdpClient(9333)
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake)
+
+    with pytest.raises(shared_live.LiveApplyUnsupported) as excinfo:
+        live.apply_live(9333, prefs_path, prefs, [plan])
+
+    assert excinfo.value.keys == ["brave.tabs.vertical_tabs_enabled"]
+    assert fake.created == []
+    assert fake.navigations == []
+
+
 def test_settings_remainder_does_not_block_the_shortcut_script(
     tmp_path: Path, monkeypatch
 ) -> None:

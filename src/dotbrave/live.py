@@ -328,6 +328,11 @@ def apply_live(port: int, prefs_path: Path, prefs: dict, plans: list[Plan]) -> N
     changes, removals = _setting_changes(prefs, target_prefs)
     newtab_changes, ordinary_changes = _route_settings(changes)
     shortcut_script = _shortcut_script(prefs, target_prefs)
+    if removals and not (newtab_changes or ordinary_changes or shortcut_script):
+        # A diff that is nothing but removals has no live half at all, so
+        # refuse before touching the browser rather than opening a work
+        # tab in the user's face only to close it again.
+        raise _live.LiveApplyUnsupported("Brave", sorted(removals))
     client = CdpClient(port)
     target: dict = {}
     created = False
