@@ -17,7 +17,6 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from typing import Callable
 
 from dotbrave._base.orchestrator import (
     cmd_apply as _base_cmd_apply,
@@ -179,66 +178,6 @@ def _normalize_brave_args(args: argparse.Namespace) -> None:
 # CLI handlers
 # ---------------------------------------------------------------------------
 
-def _profile_directory(cmdline: list[str]) -> str | None:
-    """Pull ``--profile-directory=<name>`` out of a captured argv, or None.
-
-    None means the flag is absent -- Brave's own reading of that is "the
-    default profile" (the ``Default`` directory), mirroring how
-    ``_extract_user_data_dir`` reads ``--user-data-dir``.
-    """
-    for i, a in enumerate(cmdline):
-        if a.startswith("--profile-directory="):
-            return a.split("=", 1)[1]
-        if a == "--profile-directory" and i + 1 < len(cmdline):
-            return cmdline[i + 1]
-    return None
-
-
-def _make_profile_open_fn(
-    find_cmdline_fn: Callable[[], list[str] | None], profile: str
-) -> Callable[[], bool]:
-    """Build the ``profile_open_fn`` the orchestrator uses to skip a close.
-
-    Reuses the same command-line inspection ``BrowserProcess.
-    scope_to_profile`` already relies on: a running browser's own
-    command line carries ``--profile-directory=<name>`` for the profile
-    it has open, and no flag at all for the default profile.
-
-    True (the conservative "assume open" answer) whenever this can't be
-    trusted:
-
-    - Any platform other than Linux.  ``scope_to_profile`` only narrows
-      *which pids* count as "this browser" on Linux -- there,
-      ``find_cmdline_fn`` (via ``BrowserProcess.find_main_cmdline`` ->
-      ``pids()``) is filtered down to processes whose own
-      ``--user-data-dir`` matches the target root before this ever reads
-      their argv.  On macOS and Windows, ``BrowserProcess`` detects and
-      closes by app/image name across *every* running instance
-      (``_linux_scoping_active`` is Linux-only), so the command line
-      handed back here could belong to a completely different Brave
-      install, and reading its ``--profile-directory`` would be a guess.
-    - No command line could be read at all (nothing matched, or the pid's
-      argv could not be read).
-
-    A wrong ``False`` writes a live profile's Preferences out from under
-    a running Brave, which Brave then silently overwrites on its own
-    next flush -- so an unreliable read must fall back to "open", never
-    to "not open".
-    """
-    def profile_open() -> bool:
-        if not sys.platform.startswith("linux"):
-            return True
-        cmdline = find_cmdline_fn()
-        if not cmdline:
-            return True
-        directory = _profile_directory(cmdline)
-        if directory is None:
-            return profile == "Default"
-        return directory == profile
-
-    return profile_open
-
-
 def cmd_apply(args: argparse.Namespace) -> None:
     """Unified apply for Brave.
 
@@ -273,9 +212,6 @@ def cmd_apply(args: argparse.Namespace) -> None:
             live_apply_fn=live_mod.apply_live,
             graceful_close_fn=BROWSER_PROCESS.close_and_wait,
             launch_live_fn=BROWSER_PROCESS.launch_live,
-            profile_open_fn=_make_profile_open_fn(
-                find_main_brave_cmdline, args.profile
-            ),
         )
         return
 
@@ -292,7 +228,6 @@ def cmd_apply(args: argparse.Namespace) -> None:
         live_apply_fn=live_mod.apply_live,
         graceful_close_fn=proc.close_and_wait,
         launch_live_fn=proc.launch_live,
-        profile_open_fn=_make_profile_open_fn(proc.find_main_cmdline, args.profile),
     )
 
 
