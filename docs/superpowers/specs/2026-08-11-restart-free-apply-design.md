@@ -469,6 +469,47 @@ afterwards:
   and to settle the four non-`brave.` keys;
 - the Phase 3 gating experiment.
 
+## 1.7 was attempted and reverted — the signal cannot prove a profile is closed
+
+Implemented as commit `67057c3`, reverted in `733900a` after review. Recorded
+here so nobody rebuilds it the same way.
+
+The idea was sound; the available signal is not. Reading `--profile-directory`
+off the running browser's command line is a **lower bound** on the set of
+loaded profiles, never a proof that a profile is unloaded:
+
+- Chromium's `ProcessSingleton` is keyed on `--user-data-dir`, so there is one
+  browser process per root serving *every* profile opened under it. A second
+  launch hands its arguments to the running process through the singleton and
+  exits; the running process opens the requested profile itself and its own
+  argv never changes. Opening a profile from the avatar menu adds no argv at
+  all, and session restore reopens every profile in
+  `profile.last_active_profiles` from one command line or none.
+- Worse, a flagless launch does not mean "Default". With no
+  `--profile-directory`, Chromium opens `profile.last_used`. A flagless launch
+  is the everyday Linux case — the shipped desktop entry is
+  `brave-browser-stable %U` — so a user living in `Profile 1` who starts Brave
+  from the app menu and runs `dotbrave apply -p "Profile 1"` would have been
+  told the profile was closed, and dotbrave would have written the
+  `Preferences` of a profile visible on screen.
+
+That is the silent-undo class this project has already been bitten by, and the
+`verify_fn` that follows would not catch it: it re-reads dotbrave's own bytes
+while the browser still holds its copy in memory. Note also that a loaded
+profile's prefs are committed on a ~10s timer throughout the session, not only
+at close — so "the browser only flushes on close" is not a safe premise for any
+future attempt either.
+
+The optimisation is only implementable with a signal that gives **positive
+proof a profile is unloaded**. Two Linux-only candidates, both unverified and
+both deserving their own spec: scanning `/proc/<pid>/fd` of every scoped Brave
+pid for descriptors under `<user-data-dir>/<profile>/`, or `F_GETLK`-probing
+the leveldb `LOCK` files a loaded profile's storage backends hold. Neither has
+a macOS or Windows equivalent, where the callback would stay a constant `True`.
+
+Until such a signal exists, the honest answer is that a running browser on the
+target root means the profile may be open, and the close stands.
+
 ## Out of scope
 
 - Making unallowlisted or startup-read prefs live. Not possible; the tool
