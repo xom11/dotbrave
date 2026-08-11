@@ -758,6 +758,39 @@ def test_a_preflight_answer_without_a_value_learns_nothing(
     assert state["prior_values"][_WIDE] == {"present": False, "value": None}
 
 
+def test_a_learned_value_equal_to_the_write_records_nothing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The narrow window this closes: inside Chromium's ~10s pref-commit
+    window, a second apply of the same key can see Preferences (and
+    therefore `managed_keys`, read from the same disk state) still lag a
+    write dotbrave itself already made on a previous run -- e.g. after a
+    `--unattended` run whose live half mutated but then hit a `CdpError`
+    before `write_state_files`.  `getPref` then answers with dotbrave's
+    own value even though nothing on disk yet says the key is managed, so
+    conditions 1-3 alone would learn dotbrave's setting as though it were
+    the pre-dotbrave default. When the learned value already equals the
+    value this run is about to write, nothing is recorded -- learning
+    nothing costs at most a future restart; learning wrongly would let a
+    later removal silently restore dotbrave's setting instead of the
+    user's."""
+    prefs_path = tmp_path / "Default" / "Preferences"
+    prefs_path.parent.mkdir()
+    prefs = {"brave": {}}
+    prefs_path.write_text(json.dumps(prefs))
+
+    plan = settings_mod.plan_apply(prefs_path, prefs, {_WIDE: True})
+
+    # getPref already answers with the value this run is about to write.
+    fake = FakeCdpClient(9333, evaluation_results=[[_pref_entry(_WIDE, True)]])
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake)
+
+    live.apply_live(9333, prefs_path, prefs, [plan])
+
+    state = json.loads(_sidecar(prefs_path).read_text())
+    assert state["prior_values"][_WIDE] == {"present": False, "value": None}
+
+
 def test_a_run_with_a_remainder_writes_no_enriched_sidecar(
     tmp_path: Path, monkeypatch
 ) -> None:
