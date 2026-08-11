@@ -735,9 +735,9 @@ def cmd_restore(
             print(f"cleared {sidecar}")
 
     print(
-        "note: [pwa] policy file is NOT affected by restore. If you "
-        "applied PWAs you no longer want, edit the managed-policy file "
-        "(see `dotbrave export` for its location) manually."
+        "note: [pwa] policy file is NOT affected by restore. "
+        "If you no longer want the installed PWAs, edit the "
+        "managed-policy file directly."
     )
 
     if saved_cmdline:
