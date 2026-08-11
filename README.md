@@ -243,6 +243,37 @@ sounds — Brave writes `DevToolsActivePort` only when the port is dynamic
 (`--remote-debugging-port=0`), so a browser you started on a fixed port
 would otherwise be closed and relaunched for an endpoint it already had.
 
+### macOS: keep a live endpoint from login (optional)
+
+Without a debugging endpoint, the first `dotbrave apply` of each browser
+session has to close Brave and relaunch it once just to obtain one. A user
+LaunchAgent removes that:
+
+```bash
+cp contrib/org.dotbrave.brave-endpoint.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/org.dotbrave.brave-endpoint.plist
+```
+
+To remove it:
+
+```bash
+launchctl bootout gui/$UID/org.dotbrave.brave-endpoint
+rm ~/Library/LaunchAgents/org.dotbrave.brave-endpoint.plist
+```
+
+Two things to know before installing:
+
+- **Remove Brave from System Settings → General → Login Items.** macOS does
+  not allow a second instance of the same app bundle, so whichever launches
+  first wins and the other exits immediately. If Brave is already a login
+  item, the agent's launch is the one that dies, and you get no endpoint.
+- **This starts Brave at login.** The agent does not restart Brave if you
+  quit it; a Brave you reopen yourself has no endpoint, and apply falls back
+  to closing it once, as before.
+
+The port is dynamic (`=0`) on purpose: Brave writes `DevToolsActivePort`
+only for a dynamic port, and that file is how dotbrave finds the endpoint.
+
 When Brave is running, plain `apply` uses Brave's privileged UI APIs over
 a private loopback DevTools endpoint: ordinary settings go through
 `chrome.settingsPrivate`, New Tab settings through live New Tab UI
