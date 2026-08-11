@@ -83,7 +83,17 @@ Preserve these contracts unless a change explicitly redesigns them:
    copy over the file, and writing the snapshot taken before the close
    reverts that flush (`profile.exit_type` among it).
 2. Missing TOML table means "skip this namespace"; an empty table means
-   "remove/reset entries previously managed by dotbrave".
+   "remove/reset entries previously managed by dotbrave" -- what "remove"
+   does for `[settings]` is route-dependent. Offline removal deletes the
+   key from `Preferences`, so Chromium falls back to its compiled default.
+   `chrome.settingsPrivate` has no single-pref reset, so live removal
+   instead writes back the value the settings sidecar recorded for that
+   key the moment dotbrave first started managing it (first-seen, never
+   overwritten by dotbrave's own writes), leaving the key present with
+   its pre-dotbrave value rather than gone. A key the sidecar recorded as
+   `{"present": false}` was never set before dotbrave touched it -- there
+   is no value to restore live, so that removal goes to the offline
+   remainder instead.
 3. `[settings]` must refuse MAC-protected keys found in either `Preferences`
    or sibling `Secure Preferences`. Never make a write that Brave will
    silently reset on launch.

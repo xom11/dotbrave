@@ -164,6 +164,42 @@ def _get_managed_keys(prefs_path: Path) -> set[str]:
     return set(data.get("managed_keys", []))
 
 
+def merge_prior_values(existing: dict, captured: dict) -> dict:
+    """First-seen wins.
+
+    The recorded value is what a key had before dotbrave ever managed it,
+    so a later apply must not overwrite it with dotbrave's own value --
+    that would make removal restore dotbrave's setting, not the user's.
+    """
+    merged = dict(existing)
+    for key, entry in captured.items():
+        merged.setdefault(key, entry)
+    return merged
+
+
+def _get_prior_values(prefs_path: Path) -> dict:
+    state = _state_file(prefs_path)
+    if not state.exists():
+        return {}
+    try:
+        data = json.loads(state.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    prior = data.get("prior_values")
+    return prior if isinstance(prior, dict) else {}
+
+
+def _capture_prior_values(prefs: dict, keys: set[str]) -> dict:
+    captured = {}
+    for key in keys:
+        value = _get_value(prefs, _split_key(key))
+        if value is _MISSING:
+            captured[key] = {"present": False, "value": None}
+        else:
+            captured[key] = {"present": True, "value": value}
+    return captured
+
+
 def _snapshot_file(prefs_path: Path) -> Path:
     return prefs_path.with_name(
         prefs_path.name + ".dotbrave.settings-snapshot.json"
@@ -506,11 +542,19 @@ def plan_apply(
             if got != value:
                 sys.exit(f"error: settings verification failed for key {key!r}: got {got!r}")
 
+    prior_values = merge_prior_values(
+        _get_prior_values(prefs_path),
+        _capture_prior_values(prefs, target_keys),
+    )
+
     return Plan(
         namespace=NAMESPACE,
         diff_lines=diff,
         state_path=_state_file(prefs_path),
-        state_payload={"managed_keys": sorted(target_keys)},
+        state_payload={
+            "managed_keys": sorted(target_keys),
+            "prior_values": prior_values,
+        },
         apply_fn=apply_fn,
         verify_fn=verify_fn,
         warnings=warnings,

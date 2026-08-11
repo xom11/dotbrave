@@ -424,6 +424,37 @@ def test_local_state_keys_are_refused_instead_of_silently_no_op(
     assert "Local State" in message
 
 
+def test_sidecar_records_the_value_a_key_had_before_dotbrave_managed_it(
+    fake_settings_profile_root: Path
+) -> None:
+    from dotbrave._base import settings as base_settings
+
+    prefs_path = fake_settings_profile_root / "Default" / "Preferences"
+    prefs = json.loads(prefs_path.read_text())
+
+    plan = base_settings.plan_apply(
+        "brave", prefs_path, prefs,
+        {"brave.tabs.vertical_tabs_enabled": True,   # present, False
+         "brave.tabs.brand_new_key": True},          # absent
+    )
+
+    prior = plan.state_payload["prior_values"]
+    assert prior["brave.tabs.vertical_tabs_enabled"] == {"present": True, "value": False}
+    assert prior["brave.tabs.brand_new_key"] == {"present": False, "value": None}
+
+
+def test_prior_values_are_first_seen_and_never_overwritten() -> None:
+    from dotbrave._base.settings import merge_prior_values
+
+    existing = {"a.b": {"present": True, "value": 1}}
+    captured = {"a.b": {"present": True, "value": 999}, "c.d": {"present": False, "value": None}}
+
+    merged = merge_prior_values(existing, captured)
+
+    assert merged["a.b"] == {"present": True, "value": 1}, "first-seen must win"
+    assert merged["c.d"] == {"present": False, "value": None}
+
+
 def test_profile_scoped_browser_key_is_still_accepted(tmp_path: Path) -> None:
     """The denylist is exact, not prefixed: `browser.*` is not all Local
     State. `browser.show_home_button` shares the `browser.` namespace
