@@ -8,6 +8,7 @@ from typing import Any
 
 from dotbrave._base.cdp import CdpClient, CdpError
 from dotbrave._base import live_apply as _live
+from dotbrave._base import settings as _base_settings
 from dotbrave._base.utils import Plan
 from dotbrave import shortcuts as shortcuts_mod
 
@@ -97,6 +98,31 @@ def _setting_changes(
     ]
     applicable, removals = _live.split_removals(changes)
     return [(".".join(parts), value) for parts, value in applicable], removals
+
+
+def _resolve_removals(
+    prefs_path: Path, removals: list[str],
+) -> tuple[list[tuple[str, Any]], list[str]]:
+    """Turn removals into live writes where a prior value was recorded.
+
+    ``settingsPrivate`` cannot delete a pref, but writing back what the
+    key held before dotbrave managed it is the same thing as far as the
+    browser's behaviour is concerned.  A key recorded ``present: false``
+    was never set, so there is no value to write and it has to be deleted
+    offline.  The sidecar entry is read defensively: a missing, malformed,
+    or partially-written entry (not a dict, or missing ``present``) is
+    treated the same as "no prior value recorded" rather than raising.
+    """
+    prior = _base_settings.get_prior_values(prefs_path)
+    writes: list[tuple[str, Any]] = []
+    unresolved: list[str] = []
+    for key in removals:
+        entry = prior.get(key)
+        if isinstance(entry, dict) and entry.get("present") is True:
+            writes.append((key, entry.get("value")))
+        else:
+            unresolved.append(key)
+    return writes, unresolved
 
 
 def _dict_at(prefs: dict, parts: tuple[str, ...]) -> dict[str, list[str]]:
@@ -334,11 +360,19 @@ def apply_live(
     target_prefs = _live.compute_target_prefs(prefs, plans)
     changes, removals = _setting_changes(prefs, target_prefs)
     newtab_changes, ordinary_changes = _route_settings(changes)
+    # Resolve removals against the sidecar's recorded prior values *before*
+    # the preflight runs, and fold the resolved writes into the ordinary
+    # settings changes so the preflight probes them too -- a prior value
+    # for a key settingsPrivate does not recognise is still unusable, and
+    # only the preflight can tell us that.
+    removal_writes, unresolved_removals = _resolve_removals(prefs_path, removals)
+    ordinary_changes = ordinary_changes + removal_writes
     shortcut_script = _shortcut_script(prefs, target_prefs)
     if removals and not (newtab_changes or ordinary_changes or shortcut_script):
-        # A diff that is nothing but removals has no live half at all, so
-        # refuse before touching the browser rather than opening a work
-        # tab in the user's face only to close it again.
+        # A diff that is nothing but removals -- none of which had a prior
+        # value to restore -- has no live half at all, so refuse before
+        # touching the browser rather than opening a work tab in the
+        # user's face only to close it again.
         raise _live.LiveApplyUnsupported("Brave", sorted(removals))
     client = CdpClient(port)
     target: dict = {}
@@ -357,7 +391,10 @@ def apply_live(
         # not know used to send everything offline -- every key that would
         # have worked, plus the whole [shortcuts] table, which has nothing
         # to do with it.  Blocked keys are the remainder and only that.
-        blocked = set(unsupported) | set(removals)
+        # A removal already resolved into `ordinary_changes` above lands in
+        # `blocked` via `unsupported` if the preflight rejects it too;
+        # `unresolved_removals` covers the ones with no prior value at all.
+        blocked = set(unsupported) | set(unresolved_removals)
         live_newtab = [c for c in newtab_changes if c[0] not in blocked]
         live_ordinary = [c for c in ordinary_changes if c[0] not in blocked]
         remainder = sorted(blocked | set(shortcuts_unsupported))

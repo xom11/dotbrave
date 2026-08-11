@@ -127,12 +127,17 @@ Preserve these contracts unless a change explicitly redesigns them:
    remain internal; no public endpoint or force-kill switch is exposed.
    The live/offline split is per key, not per run: everything
    `chrome.settingsPrivate` recognises is applied live, and `[shortcuts]`
-   is applied live independently of it, before anything is refused. Three
-   things and only those fall back to a normal close, verified offline
-   apply, and relaunch: the keys the browser does not recognise, the
-   removals (there is no single-pref reset), and -- as a block, named by
-   the marker `shortcuts` -- the whole `[shortcuts]` table when its own
-   preflight reports the commands bundle unusable.
+   is applied live independently of it, before anything is refused. A
+   removal itself applies live too, as `setPref` of the value the settings
+   sidecar recorded before dotbrave first managed the key (see invariant
+   2) -- resolved before the preflight so the written-back value is probed
+   like any other key. Three things and only those fall back to a normal
+   close, verified offline apply, and relaunch: the keys the browser does
+   not recognise, removals with no recorded prior value to write back
+   (`chrome.settingsPrivate` has no single-pref reset, and a key never set
+   before dotbrave touched it has no default to restore), and -- as a
+   block, named by the marker `shortcuts` -- the whole `[shortcuts]` table
+   when its own preflight reports the commands bundle unusable.
    `LiveApplyUnsupported` names exactly that remainder.
    One unknown key must never drag the keys that would have worked -- or
    `[shortcuts]`, which has nothing to do with it -- offline with it. So

@@ -198,6 +198,17 @@ def _get_prior_values(prefs_path: Path) -> dict:
     return prior if isinstance(prior, dict) else {}
 
 
+def get_prior_values(prefs_path: Path) -> dict:
+    """Public accessor for the settings sidecar's ``prior_values``.
+
+    Browser-specific live-apply adapters (e.g. ``dotbrave.live``) need this
+    to resolve a removal into a ``setPref`` write; they live outside this
+    module and must not reach into a private, underscore-prefixed name to
+    get it.
+    """
+    return _get_prior_values(prefs_path)
+
+
 def _capture_prior_values(prefs: dict, keys: set[str]) -> dict:
     """Read each key's current value out of `prefs`, before this apply writes it.
 

@@ -492,6 +492,71 @@ def test_removal_only_diff_never_opens_a_work_tab(
     assert fake.navigations == []
 
 
+def test_removal_with_a_recorded_prior_value_applies_live(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from dotbrave._base.utils import Plan
+    from dotbrave import live
+
+    prefs_path = tmp_path / "Default" / "Preferences"
+    prefs_path.parent.mkdir()
+    prefs = {"brave": {"location_bar_is_wide": True}}
+    prefs_path.write_text(json.dumps(prefs))
+    prefs_path.with_name("Preferences.dotbrave.settings.json").write_text(json.dumps({
+        "managed_keys": ["brave.location_bar_is_wide"],
+        "prior_values": {"brave.location_bar_is_wide": {"present": True, "value": False}},
+    }))
+
+    def apply_fn(target: dict) -> None:
+        del target["brave"]["location_bar_is_wide"]   # dropped from config
+
+    plan = Plan(namespace="settings", diff_lines=["removed"],
+                apply_fn=apply_fn, verify_fn=lambda _p: None,
+                state_path=prefs_path.with_name("Preferences.dotbrave.settings.json"),
+                state_payload={"managed_keys": [], "prior_values": {}})
+
+    fake = FakeCdpClient(9333, evaluation_results=[[]])
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake)
+
+    live.apply_live(9333, prefs_path, prefs, [plan])   # must NOT raise
+
+    assert any("brave.location_bar_is_wide" in e and "false" in e and "setPref" in e
+               for e in fake.evaluations)
+
+
+def test_removal_without_a_usable_prior_value_still_goes_offline(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """present: false means we never learned the default, so there is
+    nothing to write and the key has to be deleted offline."""
+    import pytest
+    from dotbrave._base import live_apply as shared_live
+    from dotbrave._base.utils import Plan
+    from dotbrave import live
+
+    prefs_path = tmp_path / "Default" / "Preferences"
+    prefs_path.parent.mkdir()
+    prefs = {"brave": {"location_bar_is_wide": True}}
+    prefs_path.write_text(json.dumps(prefs))
+    prefs_path.with_name("Preferences.dotbrave.settings.json").write_text(json.dumps({
+        "managed_keys": ["brave.location_bar_is_wide"],
+        "prior_values": {"brave.location_bar_is_wide": {"present": False, "value": None}},
+    }))
+
+    def apply_fn(target: dict) -> None:
+        del target["brave"]["location_bar_is_wide"]
+
+    plan = Plan(namespace="settings", diff_lines=["removed"],
+                apply_fn=apply_fn, verify_fn=lambda _p: None)
+
+    fake = FakeCdpClient(9333, evaluation_results=[[]])
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake)
+
+    with pytest.raises(shared_live.LiveApplyUnsupported) as excinfo:
+        live.apply_live(9333, prefs_path, prefs, [plan])
+    assert excinfo.value.keys == ["brave.location_bar_is_wide"]
+
+
 def test_settings_remainder_does_not_block_the_shortcut_script(
     tmp_path: Path, monkeypatch
 ) -> None:
