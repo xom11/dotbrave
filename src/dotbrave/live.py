@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ from dotbrave import shortcuts as shortcuts_mod
 _SETTINGS_URL = "chrome://settings/appearance"
 _SHORTCUTS_URL = "chrome://settings/system/shortcuts"
 _NEWTAB_URL = "chrome://newtab/"
+_VERSION_URL = "chrome://version/"
 _NEWTAB_ACTIONS = {
     "ntp.shortcust_visible": ("topSites", "setShowTopSites"),
     "brave.brave_search.show-ntp-search": ("search", "setShowSearchBox"),
@@ -75,6 +77,99 @@ def _await_page(client: CdpClient, target: dict, timeout: float = 10.0) -> None:
         if client.evaluate(target, _READY_EXPR) is True:
             return
         time.sleep(0.1)
+
+
+# chrome://version renders the loaded profile's own directory. Upstream
+# pins the element id in two places that must agree, so a rename would
+# break Chromium's own page:
+#
+#   components/webui/version/resources/about_version.html
+#     <td class="version" id="profile_path">$i18n{profile_path}</td>
+#   components/webui/version/resources/about_version.ts
+#     getRequiredElement('profile_path').textContent = profilePath;
+#
+# Brave ships no patch for either file (its only about_version patch is
+# the .css one), so the id holds on Brave too.
+#
+# The value is *not* in the initial markup: about_version.ts fills it from
+# a `requestPathInfo` round-trip to the browser process, so readyState
+# being 'complete' does not mean it has arrived -- poll for it, the way
+# the NTP preflight polls for its store.  Returning '' when it never
+# arrives is deliberate: the caller fails closed on an empty answer.
+_PROFILE_PATH_SCRIPT = (
+    "(async () => {"
+    "const read = () => {"
+    "const el = document.getElementById('profile_path');"
+    "return el ? (el.textContent || '').trim() : '';"
+    "};"
+    "let value = read();"
+    "for (let attempt = 0; attempt < 40 && !value; attempt++) {"
+    "await new Promise(r => setTimeout(r, 50));"
+    "value = read();"
+    "}"
+    "return value;"
+    "})()"
+)
+
+
+def _same_profile_dir(seen: str, expected: Path) -> bool:
+    """Compare two profile directories as paths, not as strings.
+
+    ``chrome://version`` prints ``profile_path.LossyDisplayName()`` -- the
+    path Brave was handed, not an absolutised one -- so it can differ from
+    ours by a trailing separator or by a symlinked ``--user-data-dir``
+    while naming the same directory.  ``resolve()`` settles both; a path
+    the OS refuses to resolve is simply not a match (fail closed).
+    """
+    try:
+        a = os.path.normcase(str(Path(seen).resolve()))
+        b = os.path.normcase(str(Path(expected).resolve()))
+    except (OSError, ValueError, RuntimeError):
+        return False
+    return a == b
+
+
+def _confirm_profile(
+    client: CdpClient, target: dict, profile_dir: Path, profile: str,
+) -> None:
+    """Refuse to write through a work tab that is not this run's profile.
+
+    ``PUT /json/new`` carries no profile hint: upstream builds the new
+    target's ``NavigateParams`` with ``ProfileManager::GetLastUsedProfile()``
+    (chrome/browser/devtools/chrome_devtools_manager_delegate.cc), so the
+    work tab lands in the browser's *last-used* profile while everything
+    else in the run -- the diff, the backup, the sidecars, ``verify_fn`` --
+    is bound to the profile the user asked for.  Endpoint discovery does
+    not cover this: only the ``.dotbrave.live.json`` sidecar is
+    profile-aware, and both fallbacks (``DevToolsActivePort`` and the
+    running command line) are profile-blind.  The reused-page fallback in
+    ``_worker_target`` is likelier still to be another profile's tab.
+
+    An unconfirmed profile is treated exactly like a mismatch, and both
+    degrade the run to the existing close -> offline apply -> relaunch.
+    That trades a visible close/relaunch (should the id ever move) for the
+    silent cross-profile write this check exists to remove.
+    """
+    client.navigate(target, _VERSION_URL)
+    _await_page(client, target)
+    seen = client.evaluate(target, _PROFILE_PATH_SCRIPT)
+    if not isinstance(seen, str) or not seen.strip():
+        raise _live.LiveApplyUnsupported(
+            "Brave",
+            [
+                f"cannot confirm the live work tab belongs to profile "
+                f"{profile!r} ({profile_dir})"
+            ],
+        )
+    seen = seen.strip()
+    if not _same_profile_dir(seen, profile_dir):
+        raise _live.LiveApplyUnsupported(
+            "Brave",
+            [
+                f"the live work tab is in {seen}, not profile "
+                f"{profile!r} ({profile_dir})"
+            ],
+        )
 
 
 def _is_shortcut_path(parts: tuple[str, ...]) -> bool:
@@ -363,7 +458,10 @@ def apply_live(
     plans: list[Plan],
     *,
     unattended: bool = False,
+    profile: str | None = None,
 ) -> None:
+    profile_dir = prefs_path.parent
+    profile_name = profile or profile_dir.name
     target_prefs = _live.compute_target_prefs(prefs, plans)
     changes, removals = _setting_changes(prefs, target_prefs)
     newtab_changes, ordinary_changes = _route_settings(changes)
@@ -387,6 +485,10 @@ def apply_live(
     backup_taken = False
     try:
         target, created = _worker_target(client)
+        # Before the preflight, before the backup, before anything is
+        # mutated: prove this tab is the profile the rest of the run is
+        # bound to.  Inside the try, so the `finally` still closes it.
+        _confirm_profile(client, target, profile_dir, profile_name)
         unsupported = _preflight_settings(
             client, target, newtab_changes, ordinary_changes
         )

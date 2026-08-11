@@ -11,7 +11,19 @@ from dotbrave import live
 
 
 class FakeCdpClient:
-    def __init__(self, port: int, evaluation_results: list[object] | None = None):
+    #: What ``chrome://version`` reports as the work tab's own profile
+    #: path.  ``None`` means the probe reads nothing back, which live
+    #: apply treats as "unconfirmed" and refuses.  Tests that are not
+    #: about the profile probe inherit the matching value that the
+    #: autouse fixture below installs on the class.
+    profile_path: str | None = None
+
+    def __init__(
+        self,
+        port: int,
+        evaluation_results: list[object] | None = None,
+        profile_path: str | None = None,
+    ):
         self.port = port
         self.targets = [{"type": "page", "url": "chrome://newtab/"}]
         self.navigations: list[str] = []
@@ -20,6 +32,8 @@ class FakeCdpClient:
         self.created: list[dict] = []
         self.closed: list[dict] = []
         self.refuse_create = False
+        if profile_path is not None:
+            self.profile_path = profile_path
 
     def list_targets(self) -> list[dict]:
         return self.targets
@@ -48,7 +62,25 @@ class FakeCdpClient:
             # follows -- production polls this in a loop, and tests
             # should not have to script a value for every poll.
             return True
+        if "getElementById('profile_path')" in expression:
+            # Same reasoning for the chrome://version profile probe: it
+            # runs on every live apply, so answering it here keeps every
+            # other test's `evaluation_results` about what it is testing.
+            return self.profile_path
         return next(self.evaluation_results, [])
+
+
+@pytest.fixture(autouse=True)
+def _work_tab_profile(monkeypatch, tmp_path: Path):
+    """Make the fake endpoint's ``chrome://version`` answer match.
+
+    Every test in this module drives ``<tmp_path>/Default/Preferences``,
+    so report that as the work tab's profile path.  The probe in
+    ``live.apply_live`` still runs for real in each of them -- this only
+    stops a check about *which* profile the tab belongs to from failing
+    tests that are about something else.
+    """
+    monkeypatch.setattr(FakeCdpClient, "profile_path", str(tmp_path / "Default"))
 
 
 def test_brave_live_apply_uses_settings_private_and_commands_service(

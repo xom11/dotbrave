@@ -434,3 +434,37 @@ def test_changed_leaf_paths_expands_new_nested_dicts() -> None:
     assert live_apply.changed_leaf_paths(before, after) == [
         (("brave", "tabs", "vertical_tabs_enabled"), True)
     ]
+
+
+def test_live_adapter_is_told_which_profile_the_run_is_bound_to(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The DevTools endpoint is profile-blind -- the tab it hands back
+    belongs to whichever profile the browser used last.  The adapter can
+    only confirm that tab if the orchestrator tells it what to confirm it
+    against, so `--profile` has to reach it."""
+    profile_root = tmp_path
+    (profile_root / "Profile 2").mkdir()
+    (profile_root / "Profile 2" / "Preferences").write_text(
+        json.dumps({"foo": {"bar": 0}})
+    )
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("[settings]\nfoo.bar = 1\n")
+
+    monkeypatch.setattr(orch, "find_devtools_port", lambda _root, _p: 9555)
+    monkeypatch.setattr(orch, "remember_devtools_port", lambda *a, **k: None)
+
+    seen: list[object] = []
+    orch.cmd_apply(
+        _args(profile_root, cfg, profile="Profile 2"),
+        display_name="Brave",
+        running_fn=lambda: True,
+        find_cmdline_fn=lambda: ["brave"],
+        restart_fn=lambda _cmd: [],
+        build_plans_fn=_build_plan,
+        live_apply_fn=lambda *_a, profile=None, **_kw: seen.append(profile),
+        graceful_close_fn=lambda: None,
+        launch_live_fn=lambda *_a, **_kw: [],
+    )
+
+    assert seen == ["Profile 2"]

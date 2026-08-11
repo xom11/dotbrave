@@ -193,7 +193,7 @@ def test_unattended_flag_reaches_the_live_adapter(
         build_plans_fn=lambda p, prefs, doc, **kw: [
             _plan("settings", empty=False, external=False)
         ],
-        live_apply_fn=lambda *a, unattended=None: seen.append(unattended),
+        live_apply_fn=lambda *a, unattended=None, **kw: seen.append(unattended),
         graceful_close_fn=lambda: None,
         launch_live_fn=lambda *a: [],
     )

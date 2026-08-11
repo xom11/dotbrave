@@ -503,7 +503,16 @@ def cmd_apply(
             live_port = int(live_port)
             try:
                 live_apply_fn(
-                    live_port, prefs_path, prefs, plans, unattended=unattended
+                    live_port,
+                    prefs_path,
+                    prefs,
+                    plans,
+                    unattended=unattended,
+                    # Which profile this run is bound to.  The adapter
+                    # drives a work tab the endpoint hands it, and the
+                    # endpoint is profile-blind -- so it needs to be told
+                    # what to confirm the tab against.
+                    profile=args.profile,
                 )
             except LiveApplyUnsupported as e:
                 settings = "\n".join(f"  {key}" for key in e.keys)

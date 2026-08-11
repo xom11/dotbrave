@@ -11,6 +11,9 @@ it belongs to.
 from __future__ import annotations
 
 import importlib
+import json
+import os
+from pathlib import Path
 
 import pytest
 
@@ -195,3 +198,173 @@ def test_scope_combines_with_channel_filter(monkeypatch) -> None:
     proc = _make_proc(bp, linux_pid_filter="/opt/brave.com/brave-beta/")
     proc.scope_to_profile(OTHER_ROOT, default_user_data_dir=DEFAULT_ROOT)
     assert proc.pids() == ["100"]
+
+
+# --------------------------------------------------------------------------
+# Live apply's work tab must belong to the profile the run is bound to.
+#
+# `CdpClient.create_page` issues `PUT /json/new`, which carries no profile
+# hint: upstream builds the new target's NavigateParams with
+# `ProfileManager::GetLastUsedProfile()`
+# (chrome/browser/devtools/chrome_devtools_manager_delegate.cc), so the work
+# tab lands in the browser's *last-used* profile while the diff, the backup,
+# the sidecars and verify_fn are all bound to `args.profile`.  Endpoint
+# discovery does not save us either: only the `.dotbrave.live.json` sidecar
+# is profile-aware, and both fallbacks (`DevToolsActivePort` and the running
+# command line) are profile-blind.  So confirm the tab's own profile before
+# writing through it, and refuse when it cannot be confirmed -- a visible
+# close/relaunch beats a silent cross-profile write.
+# --------------------------------------------------------------------------
+
+
+def _live_run(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    profile: str,
+    seen: str | None,
+    refuse_create: bool = False,
+):
+    """Wire `live.apply_live` against `<tmp_path>/<profile>/Preferences`.
+
+    `seen` is what the fake endpoint's `chrome://version` reports as the
+    work tab's own profile path.
+    """
+    from tests.test_brave_live import FakeCdpClient
+    from dotbrave._base.utils import Plan
+    from dotbrave import live
+
+    prefs_path = tmp_path / profile / "Preferences"
+    prefs_path.parent.mkdir(parents=True)
+    prefs = {"brave": {"location_bar_is_wide": False}}
+    prefs_path.write_text(json.dumps(prefs))
+
+    fake = FakeCdpClient(9333, evaluation_results=[[]], profile_path=seen)
+    fake.refuse_create = refuse_create
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake)
+
+    plan = Plan(
+        namespace="settings",
+        diff_lines=["changed"],
+        apply_fn=lambda t: t["brave"].__setitem__("location_bar_is_wide", True),
+        verify_fn=lambda _p: None,
+        state_path=prefs_path.with_name("Preferences.dotbrave.settings.json"),
+        state_payload={"managed_keys": ["brave.location_bar_is_wide"]},
+    )
+    return live, fake, prefs_path, prefs, plan
+
+
+def test_live_apply_proceeds_when_the_work_tab_is_the_target_profile(
+    tmp_path: Path, monkeypatch
+) -> None:
+    live, fake, prefs_path, prefs, plan = _live_run(
+        tmp_path, monkeypatch,
+        profile="Profile 2", seen=str(tmp_path / "Profile 2"),
+    )
+
+    live.apply_live(9333, prefs_path, prefs, [plan], profile="Profile 2")
+
+    assert any("chrome://version" in url for url in fake.navigations)
+    assert any(
+        "brave.location_bar_is_wide" in e and "setPref" in e
+        for e in fake.evaluations
+    )
+    assert plan.state_path.exists()
+
+
+def test_live_apply_refuses_a_work_tab_from_the_wrong_profile(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The bug this exists to remove: the tab is in `Default`, the run is
+    bound to `Profile 2`.  Nothing may be written through it."""
+    from dotbrave._base import live_apply as shared_live
+
+    live, fake, prefs_path, prefs, plan = _live_run(
+        tmp_path, monkeypatch,
+        profile="Profile 2", seen=str(tmp_path / "Default"),
+    )
+
+    with pytest.raises(shared_live.LiveApplyUnsupported) as excinfo:
+        live.apply_live(9333, prefs_path, prefs, [plan], profile="Profile 2")
+
+    # Named, so the fallback's report says which profile went unconfirmed.
+    assert any("Profile 2" in key for key in excinfo.value.keys)
+    # Nothing was pushed, in either profile.
+    assert not any("setPref(" in e for e in fake.evaluations)
+    assert not plan.state_path.exists()
+    # The check precedes the backup, so an unconfirmed profile leaves none
+    # behind and the offline path keeps its own (backup_taken stays False).
+    assert list(prefs_path.parent.glob("Preferences.bak.*")) == []
+    assert excinfo.value.backup_taken is False
+    # The tab we opened is still cleaned up.
+    assert fake.closed == fake.created != []
+
+
+@pytest.mark.parametrize("seen", ["", "   ", None])
+def test_live_apply_refuses_when_the_work_tab_profile_is_unreadable(
+    tmp_path: Path, monkeypatch, seen
+) -> None:
+    """Element missing, empty text, or a non-string result: all mean the
+    profile is unconfirmed, which fails closed exactly like a mismatch."""
+    from dotbrave._base import live_apply as shared_live
+
+    live, fake, prefs_path, prefs, plan = _live_run(
+        tmp_path, monkeypatch, profile="Profile 2", seen=seen,
+    )
+
+    with pytest.raises(shared_live.LiveApplyUnsupported) as excinfo:
+        live.apply_live(9333, prefs_path, prefs, [plan], profile="Profile 2")
+
+    assert any("Profile 2" in key for key in excinfo.value.keys)
+    assert not any("setPref(" in e for e in fake.evaluations)
+    assert not plan.state_path.exists()
+    assert list(prefs_path.parent.glob("Preferences.bak.*")) == []
+    assert excinfo.value.backup_taken is False
+
+
+def test_live_apply_confirms_the_profile_of_a_reused_page_too(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """`_worker_target` falls back to an existing page when the endpoint
+    refuses /json/new.  That tab is even more likely to belong to another
+    profile -- and we never close it -- so it needs the same check."""
+    from dotbrave._base import live_apply as shared_live
+
+    live, fake, prefs_path, prefs, plan = _live_run(
+        tmp_path, monkeypatch,
+        profile="Profile 2", seen=str(tmp_path / "Default"),
+        refuse_create=True,
+    )
+
+    with pytest.raises(shared_live.LiveApplyUnsupported) as excinfo:
+        live.apply_live(9333, prefs_path, prefs, [plan], profile="Profile 2")
+
+    assert any("Profile 2" in key for key in excinfo.value.keys)
+    assert fake.created == []          # the fallback reused a user tab...
+    assert fake.closed == []           # ...and we must not close it
+    assert not any("setPref(" in e for e in fake.evaluations)
+    assert list(prefs_path.parent.glob("Preferences.bak.*")) == []
+
+
+def test_live_apply_tolerates_a_trailing_separator_and_a_symlinked_root(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """chrome://version prints `profile_path.LossyDisplayName()` -- the
+    path Brave was *given*, not an absolutised one -- so compare resolved
+    paths, not strings."""
+    root = tmp_path / "real"
+    root.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(root, target_is_directory=True)
+
+    live, fake, prefs_path, prefs, plan = _live_run(
+        root, monkeypatch,
+        profile="Profile 2", seen=str(link / "Profile 2") + os.sep,
+    )
+
+    live.apply_live(9333, prefs_path, prefs, [plan], profile="Profile 2")
+
+    assert any(
+        "brave.location_bar_is_wide" in e and "setPref" in e
+        for e in fake.evaluations
+    )
