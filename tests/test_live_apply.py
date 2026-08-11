@@ -400,13 +400,25 @@ def test_offline_fallback_does_not_discard_what_the_browser_flushed_on_close(
     assert final["foo"]["bar"] == 1, "the requested change was not applied"
 
 
-def test_live_setting_removal_signals_offline_fallback() -> None:
-    with pytest.raises(live_apply.LiveApplyUnsupported) as exc:
-        live_apply.refuse_live_removals(
-            "Chrome", [(("foo", "bar"), live_apply.MISSING)]
-        )
+def test_live_setting_removal_is_split_out_not_refused() -> None:
+    """A removal has no single-pref reset, so it goes offline -- but on its
+    own.  Refusing the whole batch dragged every applicable key with it."""
+    applicable, removals = live_apply.split_removals(
+        [
+            (("foo", "bar"), live_apply.MISSING),
+            (("foo", "baz"), 1),
+        ]
+    )
 
-    assert exc.value.keys == ["foo.bar"]
+    assert applicable == [(("foo", "baz"), 1)]
+    assert removals == ["foo.bar"]
+
+
+def test_split_removals_reports_nothing_when_there_is_nothing_to_remove() -> None:
+    assert live_apply.split_removals([(("foo", "baz"), 1)]) == (
+        [(("foo", "baz"), 1)],
+        [],
+    )
 
 
 def test_changed_leaf_paths_expands_new_nested_dicts() -> None:

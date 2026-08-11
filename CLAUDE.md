@@ -67,7 +67,11 @@ Preserve these contracts unless a change explicitly redesigns them:
 
 1. `apply` uses module `Plan` objects and one orchestrated cycle. Validate
    all selected namespaces before committing profile changes; create at most
-   one Preferences backup per offline apply.
+   one Preferences backup per offline apply. A live apply takes its backup
+   only when the run finishes live -- that is, only when the per-key split
+   of invariant 5 leaves no offline remainder. A split run therefore takes
+   exactly one backup, the offline path's. Backing up before the live half
+   as well would make two.
    When an apply closes the browser, it must re-read `Preferences` before
    mutating and committing: the close flushes the browser's own in-memory
    copy over the file, and writing the snapshot taken before the close
@@ -105,8 +109,17 @@ Preserve these contracts unless a change explicitly redesigns them:
    instrument: a line in it means the pin failed that boot.
 5. Plain `apply` manages live apply. Endpoints bind to `127.0.0.1` and
    remain internal; no public endpoint or force-kill switch is exposed.
-   Unsupported live settings and removals fall back to a normal close,
-   verified offline apply, and relaunch. Every close captures the running
+   The live/offline split is per key, not per run: everything
+   `chrome.settingsPrivate` recognises is applied live, and `[shortcuts]`
+   is applied live independently of it, before anything is refused. Only
+   the keys the browser does not recognise and the removals (there is no
+   single-pref reset) fall back to a normal close, verified offline apply,
+   and relaunch, and `LiveApplyUnsupported` names exactly that remainder.
+   One unknown key must never drag the keys that would have worked -- or
+   `[shortcuts]`, which has nothing to do with it -- offline with it. So
+   the shortcut script runs before the raise, and state files stay
+   unwritten whenever a remainder exists: the offline apply writes them
+   for the whole plan. Every close captures the running
    command line *first* (`find_cmdline_fn`) and the relaunch forwards its
    flags: rebuilding the command line from scratch drops whatever the
    session needed to start at all, and a Brave launched with

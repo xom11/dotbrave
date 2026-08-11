@@ -518,9 +518,9 @@ def cmd_apply(
                         f"{settings}"
                     )
                 print(
-                    f"{display_name} cannot apply every requested setting "
-                    "live; closing it normally for offline apply "
-                    "(no force-kill)."
+                    f"{display_name} applied everything it could live; "
+                    f"closing it normally to finish these offline "
+                    f"(no force-kill):"
                 )
                 print(settings)
                 graceful_close_fn()
@@ -845,7 +845,9 @@ def register_actions(
     table_list = " ".join(f"[{namespace}]" for namespace in namespaces)
     execution_text = (
         "Live apply is attempted when the browser is running; plain `apply`\n"
-        "manages a local endpoint and normal-close fallback automatically."
+        "manages a local endpoint and normal-close fallback automatically.\n"
+        "The fallback is per key: what has a live route is applied live, and\n"
+        "only the rest is named and finished offline."
     )
     apply_execution_text = execution_text.replace("\n", "\n  ")
 

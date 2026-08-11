@@ -279,8 +279,11 @@ a private loopback DevTools endpoint: ordinary settings go through
 `chrome.settingsPrivate`, New Tab settings through live New Tab UI
 actions, and shortcuts through the Settings `CommandsService`. Supported
 changes take effect without restarting. A Brave not yet carrying the
-endpoint closes normally and relaunches once; a setting without a live
-route falls back to the same normal-close + verified offline write. Any
+endpoint closes normally and relaunches once. The fallback is per key,
+not per run: everything with a live route is applied first, and only the
+settings Brave does not recognise — plus any key you removed from the
+config, which has no live reset — fall back to the same normal-close +
+verified offline write, which then names exactly those keys. Any
 such relaunch reuses the flags the closed session was running with, so a
 Brave started as `brave-browser --ozone-platform=wayland` comes back the
 same way. If the relaunch still fails to come up, dotbrave reopens Brave

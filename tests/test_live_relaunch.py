@@ -212,6 +212,52 @@ def test_failed_relaunch_after_apply_reopens_browser_and_succeeds(
     assert restarted == [ORIGINAL_CMDLINE], "phải mở lại Brave bằng cờ gốc"
 
 
+# --------------------------------------------------------------------------
+# 3. Split apply: nửa live đã chạy rồi, phần còn lại mới đi offline
+# --------------------------------------------------------------------------
+
+
+def test_split_apply_names_only_the_remainder_and_backs_up_once(
+    prefs_root, tmp_path, monkeypatch, capsys
+):
+    """Live apply giờ chia theo từng key: nửa làm được đã áp xong trước khi
+    ném. Thông báo phải nói đúng như vậy và chỉ liệt kê phần còn lại; cả
+    lượt chạy vẫn chỉ được tạo đúng MỘT bản backup (invariant 1)."""
+    monkeypatch.setattr(orchestrator, "find_devtools_port", lambda r, p: 9555)
+    monkeypatch.setattr(
+        orchestrator, "wait_for_devtools_endpoint", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        orchestrator, "remember_devtools_port", lambda *a, **k: None
+    )
+
+    def _live_apply(port, prefs_path, prefs, plans):
+        # A split run: the live half landed, and precisely because it did
+        # the live path took no backup -- the offline half takes the one.
+        raise orchestrator.LiveApplyUnsupported(
+            browser_name="Brave", keys=["brave.tabs.vertical_tabs_collapsed"]
+        )
+
+    orchestrator.cmd_apply(
+        _args(prefs_root, _config(tmp_path)),
+        display_name="Brave",
+        running_fn=lambda: True,
+        find_cmdline_fn=lambda: ORIGINAL_CMDLINE,
+        restart_fn=lambda c: c,
+        build_plans_fn=lambda p, prefs, doc, **kw: [_settings_plan()],
+        live_apply_fn=_live_apply,
+        graceful_close_fn=lambda: None,
+        launch_live_fn=lambda *a, **k: ["brave-browser"],
+    )
+
+    out = capsys.readouterr().out
+    assert "applied everything it could live" in out
+    assert "cannot apply every requested setting" not in out
+    assert "brave.tabs.vertical_tabs_collapsed" in out
+    backups = list((prefs_root / "Default").glob("Preferences.bak.*"))
+    assert len(backups) == 1, f"invariant 1: one backup per apply, got {backups}"
+
+
 def test_failed_relaunch_before_apply_reopens_browser_then_fails(
     prefs_root, tmp_path, monkeypatch
 ):

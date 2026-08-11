@@ -164,9 +164,12 @@ def test_brave_live_routes_new_tab_settings_through_new_tab_actions(
     assert not any("chrome.settingsPrivate.setPref" in expr for expr in fake.evaluations)
 
 
-def test_brave_live_preflight_rejects_unknown_settings_before_mutation(
+def test_brave_live_preflight_names_unknown_settings_as_the_remainder(
     tmp_path: Path, monkeypatch
 ) -> None:
+    """When the unknown key is the *whole* diff the remainder is the whole
+    diff too: nothing is pushed through setPref, nothing is backed up, and
+    the key is named so the offline path can report it."""
     prefs_path = tmp_path / "Default" / "Preferences"
     prefs_path.parent.mkdir()
     prefs = {"brave": {"tabs": {"vertical_tabs_collapsed": False}}}
@@ -186,12 +189,195 @@ def test_brave_live_preflight_rejects_unknown_settings_before_mutation(
     )
     monkeypatch.setattr(live, "CdpClient", lambda port: fake)
 
-    with pytest.raises(shared_live.LiveApplyUnsupported):
+    with pytest.raises(shared_live.LiveApplyUnsupported) as excinfo:
         live.apply_live(9333, prefs_path, prefs, [plan])
 
+    assert excinfo.value.keys == ["brave.tabs.vertical_tabs_collapsed"]
     assert any("chrome.settingsPrivate.getPref" in expr for expr in fake.evaluations)
     assert not any("chrome.settingsPrivate.setPref" in expr for expr in fake.evaluations)
     assert list(prefs_path.parent.glob("Preferences.bak.*")) == []
+
+
+def _split_prefs(prefs_path: Path) -> tuple[dict, str]:
+    """A profile whose apply touches one unsupported key, one supported
+    key and one shortcut -- the three halves a split run has to separate."""
+    from dotbrave.command_ids import NAME_TO_ID
+
+    new_tab = str(NAME_TO_ID["new_tab"])
+    prefs = {
+        "brave": {
+            "tabs": {"vertical_tabs_collapsed": False},
+            "location_bar_is_wide": False,
+            "accelerators": {new_tab: ["Control+KeyT"]},
+            "default_accelerators": {new_tab: ["Control+KeyT"]},
+        }
+    }
+    prefs_path.write_text(json.dumps(prefs))
+    return prefs, new_tab
+
+
+def _split_plan(prefs_path: Path, new_tab: str) -> Plan:
+    def apply_fn(target: dict) -> None:
+        target["brave"]["tabs"]["vertical_tabs_collapsed"] = True  # unsupported
+        target["brave"]["location_bar_is_wide"] = True  # supported
+        target["brave"]["accelerators"][new_tab] = ["Control+Shift+KeyY"]
+
+    return Plan(
+        namespace="settings",
+        diff_lines=["changed"],
+        apply_fn=apply_fn,
+        verify_fn=lambda _prefs: None,
+        state_path=prefs_path.with_name("Preferences.dotbrave.settings.json"),
+        state_payload={"managed_keys": ["brave.location_bar_is_wide"]},
+    )
+
+
+def test_one_unsupported_key_no_longer_drags_the_whole_run_offline(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A key settingsPrivate does not know is the *only* thing that goes
+    offline: the supported key and the independent [shortcuts] table are
+    applied live first."""
+    prefs_path = tmp_path / "Default" / "Preferences"
+    prefs_path.parent.mkdir()
+    prefs, new_tab = _split_prefs(prefs_path)
+    plan = _split_plan(prefs_path, new_tab)
+
+    # settings preflight reports only the vertical-tabs key as unsupported;
+    # the shortcuts preflight that follows returns the default [].
+    fake = FakeCdpClient(
+        9333, evaluation_results=[["brave.tabs.vertical_tabs_collapsed"]]
+    )
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake)
+
+    with pytest.raises(shared_live.LiveApplyUnsupported) as excinfo:
+        live.apply_live(9333, prefs_path, prefs, [plan])
+
+    # the remainder is named, and only the remainder
+    assert excinfo.value.keys == ["brave.tabs.vertical_tabs_collapsed"]
+    # ...but the supported key and the shortcut were applied live first
+    assert any(
+        "brave.location_bar_is_wide" in e and "setPref" in e
+        for e in fake.evaluations
+    )
+    assert any("assignAccelerator" in e for e in fake.evaluations)
+    # and the unsupported key was never pushed through settingsPrivate
+    assert not any(
+        "vertical_tabs_collapsed" in e and "setPref" in e
+        for e in fake.evaluations
+    )
+
+
+def test_split_run_takes_no_live_backup(tmp_path: Path, monkeypatch) -> None:
+    """The orchestrator backs up for the offline remainder; a second
+    backup here would violate invariant 1.  State files stay unwritten
+    for the same reason: the offline apply writes them for every plan."""
+    prefs_path = tmp_path / "Default" / "Preferences"
+    prefs_path.parent.mkdir()
+    prefs, new_tab = _split_prefs(prefs_path)
+    plan = _split_plan(prefs_path, new_tab)
+
+    fake = FakeCdpClient(
+        9333, evaluation_results=[["brave.tabs.vertical_tabs_collapsed"]]
+    )
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake)
+
+    with pytest.raises(shared_live.LiveApplyUnsupported):
+        live.apply_live(9333, prefs_path, prefs, [plan])
+
+    # This is a split run, not an early refusal: the live half really ran.
+    assert any(
+        "brave.location_bar_is_wide" in e and "setPref" in e
+        for e in fake.evaluations
+    )
+    backups = list(prefs_path.parent.glob("Preferences.bak.*"))
+    assert backups == [], f"live path took a backup during a split run: {backups}"
+    assert not plan.state_path.exists(), "state file claims a plan not fully applied"
+
+
+def test_removal_goes_offline_alone_while_the_rest_applies_live(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """settingsPrivate has no single-pref reset, so a dropped key must go
+    offline -- but it must take nothing else with it."""
+    prefs_path = tmp_path / "Default" / "Preferences"
+    prefs_path.parent.mkdir()
+    prefs = {
+        "brave": {
+            "location_bar_is_wide": False,
+            "tabs": {"vertical_tabs_enabled": False},
+        }
+    }
+    prefs_path.write_text(json.dumps(prefs))
+
+    def apply_fn(target: dict) -> None:
+        target["brave"]["location_bar_is_wide"] = True
+        del target["brave"]["tabs"]["vertical_tabs_enabled"]
+
+    plan = Plan(
+        namespace="settings",
+        diff_lines=["changed"],
+        apply_fn=apply_fn,
+        verify_fn=lambda _prefs: None,
+    )
+    fake = FakeCdpClient(9333)  # preflight reports nothing unsupported
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake)
+
+    with pytest.raises(shared_live.LiveApplyUnsupported) as excinfo:
+        live.apply_live(9333, prefs_path, prefs, [plan])
+
+    assert excinfo.value.keys == ["brave.tabs.vertical_tabs_enabled"]
+    assert any(
+        "brave.location_bar_is_wide" in e and "setPref" in e
+        for e in fake.evaluations
+    )
+    assert list(prefs_path.parent.glob("Preferences.bak.*")) == []
+
+
+def test_settings_remainder_does_not_block_the_shortcut_script(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Ordering guard: the shortcut script must run *before* the raise."""
+    prefs_path = tmp_path / "Default" / "Preferences"
+    prefs_path.parent.mkdir()
+    prefs, new_tab = _split_prefs(prefs_path)
+    plan = _split_plan(prefs_path, new_tab)
+
+    fake = FakeCdpClient(
+        9333, evaluation_results=[["brave.tabs.vertical_tabs_collapsed"]]
+    )
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake)
+
+    with pytest.raises(shared_live.LiveApplyUnsupported):
+        live.apply_live(9333, prefs_path, prefs, [plan])
+
+    assert "chrome://settings/system/shortcuts" in fake.navigations
+    assert any("commandsCache.assignAccelerator" in e for e in fake.evaluations)
+
+
+def test_broken_shortcuts_bundle_does_not_block_live_settings(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The mirror case: shortcuts go offline, the settings still go live."""
+    prefs_path = tmp_path / "Default" / "Preferences"
+    prefs_path.parent.mkdir()
+    prefs, new_tab = _split_prefs(prefs_path)
+    plan = _split_plan(prefs_path, new_tab)
+
+    # settings preflight: everything supported; shortcuts preflight: broken.
+    fake = FakeCdpClient(9333, evaluation_results=[[], ["shortcuts"]])
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake)
+
+    with pytest.raises(shared_live.LiveApplyUnsupported) as excinfo:
+        live.apply_live(9333, prefs_path, prefs, [plan])
+
+    assert excinfo.value.keys == ["shortcuts"]
+    assert any(
+        "brave.location_bar_is_wide" in e and "setPref" in e
+        for e in fake.evaluations
+    )
+    # the bundle reported itself unusable -- do not drive it anyway
+    assert not any("commandsCache.assignAccelerator" in e for e in fake.evaluations)
 
 
 def _settings_plan(prefs_path: Path) -> Plan:

@@ -88,10 +88,16 @@ def changed_leaf_paths(
     return []
 
 
-def refuse_live_removals(
-    browser_name: str,
+def split_removals(
     changes: list[tuple[tuple[str, ...], Any]],
-) -> None:
+) -> tuple[list[tuple[tuple[str, ...], Any]], list[str]]:
+    """Separate applicable changes from deletions.
+
+    Deleted leaves carry the ``MISSING`` sentinel.  A settings API with no
+    single-pref reset cannot apply them live -- but they are the *only*
+    part of the run that has to go offline, so return them rather than
+    refusing the whole batch.
+    """
+    applicable = [(parts, value) for parts, value in changes if value is not MISSING]
     removals = [".".join(parts) for parts, value in changes if value is MISSING]
-    if removals:
-        raise LiveApplyUnsupported(browser_name, removals)
+    return applicable, removals

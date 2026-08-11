@@ -83,14 +83,20 @@ def _is_shortcut_path(parts: tuple[str, ...]) -> bool:
     }
 
 
-def _setting_changes(before: dict, target: dict) -> list[tuple[str, Any]]:
+def _setting_changes(
+    before: dict, target: dict
+) -> tuple[list[tuple[str, Any]], list[str]]:
+    """Split the settings diff into what live apply can push and what it
+    cannot.  Removals are returned, not refused: ``settingsPrivate`` has
+    no single-pref reset, but that is a fact about those keys alone and
+    must not drag the rest of the run offline with them."""
     changes = [
         (parts, value)
         for parts, value in _live.changed_leaf_paths(before, target)
         if not _is_shortcut_path(parts)
     ]
-    _live.refuse_live_removals("Brave", changes)
-    return [(".".join(parts), value) for parts, value in changes]
+    applicable, removals = _live.split_removals(changes)
+    return [(".".join(parts), value) for parts, value in applicable], removals
 
 
 def _dict_at(prefs: dict, parts: tuple[str, ...]) -> dict[str, list[str]]:
@@ -319,7 +325,7 @@ def _preflight_shortcuts(client: CdpClient, target: dict) -> list[str]:
 
 def apply_live(port: int, prefs_path: Path, prefs: dict, plans: list[Plan]) -> None:
     target_prefs = _live.compute_target_prefs(prefs, plans)
-    changes = _setting_changes(prefs, target_prefs)
+    changes, removals = _setting_changes(prefs, target_prefs)
     newtab_changes, ordinary_changes = _route_settings(changes)
     shortcut_script = _shortcut_script(prefs, target_prefs)
     client = CdpClient(port)
@@ -330,41 +336,64 @@ def apply_live(port: int, prefs_path: Path, prefs: dict, plans: list[Plan]) -> N
         unsupported = _preflight_settings(
             client, target, newtab_changes, ordinary_changes
         )
+        shortcuts_unsupported: list[str] = []
         if shortcut_script is not None:
-            unsupported.extend(_preflight_shortcuts(client, target))
-        if unsupported:
-            raise _live.LiveApplyUnsupported("Brave", unsupported)
+            shortcuts_unsupported = _preflight_shortcuts(client, target)
+
+        # The split is per key, not per run.  One key settingsPrivate does
+        # not know used to send everything offline -- every key that would
+        # have worked, plus the whole [shortcuts] table, which has nothing
+        # to do with it.  Blocked keys are the remainder and only that.
+        blocked = set(unsupported) | set(removals)
+        live_newtab = [c for c in newtab_changes if c[0] not in blocked]
+        live_ordinary = [c for c in ordinary_changes if c[0] not in blocked]
+        remainder = sorted(blocked | set(shortcuts_unsupported))
 
         has_pref_changes = any(
             not plan.empty and plan.namespace in {"settings", "shortcuts"}
             for plan in plans
         )
-        if has_pref_changes:
+        # Only back up when this run finishes here.  A split run falls
+        # through to the offline path, which takes its own backup, and
+        # invariant 1 allows exactly one.
+        if has_pref_changes and not remainder:
             _live.backup_preferences(prefs_path)
 
         _live.apply_external_plans(plans)
 
-        newtab_script = _newtab_script(newtab_changes)
+        newtab_script = _newtab_script(live_newtab)
         if newtab_script is not None:
             client.navigate(target, _NEWTAB_URL)
             _await_page(client, target)
             client.evaluate(target, newtab_script)
 
-        settings_script = _settings_script(ordinary_changes)
+        settings_script = _settings_script(live_ordinary)
         if settings_script is not None:
             client.navigate(target, _SETTINGS_URL)
             _await_page(client, target)
             client.evaluate(target, settings_script)
 
-        if shortcut_script is not None:
+        # [shortcuts] is independent of [settings]: it runs even when some
+        # settings key is headed offline, and is skipped only when its own
+        # preflight found the commands bundle unusable.
+        if shortcut_script is not None and not shortcuts_unsupported:
             client.navigate(target, _SHORTCUTS_URL)
             _await_page(client, target)
             client.evaluate(target, shortcut_script)
 
+        if remainder:
+            # State files stay unwritten: the offline apply that handles
+            # the remainder writes them for the whole plan.
+            raise _live.LiveApplyUnsupported("Brave", remainder)
+
         _live.write_state_files(plans)
     except CdpError as e:
-        # Degrade to the offline path rather than aborting: a backup has
-        # been taken by now, and in a mixed run [pwa] policy is written.
+        # Degrade to the offline path rather than aborting: in a mixed run
+        # [pwa] policy is already written, and the offline apply redoes
+        # every plan idempotently.  (A run with no remainder has taken its
+        # backup by this point, so the offline path's is a second file --
+        # pre-dates the per-key split and is left alone rather than
+        # deleting a backup we already printed.)
         raise _live.LiveApplyUnsupported("Brave", [f"live apply failed: {e}"])
     finally:
         if created:
