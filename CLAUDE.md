@@ -185,6 +185,19 @@ Preserve these contracts unless a change explicitly redesigns them:
    and Linux — so a browser started on a fixed port reads as having no
    endpoint and gets closed for nothing.
 
+   The work tab itself carries no profile guarantee: `PUT /json/new`
+   creates it via upstream's `ChromeDevToolsManagerDelegate::CreateNewTarget`,
+   which resolves `ProfileManager::GetLastUsedProfile()` -- so the tab lands
+   in the browser's *last-used* profile, not necessarily the one this run
+   targets, while everything else in the run (the diff, the backup, the
+   sidecars, `verify_fn`) is bound to `args.profile`. So before any
+   preflight, backup, or mutation touches that tab, live apply navigates it
+   to `chrome://version` and confirms `#profile_path` resolves to
+   `prefs_path.parent`; a mismatch -- or a value that cannot be read at all
+   -- degrades the run to the existing close -> offline apply -> relaunch.
+   The check fails closed on purpose: the alternative is a silent write
+   into the wrong profile that still reports `applied and verified`.
+
    `[pwa]` never touches the
    running browser and is never gated on what else is dirty: the policy
    is written first and directly (no endpoint bootstrap), and Brave
