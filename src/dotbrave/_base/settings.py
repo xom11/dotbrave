@@ -170,6 +170,15 @@ def merge_prior_values(existing: dict, captured: dict) -> dict:
     The recorded value is what a key had before dotbrave ever managed it,
     so a later apply must not overwrite it with dotbrave's own value --
     that would make removal restore dotbrave's setting, not the user's.
+
+    Retention is permanent by design: an entry is never pruned, even once
+    its key falls out of `managed_keys` on a later apply. A key dropped
+    from the config and later re-added keeps its original first-ever
+    entry rather than being recaptured -- `setdefault` below is
+    key-presence based, not value-based, so this holds for a recorded
+    `{"present": False}` marker too, not just a recorded value. The
+    dict is bounded in practice by the number of distinct settings ever
+    configured through dotbrave, not by how many times `apply` has run.
     """
     merged = dict(existing)
     for key, entry in captured.items():
@@ -190,6 +199,17 @@ def _get_prior_values(prefs_path: Path) -> dict:
 
 
 def _capture_prior_values(prefs: dict, keys: set[str]) -> dict:
+    """Read each key's current value out of `prefs`, before this apply writes it.
+
+    Migration corner case: for a key that was already in `managed_keys`
+    before this capture existed (i.e. upgrading dotbrave onto a profile
+    it was already managing), the first post-upgrade capture reads
+    `prefs` as dotbrave itself last left it -- so it records dotbrave's
+    own previously-applied value, not the true pre-dotbrave value. That
+    is not fixable after the fact (the original was never recorded), and
+    is not a bug in `merge_prior_values`'s first-seen-wins semantics --
+    it is simply the earliest value this code was ever able to observe.
+    """
     captured = {}
     for key in keys:
         value = _get_value(prefs, _split_key(key))

@@ -142,6 +142,25 @@ def test_apply_writes_then_drops(
     state = json.loads(sidecar.read_text())
     assert state["managed_keys"] == ["brave.tabs.vertical_tabs_enabled"]
 
+    # Dropping a key from `managed_keys` must not drop its recorded prior
+    # value: Task 10's live removal needs that entry to still be there so
+    # a key can be dropped again later and still have something to write
+    # back. A prune-on-drop implementation (e.g. filtering `prior_values`
+    # down to `target_keys` before writing the sidecar) would delete these
+    # two entries here even though the rest of the suite stays green.
+    assert state["prior_values"]["brave.tabs.vertical_tabs_enabled"] == {
+        "present": True,
+        "value": False,
+    }
+    assert state["prior_values"]["brave.tabs.vertical_tabs_collapsed"] == {
+        "present": True,
+        "value": True,
+    }
+    assert state["prior_values"]["bookmark_bar.show_tab_groups"] == {
+        "present": True,
+        "value": False,
+    }
+
 
 def test_apply_refuses_mac_protected_keys(
     fake_settings_profile_root: Path, tmp_path: Path
@@ -446,13 +465,32 @@ def test_sidecar_records_the_value_a_key_had_before_dotbrave_managed_it(
 def test_prior_values_are_first_seen_and_never_overwritten() -> None:
     from dotbrave._base.settings import merge_prior_values
 
-    existing = {"a.b": {"present": True, "value": 1}}
-    captured = {"a.b": {"present": True, "value": 999}, "c.d": {"present": False, "value": None}}
+    existing = {
+        "a.b": {"present": True, "value": 1},
+        "e.f": {"present": False, "value": None},
+    }
+    captured = {
+        "a.b": {"present": True, "value": 999},
+        "c.d": {"present": False, "value": None},
+        # Same key as an existing absent-marker, but this apply's fresh
+        # capture finds it present with a real value.
+        "e.f": {"present": True, "value": "surprise"},
+    }
 
     merged = merge_prior_values(existing, captured)
 
     assert merged["a.b"] == {"present": True, "value": 1}, "first-seen must win"
     assert merged["c.d"] == {"present": False, "value": None}
+    # A naive truthiness-based merge (e.g. "overwrite unless the existing
+    # entry's `present` is True") would treat `present: False` as "nothing
+    # recorded yet" and let the newly captured `present: True` entry win --
+    # silently turning a permanent "never set before dotbrave" marker into
+    # a fabricated prior value. The correct merge is key-presence based
+    # (`setdefault`), so the absent-marker must survive untouched.
+    assert merged["e.f"] == {"present": False, "value": None}, (
+        "an existing present:False marker must win over a newly captured "
+        "present:True entry for the same key"
+    )
 
 
 def test_profile_scoped_browser_key_is_still_accepted(tmp_path: Path) -> None:
