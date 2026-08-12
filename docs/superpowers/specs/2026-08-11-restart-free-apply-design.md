@@ -640,14 +640,14 @@ a macOS or Windows equivalent, where the callback would stay a constant `True`.
 Until such a signal exists, the honest answer is that a running browser on the
 target root means the profile may be open, and the close stands.
 
-## Found after shipping: a removal is computed against the disk, not the browser
+## Found after shipping, then fixed: a removal was computed against the disk
 
 First end-to-end run against a real Brave, 2026-08-12, on a throwaway root.
 Three applies in sequence: add four keys, flip one, drop one. The first two
 behaved exactly as designed — the Dock-launched Brave was closed and relaunched
 once to obtain an endpoint, and the second apply was live with no restart. The
-third exposed a bug no unit test can reach, because the fake CDP client cannot
-model the thing that causes it: **the browser holds state the disk does not.**
+third exposed a bug the unit tests had missed, because nothing modelled the
+thing that causes it: **the browser holds state the disk does not.**
 
 A live apply writes into Brave's in-memory `PrefService`. Brave commits that to
 `Preferences` on its own timer (~10s) or at exit. Every backup taken during the
@@ -674,15 +674,121 @@ and a browser killed before it flushes widens it to "forever".
 
 This is the same family as B1 — the live path trusting a disk snapshot when the
 running browser is the authority — surviving in a third place after being fixed
-in two. The fix direction: a key that the sidecar says is managed but the config
-no longer contains must be resolved against the **browser**, via `getPref`,
-rather than inferred from its absence on disk. The preflight already speaks
-`getPref`; the removal path simply never asks it, because a key missing from
-the disk diff never becomes a candidate to ask about.
+in two.
 
-Not fixed here — it needs its own change and its own review, and the fake CDP
-client needs to grow a notion of "browser value differs from disk value" or the
-regression test will be as blind as the ones that missed it.
+### What shipped
+
+Two changes, because the bug turned out to have two independent sources. Only
+the first is Brave-specific; the second sits in `_base/` and is what the family
+had in common.
+
+**A. `live.apply_live` unions a plan-derived removal set into the disk-derived
+one.** The set is `managed_before` (already read from the sidecar for
+`_enrich_prior_values`; the read simply moved above the diff) minus each
+settings plan's `state_payload["managed_keys"]` — the other half of the
+subtraction `plan_apply` had already computed as `config_managed_keys -
+target_keys`. Nothing in it reads `Preferences`, which is the point.
+
+Two things it deliberately is not. It is **not** a replacement for the disk
+branch: only the tree diff sees a dict-valued key the config still names
+*shrink*, and a run whose only work is one vanished leaf would otherwise print
+`ok -- live applied` having written nothing (measured: replacing rather than
+unioning breaks seven test ids, none of which assert the bug). And it is **not**
+a new field on `Plan`: a field named generically enough to carry this would
+invite `[shortcuts]` to pour command ids into a key space `_resolve_removals`
+reads as dotted pref paths, so every dropped shortcut would force a restart.
+The namespace filter in `_plan_removals` is load-bearing for the same reason,
+and the helper does not gate on `plan.empty` — an empty plan is precisely the
+case it exists for.
+
+Resolving against the browser via `getPref` — the direction sketched before the
+fix — was **not** taken. It is unnecessary: the sidecar's `prior_values` already
+holds what a removal needs, and the preflight cannot be asked about a key until
+that key is a removal candidate, which is the actual defect.
+
+**B. `diff_summary` emits a line for a removed key absent from disk** rather
+than staying silent (`  - <key> (removed; not present on disk)`). The silence
+made `Plan.empty` True, and an empty plan is dropped at three gates that no
+change inside `apply_live` can reach: the orchestrator's `no changes --
+Preferences already match config` early return; the sidecar write on the
+`[pwa]`-dirty branch, which rewrote `managed_keys` for a plan that was never
+applied and orphaned the key permanently; and `compute_target_prefs`, which
+skips empty plans and so never runs `apply_fn`'s `_pop_value` on the offline
+path. `Plan.empty` and `write_state_files` needed no change of their own — with
+B in place `.empty` means what it says again.
+
+**Behaviour change worth knowing.** A removal whose recorded prior value is
+`{"present": false}` now costs a close + offline apply + relaunch where it
+previously did nothing at all. Three routes reach that marker: a key first
+applied while Brave was closed and absent from disk, a key the config set to
+its own default (`_enrich_prior_values` condition 4 deliberately learns nothing
+there), and a key the user deleted by hand. The restart is not a tax for
+nothing — the close flushes the value dotbrave holds in the browser's RAM to
+disk, `cmd_apply` re-reads `Preferences` after the close, and `_pop_value` then
+deletes the key from *that* copy, so it genuinely returns to its default. That
+correctness depends on the post-close re-read; without it the restart would
+write the pre-close snapshot back and undo itself.
+
+**On the claim that no unit test could reach this.** Wrong, and worth
+correcting: `apply_live` never writes `Preferences`, so "the disk lags the
+browser" is the fake CDP client's default state, not something it had to grow.
+The regression tests are ordinary `FakeCdpClient` tests. The one real trap is
+that a **drop-only** config does not reproduce the bug — the plan comes out
+empty and `cmd_apply` returns before the adapter is reached — so a test written
+that way passes against the buggy code. Each new test flips one key and drops
+another.
+
+### Same family, left alone on purpose
+
+- **`shortcuts.py:137`, the `[shortcuts]` twin.** `removed_ids = {cid for cid in
+  (config_managed_ids - target_ids) if cid in current}` filters against the
+  accelerators read from disk, so a shortcut applied live and dropped inside the
+  uncommitted window is never reset, while `write_state_files` drops it from
+  `managed_ids` — and `[shortcuts]` has no `prior_values` to recover from.
+  Deleting the `if cid in current` filter **alone would be worse than the
+  status quo**: `_shortcut_script` decides whether to emit a cid by comparing
+  `old_keys` (from the same disk state) with `new_keys`, so an absent cid
+  compares equal and is skipped anyway — the run would print `- name: (reset to
+  default)`, do nothing, and still write the sidecar. A correct fix drives
+  `_shortcut_script` from the removal set instead of the disk diff and guards
+  `shortcuts.py:101` against a `KeyError` for a cid not on disk. It also rests
+  on a premise nobody can check without opening a browser: whether Brave
+  commits `brave.accelerators` on the standard delayed timer or calls
+  `CommitPendingWrite` immediately. If the latter, this twin does not exist in
+  practice.
+- **`live.py:314-318`, `_enrich_prior_values` condition 3.**
+  `_capture_prior_values` fabricates `{"present": true, value: <old disk
+  value>}` for any key present on disk, `merge_prior_values` folds it in before
+  enrichment runs, and condition 3 then refuses to overwrite a `present: true`
+  entry — even when the preflight's `getPref` just read the browser's real,
+  newer value. Conditions 2 and 4 already exclude the two ways `getPref` can
+  echo dotbrave's own value, so the refusal buys nothing here. Consequence: a
+  user changes a setting in the UI, runs `apply` inside the uncommitted window,
+  and dotbrave locks the value from *before* that change as the prior; a later
+  removal silently reverts the user's change. Kept out of this change on
+  purpose — fixing it changes how often the `present: false` restart above
+  fires, so mixing the two would make any test that changed colour impossible
+  to attribute. Its offline sibling is already recorded as deliberately
+  deferred at `_base/orchestrator.py:598-616`.
+
+Two more, outside this family, recorded so they are not lost: `--dry-run`
+builds its diff from the disk snapshot, so inside the uncommitted window it
+over-reports `+` for keys the browser already has (it no longer under-reports
+removals — that is change B); and `restore --list` prints the mtime of
+`Preferences` rather than of the backup (`_base/utils.py:96` uses
+`shutil.copy2`), so the timestamp contradicts the `.bak.%Y%m%d-%H%M%S` filename
+printed beside it.
+
+### Deliberately not done: dropping the tree diff for `[settings]`
+
+The larger version of this fix computes both changes and removals at dotted-key
+granularity (`target.items()` plus `removed_keys`), on the argument that this is
+the granularity `apply_fn`, `managed_keys`, `prior_values` and `setPref` all
+already share, and that the tree diff is the odd one out. The argument holds and
+may well be where this ends up. But it deletes `changed_leaf_paths`,
+`split_removals` and `_is_shortcut_path` and rewrites `_setting_changes` — a
+redesign, not a fix. The union above is the smallest change that repairs the
+measured bug.
 
 ## Out of scope
 

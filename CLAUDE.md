@@ -109,6 +109,30 @@ Preserve these contracts unless a change explicitly redesigns them:
    they keep the `{"present": false}` marker permanently, however they
    are first managed, and removing one always costs a close, an
    offline write and a relaunch.
+   Which keys count as removed comes from the settings sidecar, never
+   from the on-disk diff alone. A live apply writes into Brave's
+   in-memory `PrefService` and Brave commits that on its own timer, so a
+   key dotbrave applied live and the config then drops is absent from
+   *both* sides of the tree diff and produces no removal at all --
+   orphaned at dotbrave's value, out of `managed_keys`, never
+   reconsidered. `live._plan_removals` therefore unions a plan-derived
+   set (`managed_before` minus each settings plan's
+   `state_payload["managed_keys"]`) into the disk-derived one, filtered
+   to the `settings` namespace and not gated on `plan.empty`. Union, not
+   replacement: only the tree diff sees a dict-valued key the config
+   still names shrink. And no new field on `Plan` -- a generic one would
+   invite `[shortcuts]` command ids into a key space `_resolve_removals`
+   reads as dotted pref paths. `diff_summary` must emit a line for a
+   removed key absent from disk (`- <key> (removed; not present on
+   disk)`); silence there makes `Plan.empty` true, and an empty plan is
+   dropped by the orchestrator's early return, by the sidecar write on
+   the `[pwa]`-dirty branch, and by `compute_target_prefs`. The
+   consequence to keep in view: a removal with no usable prior value now
+   always costs a close, an offline apply and a relaunch, where a
+   memory-only key used to silently do nothing. That restart really does
+   reset the key, but only because the close flushes the browser's copy
+   and `cmd_apply` re-reads `Preferences` afterwards (invariant 1) --
+   `_pop_value` then deletes it from the post-close copy.
 3. `[settings]` must refuse MAC-protected keys found in either `Preferences`
    or sibling `Secure Preferences`. Never make a write that Brave will
    silently reset on launch.
@@ -152,7 +176,9 @@ Preserve these contracts unless a change explicitly redesigns them:
    exactly that remainder: the keys the browser does not recognise,
    removals with no recorded prior value to write back
    (`chrome.settingsPrivate` has no single-pref reset, and a key never set
-   before dotbrave touched it has no default to restore), and -- as a
+   before dotbrave touched it has no default to restore -- unconditionally
+   now, including a key whose value only ever reached the browser's
+   memory, see invariant 2), and -- as a
    block, named by the marker `shortcuts` -- the whole `[shortcuts]` table
    when its own preflight reports the commands bundle unusable. Two are
    whole-run and carry a reason string instead of keys: a work tab whose
