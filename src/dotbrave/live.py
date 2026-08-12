@@ -11,6 +11,7 @@ from dotbrave._base.cdp import CdpClient, CdpError
 from dotbrave._base import live_apply as _live
 from dotbrave._base import settings as _base_settings
 from dotbrave._base.utils import Plan
+from dotbrave.command_ids import ID_TO_NAME
 from dotbrave import shortcuts as shortcuts_mod
 
 
@@ -282,6 +283,46 @@ def _plan_removals(plans: list[Plan], managed_before: set[str]) -> set[str]:
     return out
 
 
+def _shortcut_removals(plans: list[Plan], managed_before: set[str]) -> set[str]:
+    """Command ids the sidecar says dotbrave manages that the config dropped.
+
+    The ``[shortcuts]`` twin of ``_plan_removals``, and it exists for the
+    same reason: ``brave.accelerators`` is committed on Chromium's
+    delayed timer, so a binding applied live and then dropped from the
+    config is absent from *both* sides of the tree diff and produces no
+    removal at all.  ``plan_apply`` already computed exactly this set
+    (``config_managed_ids - target_ids``) and ships the other half of the
+    subtraction in ``state_payload["managed_ids"]``, so subtracting
+    reconstructs it exactly -- both read the same sidecar, and nothing
+    writes it between plan construction and here.
+
+    No union with a disk-derived set, unlike the settings side: that one
+    needs the tree diff because a dict-valued key the config still names
+    can *shrink*.  This key space is flat, so the subtraction is complete.
+
+    Filtering by namespace is what keeps the two key spaces apart -- a
+    command id reaching ``_resolve_removals`` as a dotted pref path would
+    send every dropped shortcut offline.  ``isdigit`` filters the sidecar
+    side here as well as in ``plan_apply``: they are different code paths
+    (``sorted(key=int)`` in the script vs ``int()`` in ``diff_summary``),
+    so guarding only one leaves the other reachable from a hand-edited
+    file.
+    """
+    managed = {c for c in managed_before if isinstance(c, str) and c.isdigit()}
+    out: set[str] = set()
+    for plan in plans:
+        if plan.namespace != shortcuts_mod.NAMESPACE:
+            continue
+        payload = plan.state_payload
+        if not isinstance(payload, dict):
+            continue
+        ids = payload.get("managed_ids")
+        if not isinstance(ids, list):
+            continue
+        out |= managed - {c for c in ids if isinstance(c, str)}
+    return out
+
+
 _NO_ENTRY = object()
 
 
@@ -406,20 +447,54 @@ def _dict_at(prefs: dict, parts: tuple[str, ...]) -> dict[str, list[str]]:
     return value if isinstance(value, dict) else {}
 
 
-def _shortcut_script(before: dict, target: dict) -> str | None:
+def _shortcut_script(
+    before: dict, target: dict, removed_ids: set[str],
+) -> tuple[str | None, list[str]]:
+    """The script that pushes shortcut changes, plus what it cannot push.
+
+    Assignments come from the disk diff, removals from ``removed_ids``.
+    They have to be separate passes: a removal's whole point is that the
+    disk diff cannot see it (the binding lives only in the browser's
+    memory until Chromium's commit timer fires), and for a removal that
+    *is* on disk the diff sees `apply_fn`'s result, not the intent.
+
+    ``unresolved`` names removals with no recorded default -- the only
+    value "reset to default" could mean -- as ``shortcuts.<name>``.  They
+    go to the caller's remainder and are finished offline, where the
+    close flushes the browser's copy, `cmd_apply` re-reads Preferences,
+    and ``apply_fn`` pops the override off the post-close dict.
+    """
     current = _dict_at(before, shortcuts_mod.ACCELERATORS_KEY_PATH)
     defaults = _dict_at(before, shortcuts_mod.DEFAULT_ACCELERATORS_KEY_PATH)
     desired = _dict_at(target, shortcuts_mod.ACCELERATORS_KEY_PATH)
+    removed = {c for c in removed_ids if isinstance(c, str) and c.isdigit()}
     desired_changes: dict[str, list[str]] = {}
-    all_ids = set(current) | set(desired)
-    for cid in sorted(all_ids, key=lambda v: int(v)):
+    unresolved: list[str] = []
+    for cid in sorted((set(current) | set(desired)) - removed, key=lambda v: int(v)):
         old_keys = list(current[cid] if cid in current else defaults.get(cid, []))
         new_keys = list(desired.get(cid, []))
         if old_keys == new_keys:
             continue
         desired_changes[cid] = new_keys
+    for cid in sorted(removed, key=lambda v: int(v)):
+        # Emitted WITHOUT consulting `current`, deliberately.  The script's
+        # own notion of what a command is bound to right now is
+        # `m.commandsCache.cache` -- the browser's live state, which is the
+        # authoritative one -- so a cid already sitting at its default
+        # produces zero assign/unassign calls inside the loop.  If a future
+        # edit ever makes the script take a dotbrave-supplied "current"
+        # instead, this starts unassigning bindings.
+        #
+        # `cid in defaults`, not `defaults.get(cid)` truthiness: a command
+        # Brave records with an empty default list is *resolvable* --
+        # unassign everything, which for that cid genuinely is the default
+        # -- and is a different case from a command absent from the map.
+        if cid in defaults:
+            desired_changes[cid] = list(defaults[cid])
+        else:
+            unresolved.append(f"shortcuts.{ID_TO_NAME.get(int(cid), cid)}")
     if not desired_changes:
-        return None
+        return None, unresolved
     desired_json = json.dumps(desired_changes, separators=(",", ":"))
     return (
         "(async () => {"
@@ -443,7 +518,7 @@ def _shortcut_script(before: dict, target: dict) -> str | None:
         "await new Promise(r => setTimeout(r, 300));"
         "return true;"
         "})()"
-    )
+    ), unresolved
 
 
 def _settings_script(changes: list[tuple[str, Any]]) -> str | None:
@@ -729,6 +804,10 @@ def apply_live(
     # rewrite the file -- and nothing does between `plan_apply` and
     # enrichment.
     recorded_before = set(_base_settings.get_prior_values(prefs_path))
+    # The [shortcuts] equivalent, read from the same file `plan_apply` read
+    # at build time and for the same reason: a binding applied live and
+    # then dropped from the config is invisible to the disk diff.
+    managed_before_ids = shortcuts_mod.get_managed_ids(prefs_path)
     # Union, not replacement: neither source subsumes the other.  Only the
     # tree diff sees a dict-valued key the config still names *shrink* (a
     # leaf vanishing under it, so the key never leaves `managed_keys`);
@@ -766,13 +845,21 @@ def apply_live(
     # only the preflight can tell us that.
     removal_writes, unresolved_removals = _resolve_removals(prefs_path, removals)
     ordinary_changes = ordinary_changes + removal_writes
-    shortcut_script = _shortcut_script(prefs, target_prefs)
-    if removals and not (newtab_changes or ordinary_changes or shortcut_script):
+    shortcut_script, unresolved_shortcuts = _shortcut_script(
+        prefs,
+        target_prefs,
+        _shortcut_removals(plans, managed_before_ids),
+    )
+    if (removals or unresolved_shortcuts) and not (
+        newtab_changes or ordinary_changes or shortcut_script
+    ):
         # A diff that is nothing but removals -- none of which had a prior
-        # value to restore -- has no live half at all, so refuse before
-        # touching the browser rather than opening a work tab in the
-        # user's face only to close it again.
-        raise _live.LiveApplyUnsupported("Brave", sorted(removals))
+        # value (or, for [shortcuts], a recorded default) to restore -- has
+        # no live half at all, so refuse before touching the browser rather
+        # than opening a work tab in the user's face only to close it again.
+        raise _live.LiveApplyUnsupported(
+            "Brave", sorted(set(removals) | set(unresolved_shortcuts))
+        )
     client = CdpClient(port)
     target: dict = {}
     created = False
@@ -800,7 +887,15 @@ def apply_live(
         blocked = set(unsupported) | set(unresolved_removals)
         live_newtab = [c for c in newtab_changes if c[0] not in blocked]
         live_ordinary = [c for c in ordinary_changes if c[0] not in blocked]
-        remainder = sorted(blocked | set(shortcuts_unsupported))
+        # `unresolved_shortcuts` joins the remainder but neither of the
+        # other two sets, on purpose.  `shortcuts_unsupported` means "the
+        # commands bundle is unusable" and gates the whole script below, so
+        # one unresolvable removal must not disable the resolvable half;
+        # `blocked` filters settings changes by key, where a `shortcuts.*`
+        # entry has no business being.
+        remainder = sorted(
+            blocked | set(shortcuts_unsupported) | set(unresolved_shortcuts)
+        )
 
         if remainder and unattended:
             # Unattended keeps the old all-or-nothing semantics, and must

@@ -165,6 +165,34 @@ Preserve these contracts unless a change explicitly redesigns them:
    Under `--unattended` there is no cycle at all -- the run warns and
    returns without writing state files, so an unresolvable removal
    recurs on every activation until an apply runs with Brave closed.
+   `[shortcuts]` has the same defect and the same shape of fix.
+   `brave.accelerators` is committed on the same delayed timer (measured:
+   unchanged at t+0 and t+3s, committed by t+15s), so `plan_apply`'s
+   removal set must not be filtered by what is on disk, and
+   `shortcuts.diff_summary` must emit `- <name> (reset to default; not
+   present on disk)` for a removal the file cannot see -- same three
+   gates. It needs no union with a disk-derived set: the key space is
+   flat (command id -> list of strings), so `sidecar managed_ids -
+   target_ids` is complete on its own. Both entry points filter the
+   sidecar to numeric string ids (`plan_apply` and
+   `live._shortcut_removals`): the set now comes only from a
+   user-editable file, and `int(cid)` in `diff_summary` and
+   `sorted(key=int)` in the live script are different code paths.
+   "Reset" means writing back `brave.default_accelerators[cid]`, never
+   unassigning: `live._shortcut_script` takes the removal set as an
+   argument, emits those cids from the defaults map *without* consulting
+   the disk map (the script's own "current" is `commandsCache.cache`, the
+   browser's live state, so a cid already at its default costs zero
+   calls), and returns cids with no recorded default as
+   `unresolved` -- `shortcuts.<name>` entries that join the remainder and
+   go offline. Those must not be folded into `blocked` (a settings key
+   filter) or `shortcuts_unsupported` (which gates the whole script), or
+   one obscure keybinding disables the resolvable half. There is
+   deliberately no `prior_values` twin for `[shortcuts]`:
+   `brave.default_accelerators` is browser-written and already means "the
+   binding before any override at all", which is what "reset to default"
+   should restore -- a `prior_values` twin would restore dotbrave's
+   *previous* shortcut instead.
 3. `[settings]` must refuse MAC-protected keys found in either `Preferences`
    or sibling `Secure Preferences`. Never make a write that Brave will
    silently reset on launch.

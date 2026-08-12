@@ -96,8 +96,22 @@ def diff_summary(
             lines.append(f"  + {name}: {keys}")
         elif current[cid] != keys:
             lines.append(f"  ~ {name}: {current[cid]} -> {keys}")
-    for cid in removed_ids:
+    for cid in sorted(removed_ids, key=int):
         name = ID_TO_NAME.get(int(cid), f"<unknown:{cid}>")
+        if cid not in current:
+            # Absent from the file does NOT mean absent from the browser.
+            # Brave commits `brave.accelerators` on Chromium's delayed
+            # timer (measured: unchanged at t+0 and t+3s, committed by
+            # t+15s), so a binding applied live and then dropped from the
+            # config lives only in the browser's memory.  Staying silent
+            # here made `Plan.empty` True, and the removal was then
+            # dropped at three separate gates -- the orchestrator's "no
+            # changes" early return, the sidecar write on the
+            # [pwa]-dirty branch (which rewrites `managed_ids` for a plan
+            # that was never applied), and `compute_target_prefs`, which
+            # skips empty plans and so never runs `apply_fn`.
+            lines.append(f"  - {name} (reset to default; not present on disk)")
+            continue
         lines.append(f"  - {name}: {current[cid]} (reset to default)")
     return lines
 
@@ -117,6 +131,18 @@ def _get_managed_ids(prefs_path: Path) -> set[str]:
     return set(data.get("managed_ids", []))
 
 
+def get_managed_ids(prefs_path: Path) -> set[str]:
+    """Public accessor for the shortcuts sidecar's ``managed_ids``.
+
+    Same reasoning as ``_base.settings.get_managed_keys``: the live-apply
+    adapter needs the set dotbrave managed *before* this run (the sidecar
+    is only rewritten once the run succeeds) to reconstruct the removal
+    set, and it lives outside this module -- so it must not reach into a
+    private, underscore-prefixed name to get it.
+    """
+    return _get_managed_ids(prefs_path)
+
+
 def plan_apply(prefs_path: Path, prefs: dict, raw_table: object) -> Plan:
     """Compute the apply plan for a `[shortcuts]` TOML table.
 
@@ -134,7 +160,27 @@ def plan_apply(prefs_path: Path, prefs: dict, raw_table: object) -> Plan:
 
     target_ids = set(target)
     config_managed_ids = _get_managed_ids(prefs_path)
-    removed_ids = {cid for cid in (config_managed_ids - target_ids) if cid in current}
+    # NOT filtered by what is on disk: `brave.accelerators` is committed on
+    # Chromium's delayed timer, so a binding applied live and then dropped
+    # from the config is absent from `current` while the browser is still
+    # honouring it -- and `write_state_files` rewrites the sidecar without
+    # it either way, orphaning it permanently.  Both terms are dotbrave's
+    # own artifacts, and unlike the settings side no union with a
+    # disk-derived set is needed: this key space is flat (command id ->
+    # list of strings), so there is no removal a leaf diff could see that
+    # the subtraction cannot.
+    #
+    # The `isdigit` guard replaces safety `cid in current` was providing by
+    # accident -- every surviving cid used to come from a browser-written
+    # map, which is what makes `int(cid)` below and `sorted(key=int)` in
+    # the live script safe.  The set now comes only from the sidecar, a
+    # user-editable file.  `plan_apply` can never emit a non-numeric id
+    # (it stringifies ints from NAME_TO_ID), so nothing real is lost.
+    removed_ids = {
+        cid
+        for cid in (config_managed_ids - target_ids)
+        if isinstance(cid, str) and cid.isdigit()
+    }
 
     diff = diff_summary(current, target, removed_ids)
 

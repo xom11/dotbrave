@@ -9,6 +9,7 @@ from dotbrave._base import live_apply as shared_live
 from dotbrave._base.utils import Plan
 from dotbrave import live
 from dotbrave import settings as settings_mod
+from dotbrave import shortcuts as shortcuts_mod
 
 
 class FakeCdpClient:
@@ -155,7 +156,7 @@ def test_brave_live_uses_default_accelerator_when_current_binding_is_missing() -
         }
     }
 
-    script = live._shortcut_script(before, target)
+    script, unresolved = live._shortcut_script(before, target, set())
 
     assert script is not None
     assert "commandsCache.cache" in script
@@ -163,6 +164,74 @@ def test_brave_live_uses_default_accelerator_when_current_binding_is_missing() -
     assert f'"{close_tab}"' not in script
     assert "commandsCache.unassignAccelerator" in script
     assert "commandsCache.assignAccelerator" in script
+
+
+# ---------------------------------------------------------------------------
+# Shortcut removals, which the on-disk map cannot see.
+#
+# `brave.accelerators` is committed on Chromium's delayed timer, so a
+# binding applied live and then dropped from the config is absent from
+# both sides of the disk diff.  The removal set comes from the sidecar
+# instead, and the script is driven from it rather than from the diff.
+# ---------------------------------------------------------------------------
+
+def test_shortcut_script_resets_a_removal_absent_from_the_disk_map() -> None:
+    from dotbrave.command_ids import NAME_TO_ID
+
+    new_tab = str(NAME_TO_ID["new_tab"])
+    before = {
+        "brave": {
+            "accelerators": {},
+            "default_accelerators": {new_tab: ["Control+KeyT"]},
+        }
+    }
+    # The disk diff is genuinely empty: nothing to remove that disk knows of.
+    target = json.loads(json.dumps(before))
+
+    script, unresolved = live._shortcut_script(before, target, {new_tab})
+
+    assert script is not None
+    assert f'"{new_tab}":["Control+KeyT"]' in script
+    assert unresolved == []
+
+
+def test_shortcut_script_cannot_reset_without_a_recorded_default() -> None:
+    """No `brave.default_accelerators` entry means there is no value to
+    reset to, so the removal goes offline rather than being guessed at."""
+    from dotbrave.command_ids import NAME_TO_ID
+
+    new_tab = str(NAME_TO_ID["new_tab"])
+    before = {"brave": {"accelerators": {}, "default_accelerators": {}}}
+    target = json.loads(json.dumps(before))
+
+    script, unresolved = live._shortcut_script(before, target, {new_tab})
+
+    assert script is None
+    assert unresolved == ["shortcuts.new_tab"]
+
+
+def test_shortcut_script_never_unassigns_a_removal_it_cannot_resolve() -> None:
+    """`apply_fn`'s else-branch pops an override with no recorded default,
+    so the disk diff for such a removal is "the cid vanished" -- which the
+    old union-of-both-maps loop turned into `desired_changes[cid] = []`,
+    unassigning every binding for that command in the running browser
+    while the diff line claimed "reset to default"."""
+    from dotbrave.command_ids import NAME_TO_ID
+
+    new_tab = str(NAME_TO_ID["new_tab"])
+    before = {
+        "brave": {
+            "accelerators": {new_tab: ["Command+KeyT"]},
+            "default_accelerators": {},
+        }
+    }
+    target = json.loads(json.dumps(before))
+    del target["brave"]["accelerators"][new_tab]
+
+    script, unresolved = live._shortcut_script(before, target, {new_tab})
+
+    assert script is None or f'"{new_tab}":[]' not in script
+    assert unresolved == ["shortcuts.new_tab"]
 
 
 def test_brave_live_routes_new_tab_settings_through_new_tab_actions(
@@ -1165,6 +1234,157 @@ def test_shortcuts_preflight_reports_unsupported_instead_of_failing_hard(
     with pytest.raises(shared_live.LiveApplyUnsupported) as excinfo:
         live.apply_live(9333, prefs_path, prefs, [plan])
     assert any("shortcut" in k for k in excinfo.value.keys)
+
+
+def _memory_only_shortcut(
+    prefs_path: Path, *, defaults: dict[str, list[str]]
+) -> tuple[dict, str, Plan]:
+    """A profile whose only work is resetting a live-only binding.
+
+    `brave.accelerators` is empty on disk -- the binding dotbrave applied
+    live has not been committed yet -- while the sidecar still lists the
+    command id.  An empty `[shortcuts]` table then means "reset mine".
+    """
+    from dotbrave.command_ids import NAME_TO_ID
+
+    new_tab = str(NAME_TO_ID["new_tab"])
+    prefs = {
+        "brave": {"accelerators": {}, "default_accelerators": dict(defaults)}
+    }
+    prefs_path.write_text(json.dumps(prefs))
+    prefs_path.with_name("Preferences.dotbrave.shortcuts.json").write_text(
+        json.dumps({"managed_ids": [new_tab]})
+    )
+    plan = shortcuts_mod.plan_apply(prefs_path, prefs, {})
+    return prefs, new_tab, plan
+
+
+def test_apply_live_resets_a_memory_only_shortcut(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The orphan, end to end.
+
+    The binding exists only in the browser's memory, so the disk diff is
+    empty; without a sidecar-derived removal set the run printed "no
+    changes", rewrote `managed_ids` to `[]`, and left the binding in
+    place forever.
+    """
+    from dotbrave.command_ids import NAME_TO_ID
+
+    prefs_path = tmp_path / "Default" / "Preferences"
+    prefs_path.parent.mkdir()
+    prefs, new_tab, plan = _memory_only_shortcut(
+        prefs_path, defaults={str(NAME_TO_ID["new_tab"]): ["Control+KeyT"]}
+    )
+
+    fake = FakeCdpClient(9333)
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake)
+
+    live.apply_live(9333, prefs_path, prefs, [plan])  # must NOT raise
+
+    assert any("commandsCache.assignAccelerator" in e for e in fake.evaluations)
+    assert any(f'"{new_tab}":["Control+KeyT"]' in e for e in fake.evaluations)
+    state = json.loads(
+        prefs_path.with_name("Preferences.dotbrave.shortcuts.json").read_text()
+    )
+    assert state["managed_ids"] == []
+
+
+def test_an_unresolvable_shortcut_removal_refuses_before_opening_a_tab(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A run whose only work is a removal it cannot resolve has no live
+    half at all, so it must refuse before `CdpClient` is even built --
+    otherwise the user watches a work tab open and close for nothing."""
+    prefs_path = tmp_path / "Default" / "Preferences"
+    prefs_path.parent.mkdir()
+    prefs, new_tab, plan = _memory_only_shortcut(prefs_path, defaults={})
+
+    fake = FakeCdpClient(9333)
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake)
+
+    with pytest.raises(shared_live.LiveApplyUnsupported) as excinfo:
+        live.apply_live(9333, prefs_path, prefs, [plan])
+
+    assert excinfo.value.keys == ["shortcuts.new_tab"]
+    assert fake.navigations == []
+    assert fake.created == []
+    assert list(prefs_path.parent.glob("Preferences.bak.*")) == []
+
+
+def test_one_unresolvable_shortcut_removal_keeps_the_resolvable_half_live(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The per-key split, on the shortcuts side.
+
+    `unresolved_shortcuts` joins the remainder but must not reach
+    `shortcuts_unsupported` (which gates the whole script) or `blocked`
+    (a settings-key filter), or one obscure keybinding with no recorded
+    default would send every other reset offline with it.  The single
+    backup is still the live half's, taken before it landed, and the
+    offline path is told to skip its own.
+    """
+    from dotbrave.command_ids import NAME_TO_ID
+
+    prefs_path = tmp_path / "Default" / "Preferences"
+    prefs_path.parent.mkdir()
+    new_tab = str(NAME_TO_ID["new_tab"])
+    close_tab = str(NAME_TO_ID["close_tab"])
+    prefs = {
+        "brave": {
+            "accelerators": {},
+            # Only one of the two has a default to reset to.
+            "default_accelerators": {new_tab: ["Control+KeyT"]},
+        }
+    }
+    prefs_path.write_text(json.dumps(prefs))
+    prefs_path.with_name("Preferences.dotbrave.shortcuts.json").write_text(
+        json.dumps({"managed_ids": [new_tab, close_tab]})
+    )
+    plan = shortcuts_mod.plan_apply(prefs_path, prefs, {})
+
+    fake = FakeCdpClient(9333)
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake)
+
+    with pytest.raises(shared_live.LiveApplyUnsupported) as excinfo:
+        live.apply_live(9333, prefs_path, prefs, [plan])
+
+    assert excinfo.value.keys == ["shortcuts.close_tab"]
+    # The resolvable half ran live, before the raise.
+    assert any(f'"{new_tab}":["Control+KeyT"]' in e for e in fake.evaluations)
+    assert not any(f'"{close_tab}"' in e for e in fake.evaluations)
+    # Exactly one backup, taken by the live half, and the offline path is
+    # told not to take a second.
+    assert len(list(prefs_path.parent.glob("Preferences.bak.*"))) == 1
+    assert excinfo.value.backup_taken is True
+    # State files stay unwritten: the offline apply writes them for the
+    # whole plan.
+    assert json.loads(
+        prefs_path.with_name("Preferences.dotbrave.shortcuts.json").read_text()
+    )["managed_ids"] == [new_tab, close_tab]
+
+
+def test_settings_sidecar_is_not_read_as_command_ids() -> None:
+    """Mirror of `test_a_dropped_shortcut_id_never_becomes_a_settings_removal`.
+
+    The two key spaces must never mix: a dotted pref path arriving in the
+    shortcut removal set would reach `int(cid)` and raise, and a command
+    id arriving on the settings side would send every dropped shortcut
+    offline.  Both derivations filter by namespace for that reason.
+    """
+    settings_plan = Plan(
+        namespace="settings",
+        diff_lines=["changed"],
+        apply_fn=lambda _p: None,
+        verify_fn=lambda _p: None,
+        state_payload={"managed_keys": []},
+    )
+
+    removals = live._shortcut_removals(
+        [settings_plan], {"brave.tabs.vertical_tabs_enabled", "34014"}
+    )
+
+    assert removals == set()
 
 
 def test_scripts_guard_against_an_unloaded_settings_page() -> None:

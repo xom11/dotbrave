@@ -395,6 +395,97 @@ def test_managed_ids_handles_corrupt_sidecar(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# A shortcut that only exists in the running browser's memory.
+#
+# `brave.accelerators` is committed on Chromium's delayed timer (measured:
+# unchanged at t+0 and t+3s, committed by t+15s), so a binding applied live
+# and then dropped from the config is absent from `Preferences` while the
+# browser is still honouring it.  Filtering the removal set by what is on
+# disk orphans it permanently -- the sidecar is rewritten without it either
+# way.
+# ---------------------------------------------------------------------------
+
+def _shortcuts_sidecar(prefs_path: Path) -> Path:
+    return prefs_path.with_name(prefs_path.name + ".dotbrave.shortcuts.json")
+
+
+def test_shortcuts_diff_summary_survives_a_removal_absent_from_disk() -> None:
+    from dotbrave.command_ids import NAME_TO_ID
+
+    new_tab = str(NAME_TO_ID["new_tab"])
+
+    lines = sc.diff_summary({}, {}, {new_tab})
+
+    assert len(lines) == 1
+    assert "new_tab" in lines[0]
+    assert "reset to default" in lines[0]
+
+
+def test_shortcuts_plan_removes_a_binding_that_only_exists_in_browser_memory(
+    tmp_path: Path,
+) -> None:
+    from dotbrave.command_ids import NAME_TO_ID
+
+    new_tab = str(NAME_TO_ID["new_tab"])
+    prefs_path = tmp_path / "Preferences"
+    prefs = {
+        "brave": {
+            # The live-applied binding has not been committed yet.
+            "accelerators": {},
+            "default_accelerators": {new_tab: ["Control+KeyT"]},
+        }
+    }
+    prefs_path.write_text(json.dumps(prefs))
+    _shortcuts_sidecar(prefs_path).write_text(
+        json.dumps({"managed_ids": [new_tab]})
+    )
+
+    plan = sc.plan_apply(prefs_path, prefs, {})  # empty table = reset mine
+
+    assert plan.empty is False
+    assert any("new_tab" in line and line.startswith("  - ") for line in plan.diff_lines)
+
+    # The offline path re-reads Preferences after the close, which is when
+    # the browser's own copy has finally landed on disk.
+    post_close = {
+        "brave": {
+            "accelerators": {new_tab: ["Command+KeyT"]},
+            "default_accelerators": {new_tab: ["Control+KeyT"]},
+        }
+    }
+    plan.apply_fn(post_close)
+    assert post_close["brave"]["accelerators"][new_tab] == ["Control+KeyT"]
+
+
+def test_shortcuts_plan_ignores_a_non_numeric_managed_id(tmp_path: Path) -> None:
+    """The sidecar is a user-editable file, and the removal set now comes
+    only from it -- so a hand-edited non-numeric id would reach
+    `int(cid)` in `diff_summary` and `sorted(key=int)` in the live
+    script.  Dropped at every entry point instead."""
+    from dotbrave.command_ids import NAME_TO_ID
+
+    new_tab = str(NAME_TO_ID["new_tab"])
+    prefs_path = tmp_path / "Preferences"
+    # The numeric id is on disk, so this stays a test about the junk
+    # entries rather than about the memory-only case above.
+    prefs = {
+        "brave": {
+            "accelerators": {new_tab: ["Command+KeyT"]},
+            "default_accelerators": {new_tab: ["Control+KeyT"]},
+        }
+    }
+    prefs_path.write_text(json.dumps(prefs))
+    _shortcuts_sidecar(prefs_path).write_text(
+        json.dumps({"managed_ids": [new_tab, "abc", 7, None]})
+    )
+
+    plan = sc.plan_apply(prefs_path, prefs, {})
+
+    assert len(plan.diff_lines) == 1
+    assert "new_tab" in plan.diff_lines[0]
+
+
+# ---------------------------------------------------------------------------
 # find_preferences (shortcuts re-exports it from utils)
 # ---------------------------------------------------------------------------
 
