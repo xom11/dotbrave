@@ -99,6 +99,29 @@ def test_restore_picks_most_recent_backup(
     assert prefs == json.loads(newest.read_text())
 
 
+def test_undo_ignores_a_backup_whose_mtime_predates_an_older_one(
+    profile_with_backups: tuple[Path, list[Path]], monkeypatch
+) -> None:
+    """The name is the sort key, not the mtime.
+
+    `restore_prefs` is `shutil.copy2`, so a restore stamps Preferences
+    with the backup's mtime and the next apply's backup inherits it --
+    an mtime sort then puts an older backup first.  Nothing else can
+    disagree with the name: it is what `backup:`, `restore --list` and
+    `restored Preferences from ...` all print.  (`apply --undo` routes
+    into this same engine.)
+    """
+    monkeypatch.setattr(brave_pkg, "brave_running", lambda: False)
+    profile_root, backups = profile_with_backups
+    # Newest name, oldest mtime -- e.g. copied in from another machine.
+    os.utime(backups[-1], (1, 1))
+
+    _restore(profile_root)
+
+    prefs = json.loads((profile_root / "Default" / "Preferences").read_text())
+    assert prefs["marker"] == "newest"
+
+
 def test_restore_clears_sidecars(
     profile_with_backups: tuple[Path, list[Path]], monkeypatch
 ) -> None:

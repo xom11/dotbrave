@@ -3,11 +3,10 @@ from __future__ import annotations
 
 import copy
 import json
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from dotbrave._base.utils import Plan, backup_prefs
+from dotbrave._base.utils import Plan, backup_prefs, new_backup_path
 
 
 MISSING = object()
@@ -49,9 +48,7 @@ def compute_target_prefs(prefs: dict, plans: list[Plan]) -> dict:
 
 
 def backup_preferences(prefs_path: Path) -> Path:
-    backup = prefs_path.with_suffix(
-        prefs_path.suffix + f".bak.{datetime.now():%Y%m%d-%H%M%S}"
-    )
+    backup = new_backup_path(prefs_path)
     backup_prefs(prefs_path, backup)
     print(f"backup: {backup}")
     return backup

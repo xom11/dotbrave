@@ -7,6 +7,7 @@ combined diff, single-cycle write, and missing-vs-empty-table semantics.
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import os
 import subprocess
@@ -17,8 +18,17 @@ import pytest
 
 from dotbrave import browser as brave_pkg
 from dotbrave import pwa as pwa_mod
+from dotbrave._base import utils as bu
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+class _FrozenClock:
+    """A `datetime` stand-in whose `now()` never advances."""
+
+    @staticmethod
+    def now() -> datetime.datetime:
+        return datetime.datetime(2026, 1, 1, 12, 0, 0, 123456)
 
 
 @pytest.fixture
@@ -126,6 +136,40 @@ def test_combined_apply_writes_both_namespaces_in_one_cycle(
     # one backup per module.
     backups = list((combined_profile_root / "Default").glob("Preferences.bak.*"))
     assert len(backups) == 1, f"expected exactly one backup, got {backups}"
+
+
+def test_two_applies_in_one_second_keep_both_backups(
+    combined_profile_root: Path, tmp_path: Path, monkeypatch
+) -> None:
+    """A second apply must not truncate the first one's backup.
+
+    `backup_prefs` is `shutil.copy2`, which overwrites its destination
+    and returns normally, so a second-resolution name shared by two
+    applies loses the earlier snapshot with no diagnostic.  The clock is
+    frozen deliberately: without it two fast applies usually -- but not
+    always -- share a wall-clock second.
+    """
+    monkeypatch.setattr(brave_pkg, "brave_running", lambda: False)
+    monkeypatch.setattr(bu, "datetime", _FrozenClock)
+    profile = combined_profile_root / "Default"
+
+    on = tmp_path / "on.toml"
+    on.write_text('[settings]\n"brave.tabs.vertical_tabs_enabled" = true\n')
+    off = tmp_path / "off.toml"
+    off.write_text('[settings]\n"brave.tabs.vertical_tabs_enabled" = false\n')
+
+    _apply(combined_profile_root, on)
+    _apply(combined_profile_root, off)
+
+    backups = sorted(profile.glob("Preferences.bak.*"), key=lambda p: p.name)
+    assert len(backups) == 2, f"expected two backups, got {backups}"
+
+    first = json.loads(backups[0].read_text())
+    second = json.loads(backups[1].read_text())
+    # The older-named backup is the pre-first-apply state; the newer one
+    # is what apply 1 left behind.
+    assert first["brave"]["tabs"]["vertical_tabs_enabled"] is False
+    assert second["brave"]["tabs"]["vertical_tabs_enabled"] is True
 
 
 def test_combined_dry_run_shows_grouped_diff(

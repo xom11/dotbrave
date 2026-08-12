@@ -45,6 +45,7 @@ from dotbrave._base.utils import (
     backup_prefs,
     find_preferences,
     load_prefs,
+    new_backup_path,
     restore_prefs,
     write_atomic,
 )
@@ -619,9 +620,7 @@ def cmd_apply(
         # Skipped only when live apply already backed up ahead of its own
         # half of a split run; that file predates everything this run
         # wrote, so a second one here would be strictly worse for --undo.
-        backup = prefs_path.with_suffix(
-            prefs_path.suffix + f".bak.{datetime.now():%Y%m%d-%H%M%S}"
-        )
+        backup = new_backup_path(prefs_path)
         backup_prefs(prefs_path, backup)
         print(f"backup: {backup}")
 
@@ -726,9 +725,19 @@ def cmd_restore(
     """
     prefs_path = find_preferences(args.profile_root, args.profile)
     profile_dir = prefs_path.parent
+    # Sorted by NAME, not mtime.  `new_backup_path` makes every field of
+    # the timestamp fixed width, so a byte sort of these names is a
+    # chronological sort -- and the name is what `backup:`,
+    # `restore --list` and `restored Preferences from ...` all print, so
+    # the order matches what the user reads.  mtime cannot be trusted for
+    # this: a directory copied without `-p`, an unzip, or a profile moved
+    # between machines rewrites every mtime while the names stay right.
+    # (The one case mtime would win -- local wall time stepping backwards
+    # over a DST fallback -- costs a wrong `--undo` pick for an hour a
+    # year, and `restore --from` is the escape hatch.)
     backups = sorted(
         profile_dir.glob(f"{prefs_path.name}.bak.*"),
-        key=lambda p: p.stat().st_mtime,
+        key=lambda p: p.name,
         reverse=True,
     )
 

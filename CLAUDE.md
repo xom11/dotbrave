@@ -286,6 +286,17 @@ Preserve these contracts unless a change explicitly redesigns them:
    run that backup is the pre-live one of invariant 1, so undo reverts
    both halves -- the live keys and the offline remainder -- not just the
    remainder.
+   "Most recent" is decided by *filename*, not mtime. Every backup name
+   comes from one helper (`new_backup_path`) whose fields are all fixed
+   width down to the microsecond, so a byte sort of the names is a
+   chronological sort, and a name is never reused -- `shutil.copy2`
+   truncates its destination, so two applies sharing a second used to
+   leave one file. mtime cannot carry this: `copy2` copies
+   `Preferences`' mtime onto the backup (now corrected with `os.utime`,
+   but every backup written before that still lies), and a profile
+   directory copied between machines loses its mtimes while the names
+   survive. Old second-resolution names still glob, still restore, and
+   still sort correctly.
 8. Profile flags (`--channel`, `-r`, `-p`) are accepted both before and
    after the action name: real defaults live on the root parser; action
    parsers re-declare them with `argparse.SUPPRESS` so the after-action

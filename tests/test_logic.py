@@ -1,7 +1,10 @@
 """Pure-logic tests — no Brave process, no real profile, no subprocess."""
 from __future__ import annotations
 
+import datetime as _datetime
 import json
+import os
+import time
 from pathlib import Path
 
 import pytest
@@ -266,6 +269,56 @@ def test_write_atomic_retries_the_replace(
     assert calls["n"] == 3
     assert json.loads(p.read_text()) == {"new": True}
     assert not p.with_suffix(p.suffix + ".tmp").exists()
+
+
+# ---------------------------------------------------------------------------
+# backup naming — two applies must never share a backup file
+# ---------------------------------------------------------------------------
+
+class _FrozenClock:
+    """A `datetime` stand-in whose `now()` never advances.
+
+    Two applies inside one wall-clock second are the case that loses a
+    backup; freezing the clock makes that case deterministic instead of
+    depending on how fast the suite runs.
+    """
+
+    @staticmethod
+    def now() -> _datetime.datetime:
+        return _datetime.datetime(2026, 1, 1, 12, 0, 0, 123456)
+
+
+def test_backup_path_is_never_reused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(bu, "datetime", _FrozenClock)
+    prefs = tmp_path / "Preferences"
+    prefs.write_text("{}", encoding="utf-8")
+
+    first = bu.new_backup_path(prefs)
+    first.touch()
+    second = bu.new_backup_path(prefs)
+
+    assert first.name.startswith("Preferences.bak.")
+    assert second.name.startswith("Preferences.bak.")
+    assert first != second
+    # A byte sort of backup names must stay a chronological sort: the
+    # collision suffix has to land *after* the name it disambiguates.
+    assert sorted([first, second])[-1] is second
+
+
+def test_backup_carries_its_own_mtime(tmp_path: Path) -> None:
+    prefs = tmp_path / "Preferences"
+    prefs.write_text(json.dumps({"foo": 1}), encoding="utf-8")
+    os.utime(prefs, (1_000_000, 1_000_000))
+    backup = tmp_path / "Preferences.bak.20260101-000000.000000"
+
+    bu.backup_prefs(prefs, backup)
+
+    # copy2's copystat would hand the backup Preferences' mtime, so
+    # `restore --list` printed when the *browser* last wrote the profile.
+    assert backup.stat().st_mtime > 1_000_000
+    assert abs(backup.stat().st_mtime - time.time()) < 60
 
 
 def _flaky_open(monkeypatch: pytest.MonkeyPatch, failures: int) -> dict:

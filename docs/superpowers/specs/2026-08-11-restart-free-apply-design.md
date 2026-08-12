@@ -808,6 +808,15 @@ removals — that is change B); and `restore --list` prints the mtime of
 `shutil.copy2`), so the timestamp contradicts the `.bak.%Y%m%d-%H%M%S` filename
 printed beside it.
 
+**Closed.** The `restore --list` mtime note is fixed: `backup_prefs` now
+`os.utime`s the copy it just made (and `restore_prefs` does the same for the
+restored `Preferences`), so a backup's mtime is when it was taken. The same
+change gave backups microsecond-resolution names through a single
+`new_backup_path` helper — two applies in one wall-clock second used to leave
+one file, because `copy2` truncates its destination and returns normally — and
+made `cmd_restore` sort by name rather than mtime, since the name is now the
+only signal that survives a profile directory being copied around.
+
 ### Deliberately not done: dropping the tree diff for `[settings]`
 
 The larger version of this fix computes both changes and removals at dotted-key

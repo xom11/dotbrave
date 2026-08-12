@@ -7,6 +7,7 @@ import shutil
 import sys
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -91,14 +92,54 @@ def load_prefs(path: Path) -> dict:
     return retry_on_permission_error(read, path)
 
 
+def new_backup_path(prefs_path: Path) -> Path:
+    """Return a backup path next to ``prefs_path`` that does not exist yet.
+
+    Two backups must never share a name: ``shutil.copy2`` truncates its
+    destination, so a reused name drops the earlier snapshot with no
+    error.  Microseconds make a shared name effectively impossible; the
+    counter makes it impossible, including across a DST fallback where a
+    whole wall-clock second repeats.  Every field is fixed width, so a
+    byte sort of these names is a chronological sort -- which is what
+    ``cmd_restore`` relies on to pick the most recent one.
+
+    Second-resolution names written by older versions still match the
+    ``.bak.*`` glob and still sort correctly: ``...-000000`` is a prefix
+    of ``...-000000.000001``, so it orders first, and an old-format file
+    in the same second necessarily predates a new-format one.
+    """
+    base = f"{prefs_path.name}.bak.{datetime.now():%Y%m%d-%H%M%S.%f}"
+    candidate = prefs_path.with_name(base)
+    n = 0
+    while candidate.exists():
+        # Deliberately not re-reading the clock: under a frozen test
+        # clock -- or a clock that simply has not ticked -- that loop
+        # never terminates.
+        n += 1
+        candidate = prefs_path.with_name(f"{base}.{n:03d}")
+    return candidate
+
+
 def backup_prefs(prefs_path: Path, backup: Path) -> None:
     """Snapshot Preferences to ``backup`` while the browser may be running."""
     retry_on_permission_error(lambda: shutil.copy2(prefs_path, backup), prefs_path)
+    # copy2 runs copystat, which copies Preferences' mtime onto the
+    # backup -- so `restore --list` printed when the *browser* last wrote
+    # the profile, contradicting the timestamp in the name beside it.  A
+    # backup's mtime is when it was taken.  copy2 stays (copystat also
+    # carries the mode, keeping a 0600 profile file 0600 rather than
+    # picking up umask defaults); the utime sits outside the retry
+    # because the file it touches is ours, not the one the browser is
+    # racing.
+    os.utime(backup, None)
 
 
 def restore_prefs(backup: Path, prefs_path: Path) -> None:
     """Copy ``backup`` back over Preferences."""
     retry_on_permission_error(lambda: shutil.copy2(backup, prefs_path), prefs_path)
+    # Same reason: without this the restored Preferences carries the
+    # backup's mtime, which the next backup would then inherit in turn.
+    os.utime(prefs_path, None)
 
 
 def get_nested(d: dict, keys: tuple[str, ...]) -> dict:
