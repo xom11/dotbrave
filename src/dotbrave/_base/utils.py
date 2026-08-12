@@ -136,10 +136,23 @@ def backup_prefs(prefs_path: Path, backup: Path) -> None:
 
 def restore_prefs(backup: Path, prefs_path: Path) -> None:
     """Copy ``backup`` back over Preferences."""
-    retry_on_permission_error(lambda: shutil.copy2(backup, prefs_path), prefs_path)
-    # Same reason: without this the restored Preferences carries the
-    # backup's mtime, which the next backup would then inherit in turn.
-    os.utime(prefs_path, None)
+
+    def _copy_and_touch() -> None:
+        shutil.copy2(backup, prefs_path)
+        # Unlike `backup_prefs`, `prefs_path` here IS Preferences -- the
+        # file the browser's own replace can be racing -- so the utime
+        # has to sit inside the retry too, not outside it: an unretried
+        # `os.utime` left the same window `copy2` above it needs
+        # `retry_on_permission_error` for at all, and a `PermissionError`
+        # out of it would propagate uncaught after Preferences had
+        # already been overwritten but before the sidecars were cleared
+        # or the browser relaunched. `copy2` is idempotent, so a retry
+        # here just re-copies and re-stamps; without this, the restored
+        # Preferences would also carry the backup's mtime, which the next
+        # backup would then inherit in turn.
+        os.utime(prefs_path, None)
+
+    retry_on_permission_error(_copy_and_touch, prefs_path)
 
 
 def get_nested(d: dict, keys: tuple[str, ...]) -> dict:

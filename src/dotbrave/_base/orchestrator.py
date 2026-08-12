@@ -713,10 +713,10 @@ def cmd_restore(
 ) -> None:
     """Restore Preferences from a backup created by a prior ``apply``.
 
-    Resolves a backup file (most recent by mtime, or the one passed via
-    ``--from``), copies it back over Preferences, and clears the
-    shortcuts/settings sidecars so the next apply starts from a clean
-    "managed by dotbrave" set.
+    Resolves a backup file (most recent by *filename*, not mtime -- see
+    the sort below for why -- or the one passed via ``--from``), copies
+    it back over Preferences, and clears the shortcuts/settings sidecars
+    so the next apply starts from a clean "managed by dotbrave" set.
 
     [pwa] is intentionally out of scope -- the policy file lives outside
     the profile and isn't part of the per-apply backup.  The user is

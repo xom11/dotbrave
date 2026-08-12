@@ -234,6 +234,36 @@ def test_shortcut_script_never_unassigns_a_removal_it_cannot_resolve() -> None:
     assert unresolved == ["shortcuts.new_tab"]
 
 
+def test_shortcut_script_resolves_a_removal_with_an_empty_recorded_default() -> None:
+    """A command Brave records with an *empty* default list is still
+    resolvable -- unassigning every binding genuinely is that command's
+    default -- and must not be confused with a command absent from the
+    map entirely, which instead goes to `unresolved`.
+
+    This needs `cid in defaults`, not `defaults.get(cid)` truthiness: an
+    empty list is falsy, so the truthiness form would treat it exactly
+    like a missing entry and send it to `unresolved` instead of resetting
+    it live.
+    """
+    from dotbrave.command_ids import NAME_TO_ID
+
+    new_tab = str(NAME_TO_ID["new_tab"])
+    before = {
+        "brave": {
+            "accelerators": {new_tab: ["Control+KeyT"]},
+            "default_accelerators": {new_tab: []},
+        }
+    }
+    target = json.loads(json.dumps(before))
+    del target["brave"]["accelerators"][new_tab]
+
+    script, unresolved = live._shortcut_script(before, target, {new_tab})
+
+    assert script is not None
+    assert f'"{new_tab}":[]' in script
+    assert unresolved == []
+
+
 def test_brave_live_routes_new_tab_settings_through_new_tab_actions(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -1371,13 +1401,21 @@ def test_settings_sidecar_is_not_read_as_command_ids() -> None:
     shortcut removal set would reach `int(cid)` and raise, and a command
     id arriving on the settings side would send every dropped shortcut
     offline.  Both derivations filter by namespace for that reason.
+
+    The settings payload here deliberately carries a `managed_ids` list
+    too -- a real settings plan never would, but `_shortcut_removals`
+    only *reads* the key, and a payload without one would pass the
+    `isinstance(ids, list)` check for the wrong reason (there being no
+    list at all) rather than the one this test exists to pin: the
+    namespace filter, and only the namespace filter, keeps a settings
+    plan's payload out of the shortcut removal set.
     """
     settings_plan = Plan(
         namespace="settings",
         diff_lines=["changed"],
         apply_fn=lambda _p: None,
         verify_fn=lambda _p: None,
-        state_payload={"managed_keys": []},
+        state_payload={"managed_keys": [], "managed_ids": []},
     )
 
     removals = live._shortcut_removals(

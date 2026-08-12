@@ -257,7 +257,11 @@ Preserve these contracts unless a change explicitly redesigns them:
    recorded in the sidecars, would leak into invariants 2 and 6, and would
    never self-heal -- the same key is still unsupported next run, so there
    is still a remainder. On a home-manager activation, which only ever
-   runs `--unattended`, that state would be permanent.
+   runs `--unattended`, that state would be permanent. On a fresh
+   profile, before Brave has ever committed `brave.default_accelerators`
+   to disk, every `[shortcuts]` removal in the run is unresolvable at
+   once, so the whole run refuses -- the amplified case, and the shape a
+   home-manager user could actually hit.
    Every close captures the running
    command line *first* (`find_cmdline_fn`) and the relaunch forwards its
    flags: rebuilding the command line from scratch drops whatever the
