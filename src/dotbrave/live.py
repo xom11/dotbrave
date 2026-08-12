@@ -257,8 +257,17 @@ def _plan_removals(plans: list[Plan], managed_before: set[str]) -> set[str]:
     defensive-by-habit, and so is *not* gating on ``plan.empty``: an empty
     plan is precisely the case this exists for.  A malformed payload
     yields no removals rather than raising, the same way
-    ``_enrich_prior_values`` reads one.
+    ``_enrich_prior_values`` reads one.  Both sides of the subtraction
+    are filtered to strings, not just the one read from the plan: the
+    sidecar is the other side, and a hand-edited one with a number in
+    ``managed_keys`` would otherwise reach the caller's ``sorted()`` as a
+    mixed set and raise ``TypeError``.
+
+    The granularity here is the config's dotted key, which is not the
+    tree diff's leaf path.  Reconciling the two is the caller's job; see
+    the comment at the call site.
     """
+    managed = {k for k in managed_before if isinstance(k, str)}
     out: set[str] = set()
     for plan in plans:
         if plan.namespace != _base_settings.NAMESPACE:
@@ -269,7 +278,7 @@ def _plan_removals(plans: list[Plan], managed_before: set[str]) -> set[str]:
         keys = payload.get("managed_keys")
         if not isinstance(keys, list):
             continue
-        out |= managed_before - {k for k in keys if isinstance(k, str)}
+        out |= managed - {k for k in keys if isinstance(k, str)}
     return out
 
 
@@ -677,13 +686,31 @@ def apply_live(
     # tree diff sees a dict-valued key the config still names *shrink* (a
     # leaf vanishing under it, so the key never leaves `managed_keys`);
     # only the plan-derived set sees a key whose value never reached the
-    # file.  For a scalar key both name the same thing.  For a dict key
-    # dropped whole the union carries the dotted key *and* its leaves,
-    # and the leaves stay unresolvable so the run goes offline -- exactly
-    # what happens today.  Pruning them would instead push a dictionary
-    # value through `setPref`, which is untested against settingsPrivate.
+    # file.  For a scalar key both name the same thing.
+    #
+    # They do not speak the same granularity, though: the tree diff names
+    # leaf paths (`brave.some_dict.b`), the plan names the config's dotted
+    # key (`brave.some_dict`).  A dict-valued key dropped whole is the one
+    # shape where that matters -- the diff has already produced every leaf
+    # under it, and carrying the dotted key alongside them changes
+    # behaviour without fixing anything.  It resolves out of
+    # `prior_values` into a live `setPref(key, <dict>)` -- a dictionary
+    # value through settingsPrivate, untested here -- while its own leaves
+    # stay unresolvable, so the run still goes offline and `apply_fn` pops
+    # the key straight back off, undoing the write.  It also costs a work
+    # tab: without the dotted key this diff has no live half at all and
+    # refuses below, before the browser is touched.  So drop a
+    # plan-derived key when the diff already produced removals strictly
+    # beneath it.  A key whose value never reached the file has nothing
+    # beneath it there, which is why this leaves that case -- the one this
+    # set exists for -- exactly as it was.
     changes, disk_removals = _setting_changes(prefs, target_prefs)
-    removals = sorted(set(disk_removals) | _plan_removals(plans, managed_before))
+    plan_removals = {
+        key
+        for key in _plan_removals(plans, managed_before)
+        if not any(leaf.startswith(f"{key}.") for leaf in disk_removals)
+    }
+    removals = sorted(set(disk_removals) | plan_removals)
     newtab_changes, ordinary_changes = _route_settings(changes)
     # Resolve removals against the sidecar's recorded prior values *before*
     # the preflight runs, and fold the resolved writes into the ordinary

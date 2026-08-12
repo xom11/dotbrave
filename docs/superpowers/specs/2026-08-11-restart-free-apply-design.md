@@ -701,6 +701,24 @@ The namespace filter in `_plan_removals` is load-bearing for the same reason,
 and the helper does not gate on `plan.empty` — an empty plan is precisely the
 case it exists for.
 
+The union is over two different granularities, and one shape makes that
+visible: the tree diff names leaf paths (`brave.some_dict.b`), the plan names
+the config's dotted key (`brave.some_dict`). For a scalar key they coincide.
+For a **dict-valued key dropped whole** the diff has already produced every leaf
+under it, and the dotted key on top of them is not extra safety — it is a
+behaviour change. It resolves out of `prior_values` into a live
+`setPref(key, <dict>)`, a dictionary through `settingsPrivate` that nothing here
+tests, while its own leaves stay unresolvable, so the run goes offline regardless
+and `apply_fn` pops the key back off — undoing the write. And without it that
+diff has no live half at all, so it refuses before a work tab is opened, which is
+the guarantee `test_removal_only_diff_never_opens_a_work_tab` exists for. So a
+plan-derived key is dropped when the disk diff already produced removals
+*strictly beneath* it (`any(d.startswith(key + ".") for d in disk_removals)`).
+A key whose value never reached the file has nothing beneath it in that diff, so
+the case this whole set exists for is untouched. Verified by running the shape
+against a detached checkout of the pre-fix commit and against the fix: identical
+raise, no work tab, no navigation, no `setPref`, no backup on either.
+
 Resolving against the browser via `getPref` — the direction sketched before the
 fix — was **not** taken. It is unnecessary: the sidecar's `prior_values` already
 holds what a removal needs, and the preflight cannot be asked about a key until
@@ -722,12 +740,23 @@ B in place `.empty` means what it says again.
 previously did nothing at all. Three routes reach that marker: a key first
 applied while Brave was closed and absent from disk, a key the config set to
 its own default (`_enrich_prior_values` condition 4 deliberately learns nothing
-there), and a key the user deleted by hand. The restart is not a tax for
-nothing — the close flushes the value dotbrave holds in the browser's RAM to
-disk, `cmd_apply` re-reads `Preferences` after the close, and `_pop_value` then
-deletes the key from *that* copy, so it genuinely returns to its default. That
-correctness depends on the post-close re-read; without it the restart would
-write the pre-close snapshot back and undo itself.
+there), and a key the user deleted by hand.
+
+On the memory-only route the restart is not a tax for nothing — the close
+flushes the value dotbrave holds in the browser's RAM to disk, `cmd_apply`
+re-reads `Preferences` after the close, and `_pop_value` then deletes the key
+from *that* copy, so it genuinely returns to its default. That correctness
+depends on the post-close re-read; without it the restart would write the
+pre-close snapshot back and undo itself. It does **not** generalise to all three
+routes: for a key the user deleted from `Preferences` by hand while Brave was
+closed, the browser is holding nothing to flush and the cycle rewrites the
+sidecar and nothing else. The close/relaunch buys bookkeeping there, not a reset.
+
+`--unattended` has no cycle to spend. It warns and returns without writing state
+files, by design (invariant 5), so an unresolvable removal is *not* consumed:
+it recurs on every activation until an apply runs with Brave closed. New for
+home-manager users, and the honest version of what used to happen — pre-fix the
+key was orphaned silently and forever.
 
 **On the claim that no unit test could reach this.** Wrong, and worth
 correcting: `apply_live` never writes `Preferences`, so "the disk lags the

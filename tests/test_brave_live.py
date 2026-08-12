@@ -1186,6 +1186,55 @@ def test_a_leaf_vanishing_under_a_still_managed_key_is_still_a_removal(
     assert excinfo.value.keys == ["brave.some_dict.b"]
 
 
+def test_a_dict_key_dropped_whole_refuses_before_opening_a_work_tab(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Where the two removal sets overlap, the disk one wins.
+
+    `Preferences` holds the whole dict, so the tree diff already names
+    every leaf under the key; the plan-derived set names the config's
+    dotted key on top of that.  The dotted key *does* resolve out of
+    `prior_values`, but its own leaves do not, so the run goes offline
+    anyway and `apply_fn` pops the key straight back off.  Carrying it
+    would buy nothing and cost two things this pins: a work tab opened in
+    the user's browser only to refuse a moment later, and a dictionary
+    pushed through `setPref`, which is untested against settingsPrivate.
+    """
+    prefs_path = tmp_path / "Default" / "Preferences"
+    prefs_path.parent.mkdir()
+    prefs = {"brave": {"some_dict": {"a": 1, "b": 2}}}
+    prefs_path.write_text(json.dumps(prefs))
+    _sidecar(prefs_path).write_text(json.dumps({
+        "managed_keys": ["brave.some_dict"],
+        # Exactly the entry `_capture_prior_values` records for a
+        # dict-valued key present on disk, so the dotted key is genuinely
+        # resolvable and only the pruning keeps it out of the live half.
+        "prior_values": {
+            "brave.some_dict": {"present": True, "value": {"a": 1, "b": 2}},
+        },
+    }))
+
+    plan = settings_mod.plan_apply(prefs_path, prefs, {})   # dropped whole
+
+    fake = FakeCdpClient(9333)
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake)
+
+    with pytest.raises(shared_live.LiveApplyUnsupported) as excinfo:
+        live.apply_live(9333, prefs_path, prefs, [plan])
+
+    assert excinfo.value.keys == ["brave.some_dict.a", "brave.some_dict.b"]
+    # No work tab: `_worker_target` may reuse an existing page, so the
+    # navigation list is the load-bearing half of this pair.
+    assert fake.created == []
+    assert fake.navigations == []
+    # Deliberately loose, unlike the `_setpref_call` assertions elsewhere:
+    # this one asserts *absence*, so the broader match is the stricter
+    # test.
+    assert not any(
+        "setPref" in e and "some_dict" in e for e in fake.evaluations
+    )
+
+
 def test_a_dropped_shortcut_id_never_becomes_a_settings_removal(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -1298,3 +1347,10 @@ def test_apply_does_not_orphan_a_memory_only_key_on_the_pwa_branch(
     assert any(
         _setpref_call(_CLOSING, True) in e for e in fake.evaluations
     ), "the dropped key was never restored through the live endpoint"
+    # The orphan was defined by the pair, so assert the pair: the key left
+    # `managed_keys` *and* was restored on the way out.  Leaving it out of
+    # the set is correct only because the setPref above happened; the bug
+    # was the sidecar being rewritten by `write_state_files` for a plan the
+    # adapter never saw.
+    state = json.loads(_sidecar(prefs_path).read_text())
+    assert state["managed_keys"] == []

@@ -122,17 +122,31 @@ Preserve these contracts unless a change explicitly redesigns them:
    replacement: only the tree diff sees a dict-valued key the config
    still names shrink. And no new field on `Plan` -- a generic one would
    invite `[shortcuts]` command ids into a key space `_resolve_removals`
-   reads as dotted pref paths. `diff_summary` must emit a line for a
+   reads as dotted pref paths. The two sets do not share a granularity
+   (leaf paths vs the config's dotted key), so a plan-derived key is
+   dropped when the diff already produced removals strictly beneath it:
+   for a dict-valued key dropped whole the leaves alone are the whole
+   removal, exactly as before this union existed, and carrying the dotted
+   key too would open a work tab for a run that refuses anyway and push a
+   dictionary value through `setPref`. A key whose value never reached
+   the file has nothing beneath it there, so it is unaffected.
+   `diff_summary` must emit a line for a
    removed key absent from disk (`- <key> (removed; not present on
    disk)`); silence there makes `Plan.empty` true, and an empty plan is
    dropped by the orchestrator's early return, by the sidecar write on
    the `[pwa]`-dirty branch, and by `compute_target_prefs`. The
    consequence to keep in view: a removal with no usable prior value now
    always costs a close, an offline apply and a relaunch, where a
-   memory-only key used to silently do nothing. That restart really does
-   reset the key, but only because the close flushes the browser's copy
-   and `cmd_apply` re-reads `Preferences` afterwards (invariant 1) --
-   `_pop_value` then deletes it from the post-close copy.
+   memory-only key used to silently do nothing. On the memory-only route
+   that restart really does reset the key, but only because the close
+   flushes the browser's copy and `cmd_apply` re-reads `Preferences`
+   afterwards (invariant 1) -- `_pop_value` then deletes it from the
+   post-close copy. It is not a universal claim: for a key the user
+   deleted from `Preferences` by hand while Brave was closed the browser
+   holds nothing to flush, and the cycle only rewrites the sidecar.
+   Under `--unattended` there is no cycle at all -- the run warns and
+   returns without writing state files, so an unresolvable removal
+   recurs on every activation until an apply runs with Brave closed.
 3. `[settings]` must refuse MAC-protected keys found in either `Preferences`
    or sibling `Secure Preferences`. Never make a write that Brave will
    silently reset on launch.
