@@ -408,7 +408,34 @@ installs and minted 12 duplicate shims. They were swept afterwards by
 **Phase 3 is unblocked.** What remains before building it are product decisions,
 not technical unknowns — see below.
 
-### Open decisions before Phase 3 is worth building
+### Decision, 2026-08-12: Phase 3 is not being built
+
+The gate passed, and the answer is still no. The owner changes the `[pwa]` list
+rarely — a couple of entries a year. Phase 3's price is a background process
+that owns the browser's lifetime, a one-off migration that removes all twelve
+apps and reinstalls them, and the loss of the property that a hand-removed app
+comes back by itself. That buys back one close/relaunch every few months.
+
+So `[pwa]` stays on managed policy, and a `[pwa]` change keeps landing at the
+browser's next launch. That is now the *only* namespace with that cost:
+`[settings]` and `[shortcuts]` — the ones edited often — apply live, including
+removals.
+
+Reopen this only if one of these changes:
+
+- the `[pwa]` list starts churning (several changes a month, or a workflow that
+  rewrites it programmatically);
+- multiple machines need identical PWA sets and the migration cost amortises;
+- Chromium gains a way to make a running browser re-read the policy, which
+  would deliver the same result with none of Phase 3's cost — that would make
+  the agent unnecessary rather than worthwhile, so watch for it before building
+  anything.
+
+Everything needed to build it later is recorded above: the transport gate, the
+pipe's lifetime coupling, the macOS single-instance rule, and the measured
+behaviour of `PWA.install`/`uninstall`. Nothing here needs re-deriving.
+
+### Open decisions, had Phase 3 gone ahead
 
 - **Does `[pwa]` switch wholesale, or is CDP opt-in?** Switching means removing
   the 12 forced entries, the LaunchDaemon, the `schg` pin and the sudo prompts —
