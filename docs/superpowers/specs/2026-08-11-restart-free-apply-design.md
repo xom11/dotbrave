@@ -136,13 +136,33 @@ A third class, *removals*, is solvable inside dotbrave and is addressed in
 Phase 1.
 
 **`[pwa]`** — on macOS, policy is never re-read by a running process, so it
-needs either a restart or the CDP route (pipe, hence an agent). *(inferred)*
-On Windows and Linux the policy loaders watch the registry / policy directory,
-and this repo's own docstring at `_base/utils.py:58-69` ("the freshly written
-policy makes the browser install the forced web app, which rewrites
-Preferences") only makes sense if a running browser picks the policy up. If
-that holds, `[pwa]` is already live off macOS and the pipe work is a
-macOS-only tax.
+needs either a restart or the CDP route (pipe, hence an agent).
+
+On **Windows this is measured, not inferred, and the answer is yes** — with a
+caveat that matters more than the yes. Run 2026-08-12 on the a14 box (Windows
+11, Brave already running, pid 9392 up since 09:31:52): one entry was added to
+`HKLM\SOFTWARE\Policies\BraveSoftware\Brave\WebAppInstallForceList`, matching
+the format of the twelve already there, and nothing else was touched.
+
+    t+100s   nothing
+    t+240s   nothing
+    t+480s   nothing
+    t+580s   installed
+
+The profile grew `Web Applications\_crx_dnfpoenibinnbbckgbhendmlljoobcfg`
+containing `Excalidraw.exe` and its icon, and `Excalidraw.lnk` appeared on the
+Desktop — created by the **same** browser process, pid unchanged, no relaunch.
+
+So the docstring at `_base/utils.py:58-69` is right: a running browser does
+pick the registry policy up. But it takes **roughly ten minutes**, not
+seconds — consistent with a periodic policy reload rather than a registry
+watcher firing immediately. That is the number to tell a Windows user: their
+`[pwa]` change needs no restart, and it also will not be there when the
+command returns. A tool that printed "applied" and left them staring at an
+unchanged Start menu for ten minutes would be worse than one that said so.
+
+Linux remains *(inferred)*: `/etc/brave/policies/managed/` is a watched
+directory and the same reasoning applies, but nobody has measured it.
 
 ## Bugs to fix regardless of this design
 
