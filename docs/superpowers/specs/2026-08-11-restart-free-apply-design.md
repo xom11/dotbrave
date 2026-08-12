@@ -153,13 +153,27 @@ The profile grew `Web Applications\_crx_dnfpoenibinnbbckgbhendmlljoobcfg`
 containing `Excalidraw.exe` and its icon, and `Excalidraw.lnk` appeared on the
 Desktop — created by the **same** browser process, pid unchanged, no relaunch.
 
+Removal was measured too, by taking the entry back out and watching the same
+running process:
+
+    t+120s … t+720s   still installed
+    t+840s            uninstalled, and the Desktop shortcut removed with it
+
+So both directions work without a restart, on the same cadence: **install
+around ten minutes, uninstall around fourteen**. The browser cleans up after
+itself — the profile returned to exactly its 13 app directories and the
+shortcut was deleted by Brave, not by hand.
+
 So the docstring at `_base/utils.py:58-69` is right: a running browser does
-pick the registry policy up. But it takes **roughly ten minutes**, not
-seconds — consistent with a periodic policy reload rather than a registry
-watcher firing immediately. That is the number to tell a Windows user: their
-`[pwa]` change needs no restart, and it also will not be there when the
-command returns. A tool that printed "applied" and left them staring at an
+pick the registry policy up. But the delay is the part worth telling a Windows
+user: their `[pwa]` change needs no restart, and it also will not be there when
+the command returns. A tool that printed "applied" and left them staring at an
 unchanged Start menu for ten minutes would be worse than one that said so.
+`apply`'s `[pwa]` message is currently written for the macOS reality ("loaded
+at its next launch"); on Windows it should say the change is live but lands on
+the browser's policy-refresh cycle, in minutes rather than immediately. Not
+changed yet — it needs the per-platform wording worked out, and this session
+did not do it.
 
 Linux remains *(inferred)*: `/etc/brave/policies/managed/` is a watched
 directory and the same reasoning applies, but nobody has measured it.
