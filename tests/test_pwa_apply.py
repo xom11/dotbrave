@@ -471,13 +471,28 @@ def test_macos_uses_binary_plist_format(
 
 def test_generated_header_does_not_advertise_a_removed_subcommand() -> None:
     """dotbrave registers only `apply` and `export` (browser.py passes
-    module_registers=[]), so no generated text may name `pwa dump`."""
-    import subprocess
+    module_registers=[]), so no generated text may name `pwa dump`.
+
+    Scans `src/` directly (stdlib only) instead of shelling out to `grep`,
+    which is not guaranteed to be on PATH (e.g. a stock Windows install).
+    """
+    import os
     from pathlib import Path
 
+    forbidden = "pwa dump"
     src = Path(__file__).resolve().parents[1] / "src"
-    hits = subprocess.run(
-        ["grep", "-rn", "pwa dump", str(src), "--include=*.py"],
-        capture_output=True, text=True,
-    ).stdout.strip()
-    assert hits == "", f"removed subcommand still advertised:\n{hits}"
+    hits: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(src):
+        dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+        for filename in filenames:
+            if not filename.endswith(".py"):
+                continue
+            path = Path(dirpath) / filename
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                continue
+            for lineno, line in enumerate(text.splitlines(), start=1):
+                if forbidden in line:
+                    hits.append(f"{path}:{lineno}:{line}")
+    assert not hits, "removed subcommand still advertised:\n" + "\n".join(hits)
