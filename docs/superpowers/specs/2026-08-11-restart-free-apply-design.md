@@ -640,6 +640,50 @@ a macOS or Windows equivalent, where the callback would stay a constant `True`.
 Until such a signal exists, the honest answer is that a running browser on the
 target root means the profile may be open, and the close stands.
 
+## Found after shipping: a removal is computed against the disk, not the browser
+
+First end-to-end run against a real Brave, 2026-08-12, on a throwaway root.
+Three applies in sequence: add four keys, flip one, drop one. The first two
+behaved exactly as designed — the Dock-launched Brave was closed and relaunched
+once to obtain an endpoint, and the second apply was live with no restart. The
+third exposed a bug no unit test can reach, because the fake CDP client cannot
+model the thing that causes it: **the browser holds state the disk does not.**
+
+A live apply writes into Brave's in-memory `PrefService`. Brave commits that to
+`Preferences` on its own timer (~10s) or at exit. Every backup taken during the
+run proves the gap — all three show the four keys still `ABSENT` on disk, while
+the file written when Brave finally quit has them.
+
+`_setting_changes` diffs the **on-disk** prefs against the target. So when the
+config drops a key whose value has only ever existed in browser memory,
+`changed_leaf_paths` sees `MISSING` on both sides and reports no change at all.
+The key never enters `removals`, `_resolve_removals` never runs, and nothing is
+restored — yet `plan_apply` still writes the new `managed_keys` without it. The
+key is orphaned: left at dotbrave's value, no longer managed, with a
+`prior_values` entry that can never be used again.
+
+Measured: `brave.enable_closing_last_tab` had a recorded prior value of `true`,
+was dropped from the config, and finished at `false` — dotbrave's own value.
+The run printed `ok -- live applied` throughout.
+
+It self-corrects for a removal issued after Brave has flushed: the key is then
+on disk, the diff sees it, and the prior value is restored correctly. So the
+window is "remove a key before the browser has committed the write that set
+it". Narrow in wall-clock terms, but the very first natural sequence hit it,
+and a browser killed before it flushes widens it to "forever".
+
+This is the same family as B1 — the live path trusting a disk snapshot when the
+running browser is the authority — surviving in a third place after being fixed
+in two. The fix direction: a key that the sidecar says is managed but the config
+no longer contains must be resolved against the **browser**, via `getPref`,
+rather than inferred from its absence on disk. The preflight already speaks
+`getPref`; the removal path simply never asks it, because a key missing from
+the disk diff never becomes a candidate to ask about.
+
+Not fixed here — it needs its own change and its own review, and the fake CDP
+client needs to grow a notion of "browser value differs from disk value" or the
+regression test will be as blind as the ones that missed it.
+
 ## Out of scope
 
 - Making unallowlisted or startup-read prefs live. Not possible; the tool
