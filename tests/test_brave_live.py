@@ -636,6 +636,10 @@ def test_removal_with_a_malformed_prior_value_entry_still_goes_offline(
 
 _WIDE = "brave.location_bar_is_wide"
 _COLLAPSED = "brave.tabs.vertical_tabs_collapsed"
+#: A numeric key, so "the value on disk", "the value the browser holds"
+#: and "the value being written" can be three distinguishable things in
+#: one test -- which is what the disk-capture-vs-live-read cases need.
+_WIDTH = "brave.tabs.vertical_tabs_expanded_width"
 
 
 def _pref_entry(key: str, value: object) -> dict:
@@ -792,6 +796,162 @@ def test_a_learned_value_equal_to_the_write_records_nothing(
 
     state = json.loads(_sidecar(prefs_path).read_text())
     assert state["prior_values"][_WIDE] == {"present": False, "value": None}
+
+
+def test_the_live_value_wins_over_this_runs_stale_disk_capture(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Two observations of the same quantity, one of them lagged.
+
+    `_capture_prior_values` reads the on-disk Preferences, which Chromium
+    commits on a delayed timer -- so a value the user changed in the
+    browser minutes ago can still be absent from the file.  The preflight's
+    `getPref` read the browser's own copy, before this run wrote anything.
+    Both were taken in this same run, so neither is an earlier run's
+    first-seen entry; the live one is simply the one that is not stale.
+    """
+    prefs_path = tmp_path / "Default" / "Preferences"
+    prefs_path.parent.mkdir()
+    prefs = {"brave": {"tabs": {"vertical_tabs_expanded_width": 200}}}
+    prefs_path.write_text(json.dumps(prefs))
+
+    plan = settings_mod.plan_apply(prefs_path, prefs, {_WIDTH: 300})
+    # What plan_apply could learn from disk alone: the lagged copy.
+    assert plan.state_payload["prior_values"][_WIDTH] == {
+        "present": True, "value": 200,
+    }
+
+    fake = FakeCdpClient(9333, evaluation_results=[[_pref_entry(_WIDTH, 240)]])
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake)
+
+    live.apply_live(9333, prefs_path, prefs, [plan])
+
+    state = json.loads(_sidecar(prefs_path).read_text())
+    assert state["prior_values"][_WIDTH] == {"present": True, "value": 240}
+
+
+def test_the_live_learned_prior_is_what_a_later_removal_restores(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The silent revert this exists to stop.
+
+    Recording the stale disk copy is permanent -- `merge_prior_values`
+    never overwrites -- so every later removal of the key writes the
+    user's *pre-edit* value back over their own change.
+    """
+    prefs_path = tmp_path / "Default" / "Preferences"
+    prefs_path.parent.mkdir()
+    prefs = {"brave": {"tabs": {"vertical_tabs_expanded_width": 200}}}
+    prefs_path.write_text(json.dumps(prefs))
+
+    plan = settings_mod.plan_apply(prefs_path, prefs, {_WIDTH: 300})
+    first = FakeCdpClient(9333, evaluation_results=[[_pref_entry(_WIDTH, 240)]])
+    monkeypatch.setattr(live, "CdpClient", lambda port: first)
+    live.apply_live(9333, prefs_path, prefs, [plan])
+
+    # Second run: the key is gone from the config, and Preferences has
+    # caught up with what dotbrave wrote.
+    prefs = {"brave": {"tabs": {"vertical_tabs_expanded_width": 300}}}
+    prefs_path.write_text(json.dumps(prefs))
+    plan = settings_mod.plan_apply(prefs_path, prefs, {})
+    second = FakeCdpClient(9333, evaluation_results=[[_pref_entry(_WIDTH, 300)]])
+    monkeypatch.setattr(live, "CdpClient", lambda port: second)
+
+    live.apply_live(9333, prefs_path, prefs, [plan])  # must NOT raise
+
+    assert any(
+        f"{json.dumps(_WIDTH)}, 240" in e and "setPref" in e
+        for e in second.evaluations
+    ), "the removal must restore the value the browser actually held"
+    assert not any(f"{json.dumps(_WIDTH)}, 200" in e for e in second.evaluations)
+    state = json.loads(_sidecar(prefs_path).read_text())
+    assert state["prior_values"][_WIDTH] == {"present": True, "value": 240}
+
+
+def test_a_prior_value_recorded_by_an_earlier_run_still_wins_over_the_live_read(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """First-seen-wins is a rule *across runs*, and stays one.
+
+    The sidecar entry here was written by an earlier run, and
+    `managed_keys` does not cover the key (dropped from the config and
+    re-added), so nothing else would protect it.  The preflight's read
+    differs from both the recorded value and the value being written, so
+    an overwrite would be plainly visible.
+    """
+    prefs_path = tmp_path / "Default" / "Preferences"
+    prefs_path.parent.mkdir()
+    prefs = {"brave": {"tabs": {"vertical_tabs_expanded_width": 200}}}
+    prefs_path.write_text(json.dumps(prefs))
+    _sidecar(prefs_path).write_text(json.dumps({
+        "managed_keys": [],
+        "prior_values": {_WIDTH: {"present": True, "value": 150}},
+    }))
+
+    plan = settings_mod.plan_apply(prefs_path, prefs, {_WIDTH: 300})
+
+    fake = FakeCdpClient(9333, evaluation_results=[[_pref_entry(_WIDTH, 240)]])
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake)
+
+    live.apply_live(9333, prefs_path, prefs, [plan])
+
+    state = json.loads(_sidecar(prefs_path).read_text())
+    assert state["prior_values"][_WIDTH] == {"present": True, "value": 150}
+
+
+def test_a_recorded_absent_marker_is_still_enriched(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """An earlier run's `{"present": false}` is a recorded *absence*, not
+    a recorded value, and enrichment exists precisely to fill it in.  The
+    guard against over-tightening to "no sidecar entry is ever touched",
+    which would silently kill enrichment for every re-added key."""
+    prefs_path = tmp_path / "Default" / "Preferences"
+    prefs_path.parent.mkdir()
+    prefs = {"brave": {"tabs": {}}}
+    prefs_path.write_text(json.dumps(prefs))
+    _sidecar(prefs_path).write_text(json.dumps({
+        "managed_keys": [],
+        "prior_values": {_WIDTH: {"present": False, "value": None}},
+    }))
+
+    plan = settings_mod.plan_apply(prefs_path, prefs, {_WIDTH: 300})
+
+    fake = FakeCdpClient(9333, evaluation_results=[[_pref_entry(_WIDTH, 240)]])
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake)
+
+    live.apply_live(9333, prefs_path, prefs, [plan])
+
+    state = json.loads(_sidecar(prefs_path).read_text())
+    assert state["prior_values"][_WIDTH] == {"present": True, "value": 240}
+
+
+def test_a_learned_value_equal_to_the_write_leaves_the_disk_capture_alone(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The accepted residual, pinned.
+
+    Condition 4 -- the learned value must differ from the value being
+    written -- is checked before the disk capture is reconsidered, so a
+    `getPref` that merely echoes this run's own write never replaces
+    anything.  That is the guard against learning dotbrave's own value
+    when the sidecar is missing or stale, and it is unchanged.
+    """
+    prefs_path = tmp_path / "Default" / "Preferences"
+    prefs_path.parent.mkdir()
+    prefs = {"brave": {"tabs": {"vertical_tabs_expanded_width": 200}}}
+    prefs_path.write_text(json.dumps(prefs))
+
+    plan = settings_mod.plan_apply(prefs_path, prefs, {_WIDTH: 300})
+
+    # getPref already answers with the value this run is about to write.
+    fake = FakeCdpClient(9333, evaluation_results=[[_pref_entry(_WIDTH, 300)]])
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake)
+
+    live.apply_live(9333, prefs_path, prefs, [plan])
+
+    state = json.loads(_sidecar(prefs_path).read_text())
+    assert state["prior_values"][_WIDTH] == {"present": True, "value": 200}
 
 
 def test_a_run_with_a_remainder_writes_no_enriched_sidecar(

@@ -99,9 +99,27 @@ Preserve these contracts unless a change explicitly redesigns them:
    records it as the prior value. Only for a key this run is the first to
    manage, though -- after dotbrave's own write `getPref` returns
    dotbrave's value, and recording that would make removal restore
-   dotbrave's setting instead of the user's. An entry already recorded
-   `present: true` is never touched (`merge_prior_values` is
-   first-seen-wins). That default-learning trick only covers keys the
+   dotbrave's setting instead of the user's. An entry recorded by an
+   *earlier* run is never touched (`merge_prior_values` is
+   first-seen-wins, and that is a rule across runs). An entry this run's
+   own `_capture_prior_values` just read off disk is a different matter
+   and *is* replaced by the `getPref` value: both are observations of
+   the same quantity taken in the same run, and only the file's copy is
+   lagged by Chromium's commit timer -- so a user who changed the key in
+   the Brave UI minutes ago, then ran `apply`, would otherwise have
+   their pre-edit value locked in as "the prior" permanently, and the
+   next removal would silently revert them. `live.apply_live`
+   distinguishes the two by reading the sidecar's `prior_values` keys
+   into `recorded_before` before anything mutates; because
+   `merge_prior_values` is `setdefault`, membership decides provenance
+   exactly. Accepted in trade, both permanent once written and both
+   needing a prior failure to reach: a key dotbrave already wrote live
+   but never recorded (an `--unattended` run that hit a `CdpError`
+   before `write_state_files`) whose config value has since changed, and
+   a deleted or unparseable settings sidecar, can now learn dotbrave's
+   own value as the prior. Condition 4 (`getPref`'s answer must differ
+   from the value being written) still covers the common shape of both.
+   That default-learning trick only covers keys the
    settings preflight actually calls `getPref` for. The ten keys in
    `_NEWTAB_ACTIONS` (`live.py`, e.g. `show_clock`, `show_stats`,
    `show_background_image`) go through the New Tab store instead of

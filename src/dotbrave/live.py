@@ -289,6 +289,7 @@ def _enrich_prior_values(
     plans: list[Plan],
     learned: dict[str, tuple[Any, Any]],
     managed_before: set[str],
+    recorded_before: set[str],
 ) -> None:
     """Record the values the preflight read, where they are the *prior* ones.
 
@@ -309,28 +310,60 @@ def _enrich_prior_values(
        once dotbrave has written a key, ``getPref`` normally returns
        dotbrave's own value, and recording that would make a later
        removal restore dotbrave's setting instead of the user's;
-    3. its recorded entry is missing or does not already say
-       ``present: true``.  This keeps ``merge_prior_values``'s
-       first-seen-wins property intact -- this is not a back door
-       around it, it fills in entries that recorded no value at all.
-       A malformed entry is left exactly as found: we do not know
-       what wrote it;
+    3. its recorded entry is not an *earlier run's* observation of a
+       value.  ``recorded_before`` is the sidecar's ``prior_values``
+       keys as they were before this run, and because
+       ``merge_prior_values`` is ``setdefault`` -- key-presence based --
+       membership in it decides provenance exactly: a key in it kept
+       that earlier entry verbatim, a key not in it got the entry this
+       run's own ``_capture_prior_values`` just read off disk.  So an
+       earlier run's entry is never touched (first-seen-wins, as a rule
+       *across runs*), while this run's own disk capture is replaced by
+       the preflight's ``getPref`` value.  Both are observations of the
+       same quantity taken in the same run; only one of them is lagged
+       by Chromium's pref-commit timer, which is why the file can still
+       say 200 while the browser -- and the user, who changed it in the
+       UI -- says 240.  An entry recording no value at all
+       (``present: false``) is still filled in whoever wrote it: that
+       is what enrichment is for.  A malformed entry is left exactly as
+       found: we do not know what wrote it.
+
+       This condition is **not** the guard against ``getPref`` echoing
+       dotbrave's own value -- conditions 2 and 4 are.  Do not
+       re-tighten it back to a blanket "never touch an existing entry"
+       for that reason; that trades a real, no-prior-failure-needed bug
+       for a few seconds' incidental cover of two failure modes
+       conditions 2 and 4 already handle in the general case.  Named,
+       so nobody has to rediscover them:
+
+       * a previous ``--unattended`` run mutated the key live and then
+         hit a ``CdpError`` before ``write_state_files`` (the gap the
+         handler at the bottom of ``apply_live`` documents), *and* the
+         user has since changed the key's value in the config, so
+         condition 4 no longer bites;
+       * the settings sidecar was deleted or is unparseable, so both
+         ``managed_before`` and ``recorded_before`` come back empty.
+
+       In both, the old protection only ever held while the next apply
+       landed inside Chromium's commit window -- outside it,
+       ``_capture_prior_values`` reads dotbrave's own committed value
+       and records it identically.  Both are permanent once written;
+       recovery means hand-editing the sidecar.
     4. the value ``getPref`` read differs from ``target_value``.
-       Condition 2 alone has a gap: inside Chromium's ~10s pref-commit
-       window, a second apply of the same key can see the on-disk
-       ``Preferences`` -- and hence ``managed_keys``, which is read
-       from the same disk state -- still lag a write dotbrave itself
-       already made on the previous run.  ``getPref`` then answers with
-       dotbrave's own value even though nothing on disk yet says the
-       key is managed, so conditions 1-3 alone would learn it as though
-       it were the pre-dotbrave default. When the learned value already
-       equals the value being written, there is nothing trustworthy to
-       learn either way -- it may be a genuine coincidence, in which
-       case the key's real default is simply still unknown and the next
-       removal costs a restart, same as before this enrichment existed.
-       Learning nothing is cheap; learning wrongly would let a later
-       removal silently restore dotbrave's setting instead of the
-       user's.
+       Condition 2 alone has a gap: a run can mutate a key live and then
+       fail before ``write_state_files`` rewrites the sidecar, so
+       ``managed_keys`` -- dotbrave's own file, not a lagging copy of
+       Chromium's -- simply never recorded the key dotbrave already
+       wrote.  ``getPref`` then answers with dotbrave's own value even
+       though nothing says the key is managed, so conditions 1-3 alone
+       would learn it as though it were the pre-dotbrave default. When
+       the learned value already equals the value being written, there
+       is nothing trustworthy to learn either way -- it may be a genuine
+       coincidence, in which case the key's real default is simply still
+       unknown and the next removal costs a restart, same as before this
+       enrichment existed.  Learning nothing is cheap; learning wrongly
+       would let a later removal silently restore dotbrave's setting
+       instead of the user's.
 
     The plan's ``state_payload`` is mutated in place, which is also what
     gets written: the sidecar cannot diverge from what ``plan_apply``
@@ -356,9 +389,15 @@ def _enrich_prior_values(
             if value == target_value:
                 continue
             entry = prior.get(key, _NO_ENTRY)
-            if entry is _NO_ENTRY or (
-                isinstance(entry, dict) and entry.get("present") is not True
-            ):
+            if entry is _NO_ENTRY:
+                overwrite = True
+            elif not isinstance(entry, dict):
+                overwrite = False
+            elif entry.get("present") is not True:
+                overwrite = True
+            else:
+                overwrite = key not in recorded_before
+            if overwrite:
                 prior[key] = {"present": True, "value": value}
 
 
@@ -682,6 +721,14 @@ def apply_live(
     # the value read must differ from the value this run is about to
     # write -- is the backstop for exactly that case.
     managed_before = _base_settings.get_managed_keys(prefs_path)
+    # Which keys already had a `prior_values` entry before this run, read
+    # from the same sidecar and for the same reason it has to happen here:
+    # `plan_apply` has already folded this run's own disk capture into the
+    # plan's payload, so by the time `_enrich_prior_values` sees that dict
+    # the two provenances are indistinguishable.  Read before anything can
+    # rewrite the file -- and nothing does between `plan_apply` and
+    # enrichment.
+    recorded_before = set(_base_settings.get_prior_values(prefs_path))
     # Union, not replacement: neither source subsumes the other.  Only the
     # tree diff sees a dict-valued key the config still names *shrink* (a
     # leaf vanishing under it, so the key never leaves `managed_keys`);
@@ -843,6 +890,7 @@ def apply_live(
                 if key in learned_values
             },
             managed_before,
+            recorded_before,
         )
         _live.write_state_files(plans)
     except CdpError as e:
