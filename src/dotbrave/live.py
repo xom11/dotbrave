@@ -238,6 +238,41 @@ def _resolve_removals(
     return writes, unresolved
 
 
+def _plan_removals(plans: list[Plan], managed_before: set[str]) -> set[str]:
+    """Keys the sidecar says dotbrave manages that the config no longer names.
+
+    Nothing here reads ``Preferences``, and that is the whole point: the
+    file can lag the browser by a whole browsing session, so a key applied
+    live and then dropped from the config is absent from *both* sides of
+    the tree diff and produces no removal at all.  ``plan_apply`` already
+    computed exactly this set (``config_managed_keys - target_keys``) and
+    ships the other half of the subtraction in
+    ``state_payload["managed_keys"]``, so subtracting reconstructs it
+    without a new field on ``Plan`` -- one named generically enough to
+    hold this would invite ``[shortcuts]`` to pour a different key space
+    into it, and a command id arriving at ``_resolve_removals`` as a
+    dotted pref path would send every dropped shortcut offline.
+
+    Filtering by namespace is therefore deliberate rather than
+    defensive-by-habit, and so is *not* gating on ``plan.empty``: an empty
+    plan is precisely the case this exists for.  A malformed payload
+    yields no removals rather than raising, the same way
+    ``_enrich_prior_values`` reads one.
+    """
+    out: set[str] = set()
+    for plan in plans:
+        if plan.namespace != _base_settings.NAMESPACE:
+            continue
+        payload = plan.state_payload
+        if not isinstance(payload, dict):
+            continue
+        keys = payload.get("managed_keys")
+        if not isinstance(keys, list):
+            continue
+        out |= managed_before - {k for k in keys if isinstance(k, str)}
+    return out
+
+
 _NO_ENTRY = object()
 
 
@@ -623,21 +658,13 @@ def apply_live(
     profile_dir = prefs_path.parent
     profile_name = profile or profile_dir.name
     target_prefs = _live.compute_target_prefs(prefs, plans)
-    changes, removals = _setting_changes(prefs, target_prefs)
-    newtab_changes, ordinary_changes = _route_settings(changes)
-    # Resolve removals against the sidecar's recorded prior values *before*
-    # the preflight runs, and fold the resolved writes into the ordinary
-    # settings changes so the preflight probes them too -- a prior value
-    # for a key settingsPrivate does not recognise is still unusable, and
-    # only the preflight can tell us that.
-    removal_writes, unresolved_removals = _resolve_removals(prefs_path, removals)
-    ordinary_changes = ordinary_changes + removal_writes
     # What dotbrave managed *before* this run.  The sidecar is normally
     # only rewritten once the run succeeds, so reading it here usually
-    # answers that question -- and the answer is what keeps the preflight's
-    # `getPref` values from being recorded for a key dotbrave has already
-    # written (where `getPref` returns dotbrave's own value, not the
-    # user's).  Same source `plan_apply` read at build time.
+    # answers that question.  Two things need the answer: the removal set
+    # below, and `_enrich_prior_values`, which must not record the
+    # preflight's `getPref` value for a key dotbrave has already written
+    # (there `getPref` returns dotbrave's own value, not the user's).
+    # Same source `plan_apply` read at build time.
     #
     # "Normally", because of the gap the CdpError handler documents below
     # ("Known gap, accepted"): a run can mutate a key live and then fail
@@ -646,6 +673,25 @@ def apply_live(
     # the value read must differ from the value this run is about to
     # write -- is the backstop for exactly that case.
     managed_before = _base_settings.get_managed_keys(prefs_path)
+    # Union, not replacement: neither source subsumes the other.  Only the
+    # tree diff sees a dict-valued key the config still names *shrink* (a
+    # leaf vanishing under it, so the key never leaves `managed_keys`);
+    # only the plan-derived set sees a key whose value never reached the
+    # file.  For a scalar key both name the same thing.  For a dict key
+    # dropped whole the union carries the dotted key *and* its leaves,
+    # and the leaves stay unresolvable so the run goes offline -- exactly
+    # what happens today.  Pruning them would instead push a dictionary
+    # value through `setPref`, which is untested against settingsPrivate.
+    changes, disk_removals = _setting_changes(prefs, target_prefs)
+    removals = sorted(set(disk_removals) | _plan_removals(plans, managed_before))
+    newtab_changes, ordinary_changes = _route_settings(changes)
+    # Resolve removals against the sidecar's recorded prior values *before*
+    # the preflight runs, and fold the resolved writes into the ordinary
+    # settings changes so the preflight probes them too -- a prior value
+    # for a key settingsPrivate does not recognise is still unusable, and
+    # only the preflight can tell us that.
+    removal_writes, unresolved_removals = _resolve_removals(prefs_path, removals)
+    ordinary_changes = ordinary_changes + removal_writes
     shortcut_script = _shortcut_script(prefs, target_prefs)
     if removals and not (newtab_changes or ordinary_changes or shortcut_script):
         # A diff that is nothing but removals -- none of which had a prior

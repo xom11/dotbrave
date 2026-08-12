@@ -530,3 +530,51 @@ def test_profile_scoped_browser_key_is_still_accepted(tmp_path: Path) -> None:
             "plan_apply refused a profile-scoped browser.* key that is "
             f"not itself in LOCAL_STATE_KEYS: {exc}"
         )
+
+
+def test_a_removal_is_reported_even_when_the_key_is_absent_from_disk() -> None:
+    """Absent from `Preferences` does not mean "never set".
+
+    Between a live apply and Brave's own pref commit the browser holds a
+    value the file does not have yet.  Staying silent here made the plan
+    read as empty, and the removal was then dropped at three separate
+    gates -- the orchestrator's early return, the sidecar write on the
+    [pwa]-only branch, and `compute_target_prefs`.
+    """
+    from dotbrave._base import settings as base_settings
+
+    lines = base_settings.diff_summary(
+        {"brave": {"location_bar_is_wide": True}},
+        {},
+        {"brave.enable_closing_last_tab"},
+    )
+
+    assert lines == [
+        "  - brave.enable_closing_last_tab (removed; not present on disk)"
+    ]
+
+
+def test_a_drop_only_config_does_not_produce_an_empty_plan(tmp_path: Path) -> None:
+    """`Plan.empty` drives the orchestrator's "no changes" early return, so
+    a config whose only work is removing a key the browser has not
+    committed yet must not read as empty."""
+    from dotbrave._base import settings as base_settings
+
+    profile = tmp_path / "Default"
+    profile.mkdir()
+    prefs_path = profile / "Preferences"
+    prefs: dict = {"brave": {}}
+    prefs_path.write_text(json.dumps(prefs))
+    prefs_path.with_name("Preferences.dotbrave.settings.json").write_text(
+        json.dumps({
+            "managed_keys": ["brave.enable_closing_last_tab"],
+            "prior_values": {},
+        })
+    )
+
+    plan = base_settings.plan_apply("brave", prefs_path, prefs, {})
+
+    assert plan.empty is False
+    assert plan.diff_lines == [
+        "  - brave.enable_closing_last_tab (removed; not present on disk)"
+    ]

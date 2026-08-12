@@ -550,7 +550,10 @@ def test_removal_with_a_recorded_prior_value_applies_live(
 
     live.apply_live(9333, prefs_path, prefs, [plan])   # must NOT raise
 
-    assert any("brave.location_bar_is_wide" in e and "false" in e and "setPref" in e
+    # Exact call text: `_settings_script` folds every setPref into one
+    # expression, so `key in e and "false" in e` can pass on a script that
+    # never pairs the two.
+    assert any('"brave.location_bar_is_wide", false' in e and "setPref" in e
                for e in fake.evaluations)
 
 
@@ -853,7 +856,7 @@ def test_a_default_learned_live_makes_a_later_removal_apply_live(
     live.apply_live(9333, prefs_path, prefs, [plan])  # must NOT raise
 
     assert any(
-        _WIDE in e and "setPref" in e and "false" in e
+        f'{json.dumps(_WIDE)}, false' in e and "setPref" in e
         for e in second.evaluations
     ), "the removal should restore the default learned on the first run"
     state = json.loads(_sidecar(prefs_path).read_text())
@@ -1055,3 +1058,243 @@ def test_await_page_returns_after_timeout_instead_of_hanging(monkeypatch) -> Non
     monkeypatch.setattr(live.time, "sleep", lambda seconds: None)
 
     live._await_page(NeverReadyClient(), {}, timeout=1.0)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Removing a key whose value only exists in the browser's memory.
+#
+# A live apply writes into Brave's in-memory PrefService; Brave commits it
+# to `Preferences` on its own timer (or at exit).  Drop such a key from the
+# config inside that window and it is absent from *both* sides of the tree
+# diff -- so the disk-derived removal list is empty and nothing reconsiders
+# the key, while the sidecar is rewritten without it.  The sidecar's own
+# `managed_keys` is the only record that dotbrave ever managed it, so the
+# removal list has to be derived from that too.
+#
+# Every case here flips one key *and* drops another, deliberately: a
+# drop-only config leaves the plan empty, and `cmd_apply` returns before
+# the adapter is reached, so such a test would pass against the bug.
+# ---------------------------------------------------------------------------
+
+_CLOSING = "brave.enable_closing_last_tab"
+
+
+def _setpref_call(key: str, value: object) -> str:
+    """The exact text one `setPref` call contributes to the script.
+
+    `_settings_script` folds every call into one expression, so a loose
+    `key in expr and "true" in expr` check can pass on a script that
+    never mentions the key and the value together.
+    """
+    return f"{json.dumps(key)}, {json.dumps(value)}"
+
+
+def _memory_only_sidecar(prefs_path: Path, closing_prior: dict) -> None:
+    _sidecar(prefs_path).write_text(json.dumps({
+        "managed_keys": [_CLOSING, _WIDE],
+        "prior_values": {
+            _CLOSING: closing_prior,
+            _WIDE: {"present": True, "value": True},
+        },
+    }))
+
+
+def test_removal_of_a_key_absent_from_disk_is_applied_live(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The measured bug: `brave.enable_closing_last_tab` was applied live
+    on an earlier run and Brave has not committed it yet, so it is missing
+    from `Preferences`.  Dropping it from the config must still restore
+    its recorded prior value -- the disk diff cannot see it at all."""
+    prefs_path = tmp_path / "Default" / "Preferences"
+    prefs_path.parent.mkdir()
+    prefs = {"brave": {"location_bar_is_wide": True}}
+    prefs_path.write_text(json.dumps(prefs))
+    _memory_only_sidecar(prefs_path, {"present": True, "value": True})
+
+    plan = settings_mod.plan_apply(prefs_path, prefs, {_WIDE: False})
+
+    fake = FakeCdpClient(9333, evaluation_results=[[
+        _pref_entry(_WIDE, True),
+        _pref_entry(_CLOSING, False),
+    ]])
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake)
+
+    live.apply_live(9333, prefs_path, prefs, [plan])   # must NOT raise
+
+    assert any(
+        _setpref_call(_CLOSING, True) in e for e in fake.evaluations
+    ), "the dropped key was never restored to its recorded prior value"
+    state = json.loads(_sidecar(prefs_path).read_text())
+    assert state["managed_keys"] == [_WIDE]
+    # This path now writes where it used to do nothing, so invariant 1
+    # applies to it: exactly one backup, taken before the live half.
+    assert len(list(prefs_path.parent.glob("Preferences.bak.*"))) == 1
+
+
+def test_removal_of_a_key_absent_from_disk_without_a_prior_value_goes_offline(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Same shape, but nothing to write back: `present: false` means the
+    key has to be deleted offline, so the run must refuse and name it
+    rather than reporting success and orphaning it at dotbrave's value."""
+    prefs_path = tmp_path / "Default" / "Preferences"
+    prefs_path.parent.mkdir()
+    prefs = {"brave": {"location_bar_is_wide": True}}
+    prefs_path.write_text(json.dumps(prefs))
+    _memory_only_sidecar(prefs_path, {"present": False, "value": None})
+
+    plan = settings_mod.plan_apply(prefs_path, prefs, {_WIDE: False})
+
+    fake = FakeCdpClient(9333, evaluation_results=[[_pref_entry(_WIDE, True)]])
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake)
+
+    with pytest.raises(shared_live.LiveApplyUnsupported) as excinfo:
+        live.apply_live(9333, prefs_path, prefs, [plan])
+
+    assert excinfo.value.keys == [_CLOSING]
+
+
+def test_a_leaf_vanishing_under_a_still_managed_key_is_still_a_removal(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The disk diff is not redundant, so the plan-derived set unions with
+    it rather than replacing it.
+
+    A dict-valued key the config still names but has shrunk (`{"a", "b"}`
+    -> `{"a"}`) never leaves `managed_keys`, so the plan-derived set says
+    nothing about it; only the tree diff sees the leaf go.  Replacing the
+    disk branch would let this run report `ok -- live applied` having
+    written nothing.
+    """
+    prefs_path = tmp_path / "Default" / "Preferences"
+    prefs_path.parent.mkdir()
+    prefs = {"brave": {"some_dict": {"a": 1, "b": 2}}}
+    prefs_path.write_text(json.dumps(prefs))
+    _sidecar(prefs_path).write_text(json.dumps({
+        "managed_keys": ["brave.some_dict"], "prior_values": {},
+    }))
+
+    plan = settings_mod.plan_apply(prefs_path, prefs, {"brave.some_dict": {"a": 1}})
+
+    fake = FakeCdpClient(9333)
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake)
+
+    with pytest.raises(shared_live.LiveApplyUnsupported) as excinfo:
+        live.apply_live(9333, prefs_path, prefs, [plan])
+
+    assert excinfo.value.keys == ["brave.some_dict.b"]
+
+
+def test_a_dropped_shortcut_id_never_becomes_a_settings_removal(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """[shortcuts] speaks command ids, not dotted pref paths.  Deriving
+    removals from the plans must filter by namespace, or a dropped
+    shortcut id would arrive at `_resolve_removals` as a pref key and send
+    every such run offline.
+
+    Doubles as the invariant-2 guard for a *missing* [settings] table (and
+    for `--skip settings`): no settings plan means no settings removals,
+    whatever the sidecar still lists.
+    """
+    from dotbrave.command_ids import NAME_TO_ID
+
+    prefs_path = tmp_path / "Default" / "Preferences"
+    prefs_path.parent.mkdir()
+    new_tab = str(NAME_TO_ID["new_tab"])
+    prefs = {"brave": {"tabs": {"vertical_tabs_enabled": False}}}
+    prefs_path.write_text(json.dumps(prefs))
+
+    shortcuts_plan = Plan(
+        namespace="shortcuts",
+        diff_lines=["  - new_tab (reset to default)"],
+        apply_fn=lambda _p: None,
+        verify_fn=lambda _p: None,
+        state_path=prefs_path.with_name("Preferences.dotbrave.shortcuts.json"),
+        state_payload={"managed_ids": []},
+    )
+    # The settings sidecar happens to be empty; the shortcuts plan's
+    # `managed_ids` must not be read as settings keys regardless.
+    _sidecar(prefs_path).write_text(json.dumps({
+        "managed_keys": [new_tab], "prior_values": {},
+    }))
+
+    fake = FakeCdpClient(9333)
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake)
+
+    live.apply_live(9333, prefs_path, prefs, [shortcuts_plan])  # must NOT raise
+
+
+def test_apply_does_not_orphan_a_memory_only_key_on_the_pwa_branch(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Composition, at the layer where the second orphan path lives.
+
+    With a dirty [pwa] and a [settings] table whose only work is a
+    removal, the orchestrator's own `write_state_files` rewrote the
+    settings sidecar for a plan that was never applied -- the key left
+    `managed_keys` without ever being reconsidered, and the adapter was
+    never called.
+    """
+    import argparse
+
+    from dotbrave._base import orchestrator as orch
+
+    profile_root = tmp_path
+    prefs_path = profile_root / "Default" / "Preferences"
+    prefs_path.parent.mkdir()
+    prefs_path.write_text(json.dumps({"brave": {"location_bar_is_wide": True}}))
+    _sidecar(prefs_path).write_text(json.dumps({
+        "managed_keys": [_CLOSING],
+        "prior_values": {_CLOSING: {"present": True, "value": True}},
+    }))
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[settings]\n[pwa]\nurls = ["https://example.com"]\n')
+
+    external: list[str] = []
+
+    def build_plans_fn(path: Path, prefs: dict, doc: dict, **_kw) -> list[Plan]:
+        return [
+            settings_mod.plan_apply(path, prefs, doc["settings"]),
+            Plan(
+                namespace="pwa",
+                diff_lines=["  + https://example.com"],
+                apply_fn=lambda _p: None,
+                verify_fn=lambda _p: None,
+                external_apply_fn=lambda: external.append("pwa"),
+            ),
+        ]
+
+    fake = FakeCdpClient(9333, evaluation_results=[[_pref_entry(_CLOSING, False)]])
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake)
+    monkeypatch.setattr(orch, "find_devtools_port", lambda _root, _profile: 9333)
+    monkeypatch.setattr(orch, "remember_devtools_port", lambda *a, **k: None)
+    monkeypatch.setattr(orch, "_already_privileged", lambda: True)
+
+    orch.cmd_apply(
+        argparse.Namespace(
+            profile_root=profile_root,
+            profile="Default",
+            config=str(cfg),
+            dry_run=False,
+            allow_http=False,
+            expect_sha256=None,
+        ),
+        display_name="Brave",
+        running_fn=lambda: True,
+        find_cmdline_fn=lambda: ["brave"],
+        restart_fn=lambda _cmd: [],
+        build_plans_fn=build_plans_fn,
+        live_apply_fn=live.apply_live,
+        graceful_close_fn=lambda: pytest.fail("the browser must not be closed"),
+        launch_live_fn=lambda *a, **k: ["brave"],
+    )
+
+    assert external == ["pwa"]
+    out = capsys.readouterr().out
+    assert _CLOSING in out, "the removal never appeared in the printed diff"
+    assert any(
+        _setpref_call(_CLOSING, True) in e for e in fake.evaluations
+    ), "the dropped key was never restored through the live endpoint"

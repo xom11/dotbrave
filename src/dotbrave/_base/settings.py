@@ -516,6 +516,17 @@ def diff_summary(
         parts = _split_key(key)
         cur = _get_value(prefs, parts)
         if cur is _MISSING:
+            # Absent from the file does NOT mean "never set": between a
+            # live apply and the browser's own pref commit (~10s in
+            # Chromium, or not until exit) the value exists only in the
+            # browser's memory.  Staying silent here made `Plan.empty`
+            # True, and the removal was then dropped at three separate
+            # gates -- the orchestrator's "no changes" early return, the
+            # sidecar write on the [pwa]-only branch (which rewrites
+            # `managed_keys` for a plan that was never applied), and
+            # `compute_target_prefs`, which skips empty plans and so
+            # never runs `apply_fn`'s `_pop_value` on the offline path.
+            lines.append(f"  - {key} (removed; not present on disk)")
             continue
         lines.append(f"  - {key}: {json.dumps(cur)} (removed)")
     return lines
