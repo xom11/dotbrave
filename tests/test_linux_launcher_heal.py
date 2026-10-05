@@ -314,6 +314,9 @@ def apply_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     (root / "Default" / "Preferences").write_text(json.dumps({"some": "thing"}))
     policy = tmp_path / "policy" / "dotbrave-pwa.json"
     monkeypatch.setattr(pwa, "POLICY_FILE", policy)
+    # The Nix build sandbox has no pgrep, and an unknown browser state is a
+    # refusal, not "not running".
+    monkeypatch.setattr(brave_pkg, "brave_running", lambda: False)
     writes: list[list[dict]] = []
 
     def fake_write(entries: list[dict]) -> None:
