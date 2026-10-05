@@ -179,6 +179,21 @@ def test_later_unknown_hijacked_launcher_is_deleted_with_its_icons(paths) -> Non
     assert (paths.apps_dir / APP).read_text() == GOOD
 
 
+def test_nodisplay_is_stripped_from_a_good_launcher(paths) -> None:
+    """Brave hides a launcher it rewrites; the app stays installed and
+    simply vanishes from the menu."""
+    hidden = GOOD + "NoDisplay=true\n"
+    (paths.apps_dir / APP).write_text(hidden)
+    _run_heal(paths)
+    assert (paths.apps_dir / APP).read_text() == GOOD
+    assert (paths.snapshot_dir / APP).read_text() == GOOD
+    assert f"unhid {APP}" in _log(paths)
+
+    log = _log(paths)
+    _run_heal(paths)
+    assert _log(paths) == log
+
+
 def test_launchers_without_an_app_id_are_left_alone(paths) -> None:
     browser = "brave-browser.desktop"
     text = "[Desktop Entry]\nExec=brave --user-data-dir=/x %U\n"

@@ -229,6 +229,18 @@ def _partial_note(applied: list[str], pending: list[Plan]) -> str:
     return f"{right} not applied"
 
 
+def _policy_pickup_note() -> str:
+    """When a running browser sees a new policy -- measured, not assumed.
+    Linux: launchers appeared or vanished 6-51s after the file changed.
+    Windows: a new entry installed itself at t+580s. macOS: a running
+    browser never reloads it (invariant 4)."""
+    if sys.platform == "darwin":
+        return "loaded at its next launch"
+    if sys.platform == "win32":
+        return "a running one picks it up in about ten minutes"
+    return "a running one picks it up within a minute"
+
+
 def _warn(message: str) -> None:
     """Report on stderr without letting it overtake stdout.
 
@@ -434,7 +446,7 @@ def cmd_apply(
             names = ", ".join(applied_external)
             print(
                 f"ok -- {names} applied without touching the "
-                f"running {display_name} (loaded at its next launch)"
+                f"running {display_name} ({_policy_pickup_note()})"
             )
             if not browser_bound:
                 # The whole story: nothing needs the browser.

@@ -70,8 +70,8 @@ def _build_policy_payload(entries: list[dict]) -> bytes:
     return _base.build_policy_payload(POLICY_FILE, _WINDOWS_POLICY_KEY, entries)
 
 
-def _entry_for(url: str) -> dict[str, Any]:
-    return _base.entry_for(url)
+def _entry_for(url: str, name: str | None = None) -> dict[str, Any]:
+    return _base.entry_for(url, name)
 
 
 def _sudo_write_policy(entries: list[dict]) -> None:

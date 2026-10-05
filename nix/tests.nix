@@ -78,6 +78,35 @@ let
       [pwa]
       urls = [ 42 ]
     '');
+
+    # `name` is the placeholder name Brave uses when it cannot read a manifest.
+    named-entry-sets-fallback-app-name = entriesOf "named.toml" ''
+      [pwa]
+      urls = [ "https://a.example/", { url = "https://b.example/", name = "B" } ]
+    '' == [
+      (entry "https://a.example/")
+      (entry "https://b.example/" // { fallback_app_name = "B"; })
+    ];
+
+    duplicate-url-keeps-the-first-entry = entriesOf "dup-named.toml" ''
+      [pwa]
+      urls = [ { url = "https://a.example/", name = "A" }, "https://a.example/" ]
+    '' == [ (entry "https://a.example/" // { fallback_app_name = "A"; }) ];
+
+    unknown-entry-key-is-refused = evalFails (entriesOf "entry-extra.toml" ''
+      [pwa]
+      urls = [ { url = "https://a.example/", icon = "x.png" } ]
+    '');
+
+    entry-without-url-is-refused = evalFails (entriesOf "entry-no-url.toml" ''
+      [pwa]
+      urls = [ { name = "A" } ]
+    '');
+
+    blank-name-is-refused = evalFails (entriesOf "entry-blank.toml" ''
+      [pwa]
+      urls = [ { url = "https://a.example/", name = " " } ]
+    '');
   };
 
   failed = lib.filter (name: !cases.${name}) (lib.attrNames cases);

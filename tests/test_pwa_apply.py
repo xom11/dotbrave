@@ -187,6 +187,31 @@ def test_validate_rejects_non_https_urls() -> None:
         pwa._validate_table({"urls": ["http://example.com/"]})  # plain http
 
 
+def test_validate_accepts_named_entries() -> None:
+    from dotbrave._base import pwa as base
+    out = base.validate_entries({"urls": [
+        "https://a/",
+        {"url": "https://b/", "name": "B"},
+        {"url": "https://c/"},
+        {"url": "https://a/", "name": "dropped as a duplicate"},
+    ]})
+    assert out == [("https://a/", None), ("https://b/", "B"), ("https://c/", None)]
+    assert pwa._validate_table({"urls": [{"url": "https://b/", "name": "B"}]}) == [
+        "https://b/"
+    ]
+
+
+def test_validate_rejects_malformed_named_entries() -> None:
+    with pytest.raises(SystemExit, match=r"url table has unsupported keys"):
+        pwa._validate_table({"urls": [{"url": "https://a/", "icon": "x"}]})
+    with pytest.raises(SystemExit, match=r"needs a string `url"):
+        pwa._validate_table({"urls": [{"name": "A"}]})
+    with pytest.raises(SystemExit, match=r"name must be a non-empty string"):
+        pwa._validate_table({"urls": [{"url": "https://a/", "name": " "}]})
+    with pytest.raises(SystemExit, match=r"must start with https://"):
+        pwa._validate_table({"urls": [{"url": "http://a/", "name": "A"}]})
+
+
 def test_validate_rejects_unknown_keys() -> None:
     """Reject keys we don't yet support so that future schema additions
     can rely on never having silently absorbed user intent. v1 only
@@ -245,6 +270,76 @@ def test_reapply_same_urls_is_noop(
     _apply(fake_pwa_profile_root, cfg)
     assert fake_policy.stat().st_mtime_ns == mtime_before, \
         "policy file rewritten when no diff was expected"
+
+
+def test_named_entry_becomes_fallback_app_name(
+    fake_pwa_profile_root: Path,
+    fake_policy: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A placeholder install -- no manifest, or a login wall -- is named
+    after its URL unless the policy carries ``fallback_app_name``."""
+    monkeypatch.setattr(brave_pkg, "brave_running", lambda: False)
+
+    cfg = tmp_path / "brave.toml"
+    cfg.write_text(
+        '[pwa]\n'
+        'urls = ["https://squoosh.app/", '
+        '{ url = "https://www.notion.so/", name = "Notion" }]\n'
+    )
+    _apply(fake_pwa_profile_root, cfg)
+
+    entries = {e["url"]: e for e in _read_policy_file(fake_policy)[pwa.POLICY_KEY]}
+    assert entries["https://www.notion.so/"]["fallback_app_name"] == "Notion"
+    assert entries["https://www.notion.so/"]["default_launch_container"] == "window"
+    assert "fallback_app_name" not in entries["https://squoosh.app/"]
+
+
+def test_name_change_alone_rewrites_the_policy(
+    fake_pwa_profile_root: Path,
+    fake_policy: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The URL set is unchanged, so a URL-only diff would call this a no-op
+    and the name would never reach the policy."""
+    monkeypatch.setattr(brave_pkg, "brave_running", lambda: False)
+
+    cfg = tmp_path / "brave.toml"
+    cfg.write_text('[pwa]\nurls = ["https://www.notion.so/"]\n')
+    _apply(fake_pwa_profile_root, cfg)
+    capsys.readouterr()
+
+    cfg.write_text(
+        '[pwa]\nurls = [{ url = "https://www.notion.so/", name = "Notion" }]\n'
+    )
+    _apply(fake_pwa_profile_root, cfg)
+
+    out = capsys.readouterr().out
+    assert "~ https://www.notion.so/ (name (none) -> Notion" in out
+    entry = _read_policy_file(fake_policy)[pwa.POLICY_KEY][0]
+    assert entry["fallback_app_name"] == "Notion"
+
+
+def test_export_round_trips_names(
+    fake_policy: Path,
+) -> None:
+    fake_policy.parent.mkdir(parents=True, exist_ok=True)
+    fake_policy.write_bytes(pwa._build_policy_payload([
+        pwa._entry_for("https://squoosh.app/"),
+        pwa._entry_for("https://www.notion.so/", "Notion"),
+    ]))
+    text = "\n".join(pwa.build_dump_block())
+    assert '  { url = "https://www.notion.so/", name = "Notion" },' in text
+    assert '  "https://squoosh.app/",' in text
+
+    import tomllib
+    assert pwa._base.validate_entries(tomllib.loads(text)["pwa"]) == [
+        ("https://squoosh.app/", None),
+        ("https://www.notion.so/", "Notion"),
+    ]
 
 
 def test_remove_url_uninstalls(

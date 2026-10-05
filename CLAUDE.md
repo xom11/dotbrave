@@ -321,8 +321,9 @@ Preserve these contracts unless a change explicitly redesigns them:
 
    `[pwa]` never touches the
    running browser and is never gated on what else is dirty: the policy
-   is written first and directly (no endpoint bootstrap), and Brave
-   loads it at next launch. Gating it on "the diff contains nothing but
+   is written first and directly (no endpoint bootstrap), and a running
+   Brave picks it up by itself on Linux and Windows (macOS: next launch;
+   `_policy_pickup_note`). Gating it on "the diff contains nothing but
    `[pwa]`" made one dirty `[shortcuts]` drop the policy on every
    `--unattended` run, and permanently -- `[shortcuts]` is only cleaned
    by an apply with Brave closed, which `--unattended` never performs.

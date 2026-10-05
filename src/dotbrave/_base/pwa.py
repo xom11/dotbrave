@@ -511,34 +511,64 @@ def check_install_supported(cfg: PwaConfig, prefs_path: Path) -> None:
             )
 
 
-def validate_table(raw: object) -> list[str]:
+def validate_entries(raw: object) -> list[tuple[str, str | None]]:
+    """``(url, name)`` per ``[pwa]`` entry, in order, duplicates dropped.
+
+    An entry is a URL string or ``{ url = "...", name = "..." }``. ``name``
+    becomes the policy's ``fallback_app_name``: the name Brave gives an app
+    it can only install as a placeholder -- no manifest, or a login wall in
+    front of it -- which otherwise shows up as the bare URL."""
     if not isinstance(raw, dict):
         sys.exit("error: [pwa] must be a table")
     extra = set(raw.keys()) - {"urls"}
     if extra:
         sys.exit(
             f"error: [pwa] has unsupported keys: {sorted(extra)}. "
-            f"v1 only supports `urls = [...]`"
+            f"Only `urls = [...]` is supported"
         )
     urls = raw.get("urls", [])
     if not isinstance(urls, list):
         sys.exit("error: [pwa] urls must be an array of strings")
     seen: set[str] = set()
-    out: list[str] = []
+    out: list[tuple[str, str | None]] = []
     for u in urls:
-        if not isinstance(u, str):
-            sys.exit(f"error: [pwa] url entries must be strings, got {type(u).__name__}")
+        name = None
+        if isinstance(u, dict):
+            bad = set(u) - {"url", "name"}
+            if bad:
+                sys.exit(
+                    f"error: [pwa] url table has unsupported keys: {sorted(bad)} "
+                    f'(expected {{ url = "...", name = "..." }})'
+                )
+            name = u.get("name")
+            if name is not None and (not isinstance(name, str) or not name.strip()):
+                sys.exit(f"error: [pwa] name must be a non-empty string, got {name!r}")
+            u = u.get("url")
+            if not isinstance(u, str):
+                sys.exit('error: [pwa] url table needs a string `url = "https://..."`')
+        elif not isinstance(u, str):
+            sys.exit(
+                f"error: [pwa] url entries must be strings or {{ url, name }} "
+                f"tables, got {type(u).__name__}"
+            )
         if not u.startswith("https://"):
             sys.exit(f"error: [pwa] invalid url {u!r} (must start with https://)")
         if u in seen:
             continue
         seen.add(u)
-        out.append(u)
+        out.append((u, name))
     return out
 
 
-def entry_for(url: str) -> dict[str, Any]:
-    return {"url": url, **_DEFAULT_ENTRY}
+def validate_table(raw: object) -> list[str]:
+    return [url for url, _ in validate_entries(raw)]
+
+
+def entry_for(url: str, name: str | None = None) -> dict[str, Any]:
+    entry: dict[str, Any] = {"url": url, **_DEFAULT_ENTRY}
+    if name:
+        entry["fallback_app_name"] = name
+    return entry
 
 
 def read_windows_registry_payload(windows_registry_key: str) -> dict:
@@ -619,14 +649,29 @@ def build_policy_payload(
     return (json.dumps(payload, indent=2) + "\n").encode("utf-8")
 
 
-def diff_summary(current: dict[str, dict], target_urls: list[str]) -> list[str]:
+def diff_summary(
+    current: dict[str, dict],
+    target_urls: list[str],
+    target_names: dict[str, str] | None = None,
+) -> list[str]:
     target_set = set(target_urls)
     current_set = set(current)
+    names = target_names or {}
     lines: list[str] = []
     for url in sorted(target_set - current_set):
         lines.append(f"  + {url}")
     for url in sorted(current_set - target_set):
         lines.append(f"  - {url} (uninstall)")
+    for url in sorted(target_set & current_set):
+        have = current[url].get("fallback_app_name")
+        want = names.get(url)
+        if have != want:
+            # Measured: Brave does not rename a placeholder it already
+            # installed; the name lands at the app's next install.
+            lines.append(
+                f"  ~ {url} (name {have or '(none)'} -> {want or '(none)'}; "
+                f"used from its next install)"
+            )
     return lines
 
 
@@ -722,10 +767,12 @@ def plan_apply(
     check_platform_supported(policy_file)
     check_install_supported(cfg, prefs_path)
 
-    target_urls = validate_table(raw_table)
+    target = validate_entries(raw_table)
+    target_urls = [url for url, _ in target]
+    target_names = {url: name for url, name in target if name}
     current = read_policy_fn()
 
-    diff = diff_summary(current, target_urls)
+    diff = diff_summary(current, target_urls, target_names)
     policy_dirty = bool(diff)
 
     heal_action = None
@@ -745,7 +792,7 @@ def plan_apply(
 
     def external_apply_fn() -> None:
         if policy_dirty:
-            entries = [entry_for(u) for u in target_urls]
+            entries = [entry_for(u, target_names.get(u)) for u in target_urls]
             sudo_write_fn(entries)
             actual = read_policy_fn()
             if set(actual) != set(target_urls):
@@ -753,6 +800,15 @@ def plan_apply(
                     "error: pwa verification failed: policy file URL set does "
                     f"not match config (wrote {sorted(target_urls)}, "
                     f"file has {sorted(actual)})"
+                )
+            actual_names = {
+                u: e.get("fallback_app_name") for u, e in actual.items()
+                if e.get("fallback_app_name")
+            }
+            if actual_names != target_names:
+                sys.exit(
+                    "error: pwa verification failed: policy file names do not "
+                    f"match config (wrote {target_names}, file has {actual_names})"
                 )
         if heal_action is not None:
             heal_action()
@@ -790,7 +846,11 @@ def build_dump_block(
     if urls:
         lines.append("urls = [")
         for u in urls:
-            lines.append(f"  {json.dumps(u)},")
+            name = current[u].get("fallback_app_name")
+            if isinstance(name, str) and name:
+                lines.append(f"  {{ url = {json.dumps(u)}, name = {json.dumps(name)} }},")
+            else:
+                lines.append(f"  {json.dumps(u)},")
         lines.append("]")
     else:
         lines.append("urls = []")

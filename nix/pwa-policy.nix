@@ -37,35 +37,61 @@ let
 
       extra = builtins.attrNames (builtins.removeAttrs raw [ "urls" ]);
       # A present-but-bare `[pwa]` keeps meaning "uninstall all", matching
-      # `raw.get("urls", [])` in validate_table(). Only ABSENT is refused.
+      # `raw.get("urls", [])` in validate_entries(). Only ABSENT is refused.
       urls = raw.urls or [ ];
 
-      checkUrl = u:
-        if !builtins.isString u then
-          throw ("${at} url entries must be strings, got ${builtins.typeOf u}: "
-            + lib.generators.toPretty { multiline = false; } u)
-        else if !lib.hasPrefix "https://" u then
+      pretty = lib.generators.toPretty { multiline = false; };
+
+      checkHttps = u:
+        if !lib.hasPrefix "https://" u then
           throw ''${at} invalid url "${u}" (must start with https://)''
         else
           u;
+
+      # -> { url; name; } with name = null when the entry is a bare string.
+      checkEntry = e:
+        if builtins.isString e then
+          { url = checkHttps e; name = null; }
+        else if builtins.isAttrs e then
+          let bad = builtins.attrNames (builtins.removeAttrs e [ "url" "name" ]); in
+          if bad != [ ] then
+            throw ("${at} url table has unsupported keys: "
+              + lib.concatStringsSep ", " bad
+              + '' (expected { url = "...", name = "..." })'')
+          else if !(builtins.isString (e.url or null)) then
+            throw ''${at} url table needs a string `url = "https://..."`''
+          else if (e ? name) && !(builtins.isString e.name && lib.trim e.name != "") then
+            throw "${at} name must be a non-empty string, got ${pretty e.name}"
+          else
+            { url = checkHttps e.url; name = e.name or null; }
+        else
+          throw ("${at} url entries must be strings or { url, name } tables, "
+            + "got ${builtins.typeOf e}: ${pretty e}");
+
+      # Duplicate URLs are dropped rather than rejected, first one wins,
+      # matching Python.
+      dedupe = entries:
+        builtins.foldl'
+          (acc: e: if builtins.elem e.url (map (x: x.url) acc) then acc else acc ++ [ e ])
+          [ ]
+          entries;
     in
     lib.throwIf (!builtins.isAttrs raw)
       "${at} must be a table"
       (lib.throwIf (extra != [ ])
         ("${at} has unsupported keys: ${lib.concatStringsSep ", " extra}. "
-          + "v1 only supports `urls = [...]`")
+          + "Only `urls = [...]` is supported")
         (lib.throwIf (!builtins.isList urls)
           "${at} urls must be an array of strings"
-          # Duplicates are dropped rather than rejected, matching Python.
-          (lib.unique (map checkUrl urls))));
+          (dedupe (map checkEntry urls))));
 in
 {
   entriesFrom = tomlPath:
     map
-      (url: {
-        inherit url;
+      (e: {
+        inherit (e) url;
         default_launch_container = "window";
         create_desktop_shortcut = true;
-      })
+      } // lib.optionalAttrs (e.name != null) { fallback_app_name = e.name; })
       (validUrls tomlPath (builtins.fromTOML (builtins.readFile tomlPath)));
 }

@@ -3,19 +3,24 @@
 # Each URL is installed via Chromium's enterprise `WebAppInstallForceList`
 # policy: Brave fetches the manifest, downloads icons, registers the app in
 # chrome://apps, and emits a `.desktop` launcher (Linux). Removing a URL
-# here + re-applying causes Brave to uninstall on next launch.
+# here + re-applying uninstalls the app.
 #
 # Two important differences from [shortcuts] / [settings]:
 #   - REQUIRES SUDO. The policy file is root-owned:
 #       Linux: /etc/brave/policies/managed/dotbrave-pwa.json
 #       macOS: /Library/Managed Preferences/com.brave.Browser.plist
-#   - TAKES EFFECT AT THE NEXT BRAVE LAUNCH. A pwa-only apply never
-#     touches a running Brave: the policy file is written immediately
-#     and Brave reads it the next time it starts.
+#   - A pwa-only apply never touches a running Brave. A running Brave
+#     picks the policy up by itself: within a minute on Linux, about ten
+#     minutes on Windows. macOS reads it at the next launch.
+#
+# An entry can also be { url = "...", name = "..." }. `name` is used when
+# Brave can only install the app as a placeholder -- no manifest, or a
+# login wall in front of it -- which is otherwise named after the URL.
 # Force-installed apps cannot be removed via the Brave UI; delete the URL
 # here and re-apply to uninstall.
 
 [pwa]
 urls = [
   "https://squoosh.app/",
+  { url = "https://www.notion.so/", name = "Notion" },
 ]

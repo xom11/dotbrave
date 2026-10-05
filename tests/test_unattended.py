@@ -433,9 +433,10 @@ def test_all_external_apply_is_unchanged_and_applies_once(
 
     captured = capsys.readouterr()
     assert calls == ["pwa"]
+    from dotbrave._base import orchestrator as orch
     assert (
         "ok -- [pwa] applied without touching the running Brave "
-        "(loaded at its next launch)" in captured.out
+        f"({orch._policy_pickup_note()})" in captured.out
     )
     # The whole story: nothing was left undone, so nothing is reported as such.
     assert "not applied" not in captured.err

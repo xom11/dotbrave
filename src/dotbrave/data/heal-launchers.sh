@@ -42,8 +42,17 @@ for f in "$APPS"/brave*.desktop; do
       sed -i -e 's/ "--user-data-dir=[^"]*"//g' -e 's/ --user-data-dir=[^ ]*//g' "$f" || exit 1
       echo "$(now) stripped $name (first run, no known-good copy)" >> "$LOG"
     fi
-  elif ! cmp -s "$f" "$SNAP/$name"; then
-    cp "$f" "$SNAP/$name" || exit 1
+  else
+    # Brave adds NoDisplay=true whenever it rewrites a launcher that already
+    # existed -- measured on a placeholder reinstall and on three apps that
+    # gained the policy source on top of a user install -- which drops a
+    # managed app from the menu while it stays installed. No fresh install
+    # measured so far has carried it.
+    if grep -q '^NoDisplay=true$' "$f"; then
+      sed -i '/^NoDisplay=true$/d' "$f" || exit 1
+      echo "$(now) unhid $name" >> "$LOG"
+    fi
+    cmp -s "$f" "$SNAP/$name" || cp "$f" "$SNAP/$name" || exit 1
   fi
 done
 [ "$established" = 1 ] || : > "$SNAP/.established"

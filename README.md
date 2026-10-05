@@ -179,9 +179,15 @@ dotbrave apply brave.toml              # live apply if Brave is running
   set in the Brave UI instead.
 - **PWA URLs**: every entry installs with
   `default_launch_container = "window"` and `create_desktop_shortcut = true`.
+  An entry can be `{ url = "https://www.notion.so/", name = "Notion" }`:
+  `name` becomes the policy's `fallback_app_name`, the name Brave gives an
+  app it can only install as a placeholder (no manifest, or a login wall in
+  front of it) — otherwise the launcher is named after the bare URL. Brave
+  does not rename a placeholder it already installed; the name lands at the
+  app's next install.
   `[pwa]` is the only namespace that needs elevated privileges: it writes a
   managed-policy file (sudo on Linux/macOS) or the Windows Registry
-  (Administrator). No `[pwa]` URL diff → no policy write.
+  (Administrator). No `[pwa]` diff → no policy write.
 - **Empty header** (e.g. `[settings]` with no entries) wipes everything
   dotbrave previously managed in that namespace. **Missing header** = skip
   the namespace entirely.
@@ -295,9 +301,10 @@ with its original command line rather than leaving you without a browser
 — and when the config was already applied and verified by then, that
 relaunch failure is a warning on stderr, not a non-zero exit. A config
 whose only diff is `[pwa]` skips the endpoint entirely — the managed
-policy is written while Brave keeps running, and Brave loads it at its
-next launch. The endpoint binds to `127.0.0.1` only, and there is no
-force-kill switch.
+policy is written while Brave keeps running. A running Brave picks it up
+by itself on Linux (within a minute) and Windows (about ten minutes); on
+macOS it is loaded at the next launch. The endpoint binds to `127.0.0.1`
+only, and there is no force-kill switch.
 
 `[shortcuts]` and `[settings]` track managed entries in sidecar files
 (`Preferences.dotbrave.{shortcuts,settings}.json`), so removing a key from
