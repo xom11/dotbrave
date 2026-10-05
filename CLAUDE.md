@@ -222,6 +222,17 @@ Preserve these contracts unless a change explicitly redesigns them:
    the reconcile is unverified -- the event is intermittent and resisted
    every attempt to trigger it on demand -- so the heal log is the
    instrument: a line in it means the pin failed that boot.
+   On Linux the policy reaches every `--user-data-dir`, and a throwaway
+   profile overwrites the real profile's launchers (same file names, its own
+   data dir in `Exec`). A per-user systemd path unit runs
+   `data/heal-launchers.sh` on every change to the applications dir. It is
+   diffed apart from the policy (`LauncherHeal`), so a matching policy still
+   gets the heal and that run writes no policy. A hijacked launcher with no
+   known-good copy is deleted only once `launchers/.established` exists:
+   on the first run the heal cannot tell a throwaway-only app id from a
+   real app it never saw good, so it strips the flag instead. Keep the
+   builders pure and `install_linux_launcher_heal`/`remove_linux_launcher_heal`
+   patchable; `tests/conftest.py` disables the heal for every other test.
 5. Plain `apply` manages live apply. Endpoints bind to `127.0.0.1` and
    remain internal; no public endpoint or force-kill switch is exposed.
    The live/offline split is per key, not per run: everything

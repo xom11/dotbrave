@@ -10,9 +10,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import plistlib
+import shlex
+import shutil
 import subprocess
 import sys
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -234,6 +238,234 @@ def remove_self_healing_daemon(policy_file: Path) -> None:
     for p in (daemon_path, heal_script, source_plist,
               macos_heal_log(policy_file)):
         subprocess.run(["sudo", "rm", "-f", str(p)], check=False)
+
+
+# ---------------------------------------------------------------------------
+# Linux launcher heal
+#
+# The managed policy applies to every --user-data-dir, and a launcher's file
+# name (brave-<app-id>-<Profile>.desktop) does not include the data dir. So
+# any Brave started on a throwaway profile -- a test harness, a headless
+# screenshot -- force-installs the same apps and overwrites the real
+# profile's launchers with its own --user-data-dir, silently sending every
+# PWA into an empty profile. A systemd user path unit watches the
+# applications dir and runs data/heal-launchers.sh on every change.
+# ---------------------------------------------------------------------------
+
+_LINUX_HEAL_UNIT = "dotbrave-pwa-heal"
+
+
+@dataclass(frozen=True)
+class LinuxHealPaths:
+    """Where the Linux launcher heal lives. All per-user: unlike the macOS
+    daemon it needs no root, because the launchers are the user's own files."""
+
+    apps_dir: Path
+    state_dir: Path
+    unit_dir: Path
+
+    @property
+    def script(self) -> Path:
+        return self.state_dir / "heal-launchers.sh"
+
+    @property
+    def snapshot_dir(self) -> Path:
+        return self.state_dir / "launchers"
+
+    @property
+    def log(self) -> Path:
+        return self.state_dir / "heal-launchers.log"
+
+    @property
+    def path_unit(self) -> Path:
+        return self.unit_dir / f"{_LINUX_HEAL_UNIT}.path"
+
+    @property
+    def service_unit(self) -> Path:
+        return self.unit_dir / f"{_LINUX_HEAL_UNIT}.service"
+
+    @property
+    def timer_unit(self) -> Path:
+        return self.unit_dir / f"{_LINUX_HEAL_UNIT}.timer"
+
+
+def linux_heal_paths(env: Mapping[str, str] | None = None) -> LinuxHealPaths:
+    env = os.environ if env is None else env
+    home = Path(env.get("HOME") or Path.home())
+
+    def xdg(var: str, default: str) -> Path:
+        # The XDG spec says a relative value is invalid and must be ignored.
+        value = env.get(var)
+        return Path(value) if value and os.path.isabs(value) else home / default
+
+    return LinuxHealPaths(
+        apps_dir=xdg("XDG_DATA_HOME", ".local/share") / "applications",
+        state_dir=xdg("XDG_STATE_HOME", ".local/state") / "dotbrave",
+        unit_dir=xdg("XDG_CONFIG_HOME", ".config") / "systemd" / "user",
+    )
+
+
+def linux_heal_script_source() -> Path:
+    return Path(__file__).resolve().parent.parent / "data" / "heal-launchers.sh"
+
+
+def build_linux_heal_script(paths: LinuxHealPaths) -> str:
+    """Inline the packaged script for the same reason as
+    ``build_heal_script``: a unit already on disk must keep working after
+    the package that wrote it is upgraded or garbage-collected."""
+    _, _, body = linux_heal_script_source().read_text().partition("\n")
+    return (
+        "#!/bin/sh\n"
+        f"APPS={shlex.quote(str(paths.apps_dir))}\n"
+        f"SNAP={shlex.quote(str(paths.snapshot_dir))}\n"
+        f"LOG={shlex.quote(str(paths.log))}\n"
+        "export APPS SNAP LOG\n"
+        f"{body}"
+    )
+
+
+def _unit_value(path: Path) -> str:
+    # `%` starts a specifier in unit files.
+    return str(path).replace("%", "%%")
+
+
+def build_systemd_path_unit(paths: LinuxHealPaths) -> str:
+    """``PathChanged=`` on a directory fires for a child file overwritten in
+    place, copied over, rewritten by ``sed -i``, created or deleted --
+    measured on systemd 261 -- so one watch covers however Brave writes its
+    launchers."""
+    return (
+        "[Unit]\n"
+        "Description=dotbrave: restore Brave PWA launchers a throwaway profile rewrote\n"
+        "\n"
+        "[Path]\n"
+        f"PathChanged={_unit_value(paths.apps_dir)}\n"
+        f"Unit={_LINUX_HEAL_UNIT}.service\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=default.target\n"
+    )
+
+
+def build_systemd_service_unit(paths: LinuxHealPaths) -> str:
+    """``StartLimitIntervalSec=0`` is load-bearing: a throwaway profile
+    writes a dozen launchers inside a few seconds, the default start limit
+    (5 in 10s) failed the service with ``start-limit-hit``, and the path unit
+    then failed too and stopped watching -- measured, with 12 launchers left
+    hijacked."""
+    return (
+        "[Unit]\n"
+        "Description=dotbrave: restore Brave PWA launchers a throwaway profile rewrote\n"
+        "StartLimitIntervalSec=0\n"
+        "\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        f'ExecStart=/bin/sh "{_unit_value(paths.script)}"\n'
+    )
+
+
+def build_systemd_timer_unit() -> str:
+    """Safety net, like the macOS daemon's ``StartInterval``: a launcher
+    written while the service is already running fires no new trigger."""
+    return (
+        "[Unit]\n"
+        "Description=dotbrave: periodic Brave PWA launcher heal\n"
+        "\n"
+        "[Timer]\n"
+        "OnStartupSec=30\n"
+        "OnUnitInactiveSec=60\n"
+        f"Unit={_LINUX_HEAL_UNIT}.service\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=timers.target\n"
+    )
+
+
+def linux_heal_files(paths: LinuxHealPaths) -> dict[Path, str]:
+    return {
+        paths.script: build_linux_heal_script(paths),
+        paths.path_unit: build_systemd_path_unit(paths),
+        paths.service_unit: build_systemd_service_unit(paths),
+        paths.timer_unit: build_systemd_timer_unit(),
+    }
+
+
+def linux_heal_current(paths: LinuxHealPaths) -> bool:
+    for path, text in linux_heal_files(paths).items():
+        try:
+            if path.read_text(encoding="utf-8") != text:
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def linux_heal_present(paths: LinuxHealPaths) -> bool:
+    return any(p.exists() for p in linux_heal_files(paths))
+
+
+def _systemctl_user(*args: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", *args],
+            check=False, capture_output=True, text=True,
+        )
+    except FileNotFoundError:
+        return False
+    return result.returncode == 0
+
+
+def install_linux_launcher_heal(paths: LinuxHealPaths) -> None:
+    """Write the script and units, then start watching. Patchable in tests.
+
+    The first run is started explicitly so the snapshot exists before any
+    throwaway profile does."""
+    for path, text in linux_heal_files(paths).items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    paths.script.chmod(0o755)
+    started = (
+        _systemctl_user("daemon-reload")
+        and _systemctl_user(
+            "enable", "--now",
+            f"{_LINUX_HEAL_UNIT}.path", f"{_LINUX_HEAL_UNIT}.timer",
+        )
+        and _systemctl_user("start", f"{_LINUX_HEAL_UNIT}.service")
+    )
+    if not started:
+        print(
+            "warning: [pwa] launcher heal is written but not running -- "
+            "`systemctl --user` failed here. From a desktop session run: "
+            f"systemctl --user enable --now {_LINUX_HEAL_UNIT}.path",
+            file=sys.stderr,
+        )
+
+
+def remove_linux_launcher_heal(paths: LinuxHealPaths) -> None:
+    """Stop watching and delete the heal's own files. Patchable in tests."""
+    _systemctl_user(
+        "disable", "--now", f"{_LINUX_HEAL_UNIT}.path", f"{_LINUX_HEAL_UNIT}.timer",
+    )
+    for path in (paths.path_unit, paths.service_unit, paths.timer_unit,
+                 paths.script, paths.log):
+        path.unlink(missing_ok=True)
+    shutil.rmtree(paths.snapshot_dir, ignore_errors=True)
+    try:
+        paths.state_dir.rmdir()
+    except OSError:
+        pass
+    _systemctl_user("daemon-reload")
+
+
+@dataclass(frozen=True)
+class LauncherHeal:
+    """The Linux launcher heal as ``plan_apply`` sees it, injected by the
+    browser wrapper so tests can fake it."""
+
+    current: Callable[[], bool]
+    present: Callable[[], bool]
+    install: Callable[[], None]
+    remove: Callable[[], None]
 
 
 @dataclass
@@ -475,12 +707,17 @@ def plan_apply(
     prefs_path: Path,
     prefs: dict,
     raw_table: object,
+    launcher_heal: LauncherHeal | None = None,
 ) -> Plan:
     """Build a Plan for the [pwa] table.
 
     ``policy_file``, ``sudo_write_fn``, and ``read_policy_fn`` are
     passed in by the browser wrapper so that tests can monkeypatch
     the browser module's attributes and the changes are visible here.
+
+    ``launcher_heal`` is diffed separately from the policy, so a machine
+    whose policy already matches still gets the heal installed -- and that
+    run writes no policy, so it does not need sudo for anything.
     """
     check_platform_supported(policy_file)
     check_install_supported(cfg, prefs_path)
@@ -489,6 +726,16 @@ def plan_apply(
     current = read_policy_fn()
 
     diff = diff_summary(current, target_urls)
+    policy_dirty = bool(diff)
+
+    heal_action = None
+    if launcher_heal is not None:
+        if target_urls and not launcher_heal.current():
+            heal_action = launcher_heal.install
+            diff.append(f"  + launcher heal (systemd --user {_LINUX_HEAL_UNIT}.path)")
+        elif not target_urls and launcher_heal.present():
+            heal_action = launcher_heal.remove
+            diff.append(f"  - launcher heal (systemd --user {_LINUX_HEAL_UNIT}.path)")
 
     def apply_fn(_prefs: dict) -> None:
         pass
@@ -497,15 +744,18 @@ def plan_apply(
         pass
 
     def external_apply_fn() -> None:
-        entries = [entry_for(u) for u in target_urls]
-        sudo_write_fn(entries)
-        actual = read_policy_fn()
-        if set(actual) != set(target_urls):
-            sys.exit(
-                "error: pwa verification failed: policy file URL set does "
-                f"not match config (wrote {sorted(target_urls)}, "
-                f"file has {sorted(actual)})"
-            )
+        if policy_dirty:
+            entries = [entry_for(u) for u in target_urls]
+            sudo_write_fn(entries)
+            actual = read_policy_fn()
+            if set(actual) != set(target_urls):
+                sys.exit(
+                    "error: pwa verification failed: policy file URL set does "
+                    f"not match config (wrote {sorted(target_urls)}, "
+                    f"file has {sorted(actual)})"
+                )
+        if heal_action is not None:
+            heal_action()
 
     return Plan(
         namespace=NAMESPACE,

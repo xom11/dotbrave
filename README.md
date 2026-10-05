@@ -181,7 +181,7 @@ dotbrave apply brave.toml              # live apply if Brave is running
   `default_launch_container = "window"` and `create_desktop_shortcut = true`.
   `[pwa]` is the only namespace that needs elevated privileges: it writes a
   managed-policy file (sudo on Linux/macOS) or the Windows Registry
-  (Administrator). No `[pwa]` diff → no elevation prompt.
+  (Administrator). No `[pwa]` URL diff → no policy write.
 - **Empty header** (e.g. `[settings]` with no entries) wipes everything
   dotbrave previously managed in that namespace. **Missing header** = skip
   the namespace entirely.
@@ -325,6 +325,29 @@ root-owned self-healing helper:
   rewrite script.
 
 Applying an empty `[pwa]` table (`urls = []`) removes all of the above.
+
+On Linux the policy has a different side effect: it applies to **every**
+`--user-data-dir`, and a launcher's file name
+(`brave-<app-id>-Default.desktop`) does not include the data dir. So any
+Brave started on a throwaway profile — a test harness, a headless
+screenshot, an AI agent checking a page — installs the same apps and
+overwrites your launchers with its own `--user-data-dir`. From then on
+every PWA opens in an empty profile, signed out of everything, with no
+error anywhere. `apply` therefore installs a per-user watch (no root):
+
+- `~/.config/systemd/user/dotbrave-pwa-heal.{path,service,timer}` — runs
+  the heal whenever `~/.local/share/applications` changes, and once a minute
+  as a safety net.
+- `~/.local/state/dotbrave/heal-launchers.sh` — restores a hijacked
+  launcher from `launchers/`, its last known-good copy. A hijacked launcher
+  with no copy is an app id only the throwaway profile has (same URL, but
+  its manifest resolved differently there) and is deleted with its icons —
+  except on the very first run, when it could be a real app's only launcher
+  and just has the `--user-data-dir` stripped. Every fix is logged to
+  `heal-launchers.log`.
+
+A machine whose policy already matches still gets the heal on its next
+`apply`, without a policy write. `urls = []` removes it.
 
 ### Brave install methods
 

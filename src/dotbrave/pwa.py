@@ -94,6 +94,17 @@ def _check_install_supported(prefs_path: Path) -> None:
     _base.check_install_supported(_PWA_CONFIG, prefs_path)
 
 
+def _launcher_heal() -> _base.LauncherHeal | None:
+    if not sys.platform.startswith("linux"):
+        return None
+    return _base.LauncherHeal(
+        current=lambda: _base.linux_heal_current(_base.linux_heal_paths()),
+        present=lambda: _base.linux_heal_present(_base.linux_heal_paths()),
+        install=lambda: _base.install_linux_launcher_heal(_base.linux_heal_paths()),
+        remove=lambda: _base.remove_linux_launcher_heal(_base.linux_heal_paths()),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -107,6 +118,7 @@ def plan_apply(prefs_path: Path, prefs: dict, raw_table: object) -> Plan:
         prefs_path,
         prefs,
         raw_table,
+        _launcher_heal(),
     )
 
 

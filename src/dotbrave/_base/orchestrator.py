@@ -433,7 +433,7 @@ def cmd_apply(
             applied_external = [f"[{p.namespace}]" for p in external]
             names = ", ".join(applied_external)
             print(
-                f"ok -- {names} policy written without touching the "
+                f"ok -- {names} applied without touching the "
                 f"running {display_name} (loaded at its next launch)"
             )
             if not browser_bound:

@@ -7,6 +7,15 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _no_launcher_heal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep every [pwa] apply away from the real ~/.config/systemd/user.
+    Tests of the heal itself re-patch ``pwa._launcher_heal``."""
+    from dotbrave import pwa
+
+    monkeypatch.setattr(pwa, "_launcher_heal", lambda: None)
+
+
 @pytest.fixture
 def fake_settings_profile_root(tmp_path: Path) -> Path:
     """Profile root for settings tests.

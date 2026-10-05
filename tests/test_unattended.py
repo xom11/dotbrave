@@ -363,7 +363,7 @@ def test_unattended_partial_apply_names_what_landed_and_what_did_not(
     )
 
     captured = capsys.readouterr()
-    assert "[pwa] policy written without touching the running Brave" in captured.out
+    assert "[pwa] applied without touching the running Brave" in captured.out
     assert "[pwa] applied" in captured.err
     assert "[shortcuts] not applied" in captured.err
 
@@ -434,7 +434,7 @@ def test_all_external_apply_is_unchanged_and_applies_once(
     captured = capsys.readouterr()
     assert calls == ["pwa"]
     assert (
-        "ok -- [pwa] policy written without touching the running Brave "
+        "ok -- [pwa] applied without touching the running Brave "
         "(loaded at its next launch)" in captured.out
     )
     # The whole story: nothing was left undone, so nothing is reported as such.
