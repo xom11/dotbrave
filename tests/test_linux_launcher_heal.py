@@ -3,9 +3,9 @@
 A Brave started on a throwaway --user-data-dir obeys the managed [pwa]
 policy too, and overwrites the real profile's launchers with its own data
 dir in Exec. The heal is a systemd user path unit plus a shell script that
-puts them back. The pure builders run anywhere; the script itself runs under
-a real /bin/sh against a tmp applications dir; install/remove record the
-systemctl calls instead of making them.
+puts them back. The script runs under a real /bin/sh against a tmp
+applications dir; install/remove record the systemctl calls instead of
+making them.
 """
 from __future__ import annotations
 
@@ -22,7 +22,10 @@ from dotbrave import browser as brave_pkg
 from dotbrave import pwa
 from dotbrave._base import pwa as base
 
-linux_only = pytest.mark.skipif(
+# The heal only ever runs on Linux, and the path tests assume POSIX paths:
+# on Windows `os.path.isabs("/data")` is False (3.13) and shlex quotes a
+# backslashed path, so the same assertions would test nothing real there.
+pytestmark = pytest.mark.skipif(
     not sys.platform.startswith("linux"), reason="the launcher heal is Linux-only"
 )
 
@@ -121,7 +124,6 @@ def test_script_inlines_its_inputs_under_a_single_shebang(paths) -> None:
 # ---------------------------------------------------------------------------
 
 
-@linux_only
 def test_good_launcher_is_snapshotted(paths) -> None:
     (paths.apps_dir / APP).write_text(GOOD)
     _run_heal(paths)
@@ -129,7 +131,6 @@ def test_good_launcher_is_snapshotted(paths) -> None:
     assert _log(paths) == ""
 
 
-@linux_only
 def test_hijacked_launcher_is_restored_from_the_snapshot(paths) -> None:
     (paths.apps_dir / APP).write_text(GOOD)
     _run_heal(paths)
@@ -139,7 +140,6 @@ def test_hijacked_launcher_is_restored_from_the_snapshot(paths) -> None:
     assert f"restored {APP}" in _log(paths)
 
 
-@linux_only
 def test_first_run_strips_an_unknown_hijacked_launcher_instead_of_deleting(
     paths,
 ) -> None:
@@ -159,7 +159,6 @@ def test_first_run_strips_an_unknown_hijacked_launcher_instead_of_deleting(
         assert f"stripped {name}" in _log(paths)
 
 
-@linux_only
 def test_later_unknown_hijacked_launcher_is_deleted_with_its_icons(paths) -> None:
     """Once the heal has run, every real launcher passed through it good, so
     one with no snapshot is an app id only the throwaway profile has."""
@@ -180,7 +179,6 @@ def test_later_unknown_hijacked_launcher_is_deleted_with_its_icons(paths) -> Non
     assert (paths.apps_dir / APP).read_text() == GOOD
 
 
-@linux_only
 def test_launchers_without_an_app_id_are_left_alone(paths) -> None:
     browser = "brave-browser.desktop"
     text = "[Desktop Entry]\nExec=brave --user-data-dir=/x %U\n"
@@ -189,7 +187,6 @@ def test_launchers_without_an_app_id_are_left_alone(paths) -> None:
     assert (paths.apps_dir / browser).read_text() == text
 
 
-@linux_only
 def test_launcher_briefly_missing_is_still_restored_not_deleted(paths) -> None:
     """Brave rewrites a launcher by deleting and recreating it. A run in that
     gap used to forget the snapshot, and the next run deleted the real app's
@@ -204,7 +201,6 @@ def test_launcher_briefly_missing_is_still_restored_not_deleted(paths) -> None:
     assert "removed" not in _log(paths)
 
 
-@linux_only
 def test_second_run_writes_nothing(paths) -> None:
     """The path unit fires on the heal's own writes; a run that changes
     nothing is what stops that from looping."""
@@ -307,8 +303,6 @@ class _FakeHeal:
 
 @pytest.fixture
 def apply_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    if sys.platform == "win32":
-        pytest.skip("the launcher heal is Linux-only")
     root = tmp_path / "root"
     (root / "Default").mkdir(parents=True)
     (root / "Default" / "Preferences").write_text(json.dumps({"some": "thing"}))
