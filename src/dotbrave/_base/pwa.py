@@ -9,13 +9,16 @@ wrappers (so tests can monkeypatch module-level ``POLICY_FILE`` and
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import plistlib
+import re
 import shlex
 import shutil
 import subprocess
 import sys
+import urllib.parse
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -468,6 +471,381 @@ class LauncherHeal:
     remove: Callable[[], None]
 
 
+@dataclass(frozen=True)
+class LauncherCleanup:
+    """Immediate OS launcher cleanup for uninstalled PWAs and foreign-profile
+    shims, injected by the browser wrapper so tests can isolate or fake it."""
+
+    orphan_diff: Callable[[], list[str]]
+    clean: Callable[[dict[str, dict], dict[str, str | None]], None]
+
+
+# ---------------------------------------------------------------------------
+# Chromium PWA app_id + immediate OS launcher cleanup
+# ---------------------------------------------------------------------------
+
+VALID_PLATFORMS = ("linux", "macos", "windows")
+_AUTO_PLATFORM = "__auto__"
+
+_MACOS_SHIM_DIRS = {
+    "com.brave.Browser": "Brave Browser Apps.localized",
+    "com.brave.Browser.beta": "Brave Browser Beta Apps.localized",
+    "com.brave.Browser.nightly": "Brave Browser Nightly Apps.localized",
+}
+_LSREGISTER = Path(
+    "/System/Library/Frameworks/CoreServices.framework/Versions/A"
+    "/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister"
+)
+_APP_ID_RE = re.compile(r"--app-id=([a-p]{32})\b")
+_PROFILE_DIR_RE = re.compile(r'--profile-directory=(?:"([^"]+)"|(\S+))')
+
+
+def current_platform_name(plat: str | None = None) -> str | None:
+    p = sys.platform if plat is None else plat
+    if p.startswith("linux"):
+        return "linux"
+    if p == "darwin":
+        return "macos"
+    if p == "win32":
+        return "windows"
+    return None
+
+
+def canonical_pwa_url(url: str) -> str:
+    """Canonicalize an HTTPS PWA URL the way Chromium's ``GURL`` does for
+    placeholder ``manifest_id`` hashing (empty path becomes ``"/"``)."""
+    parts = urllib.parse.urlsplit(url)
+    scheme = parts.scheme.lower()
+    hostname = (parts.hostname or "").lower()
+    port = parts.port
+    if port is None or (scheme == "https" and port == 443):
+        netloc = hostname
+    else:
+        netloc = f"{hostname}:{port}"
+    path = parts.path or "/"
+    return urllib.parse.urlunsplit((scheme, netloc, path, parts.query, ""))
+
+
+def pwa_origin(url: str) -> str:
+    parts = urllib.parse.urlsplit(canonical_pwa_url(url))
+    if not parts.scheme or not parts.netloc:
+        return ""
+    return f"{parts.scheme}://{parts.netloc}"
+
+
+def crx_app_id(manifest_id: str) -> str:
+    """Chromium ``GenerateAppIdFromManifestId``: ``SHA256(SHA256(id))[:16]``
+    encoded nibble-by-nibble in ``'a'..'p'``."""
+    h1 = hashlib.sha256(manifest_id.encode("utf-8")).digest()
+    digest = hashlib.sha256(h1).digest()[:16]
+    return "".join(
+        chr(ord("a") + (b >> 4)) + chr(ord("a") + (b & 0x0F))
+        for b in digest
+    )
+
+
+def candidate_app_ids(
+    urls: set[str],
+    prefs: dict,
+    *,
+    exclude_urls: set[str] | frozenset[str] = frozenset(),
+) -> set[str]:
+    """Resolve policy URLs to installed Chromium ``app_id``s via both the
+    placeholder URL hash and ``Preferences`` ``app_banner`` records."""
+    target_canon = {canonical_pwa_url(u) for u in urls}
+    excluded_canon = {canonical_pwa_url(u) for u in exclude_urls}
+    target_origins = {pwa_origin(u) for u in target_canon if pwa_origin(u)}
+    excluded_origins = {pwa_origin(u) for u in excluded_canon if pwa_origin(u)}
+
+    out: set[str] = set()
+    for u in urls:
+        canon = canonical_pwa_url(u)
+        if canon not in excluded_canon:
+            out.add(crx_app_id(canon))
+            out.add(crx_app_id(u))
+
+    app_banner = (
+        prefs.get("profile", {})
+        .get("content_settings", {})
+        .get("exceptions", {})
+        .get("app_banner", {})
+    )
+    if isinstance(app_banner, dict):
+        for pattern, record in app_banner.items():
+            if not isinstance(pattern, str) or not isinstance(record, dict):
+                continue
+            pattern_orig = pwa_origin(pattern.split(",", 1)[0])
+            setting = record.get("setting")
+            if not isinstance(setting, dict):
+                continue
+            for manifest_key in setting:
+                if not isinstance(manifest_key, str) or not manifest_key:
+                    continue
+                mk_canon = canonical_pwa_url(manifest_key)
+                mk_orig = pwa_origin(mk_canon)
+                origin_match = (
+                    (pattern_orig and pattern_orig in (target_origins - excluded_origins))
+                    or (mk_orig and mk_orig in (target_origins - excluded_origins))
+                )
+                prefix_match = (
+                    any(mk_canon.startswith(t) for t in target_canon)
+                    and not any(mk_canon.startswith(e) for e in excluded_canon)
+                )
+                if origin_match or prefix_match:
+                    out.add(crx_app_id(manifest_key))
+                    out.add(crx_app_id(mk_canon))
+    return out
+
+
+def removed_app_ids(
+    removed_urls: set[str], target_urls: list[str], prefs: dict
+) -> set[str]:
+    return candidate_app_ids(
+        removed_urls, prefs, exclude_urls=set(target_urls)
+    )
+
+
+def _path_within(child: Path, root: Path) -> bool:
+    try:
+        return child.resolve().is_relative_to(root.resolve())
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
+def macos_shim_dir(bundle_id: str, home: Path | None = None) -> Path | None:
+    folder = _MACOS_SHIM_DIRS.get(bundle_id)
+    if folder is None:
+        return None
+    return (home or Path.home()) / "Applications" / folder
+
+
+def _read_macos_shim_info(app_bundle: Path) -> dict[str, Any] | None:
+    plist_path = app_bundle / "Contents" / "Info.plist"
+    try:
+        with plist_path.open("rb") as f:
+            data = plistlib.load(f)
+    except (OSError, plistlib.InvalidFileException, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    shortcut_id = data.get("CrAppModeShortcutID")
+    if not isinstance(shortcut_id, str) or not shortcut_id:
+        return None
+    return data
+
+
+def scan_macos_foreign_shims(
+    shim_dir: Path | None, bundle_id: str, profile_root: Path
+) -> list[Path]:
+    """Find ``.app`` shims in ``shim_dir`` created by throwaway
+    ``--user-data-dir`` launches outside ``profile_root``."""
+    if shim_dir is None or not shim_dir.is_dir():
+        return []
+    found: list[Path] = []
+    for app_bundle in sorted(shim_dir.glob("*.app")):
+        info = _read_macos_shim_info(app_bundle)
+        if info is None or info.get("CrBundleIdentifier") != bundle_id:
+            continue
+        udd = info.get("CrAppModeUserDataDir")
+        if isinstance(udd, str) and udd and not _path_within(Path(udd), profile_root):
+            found.append(app_bundle)
+    return found
+
+
+def unregister_and_remove_macos_shim(
+    app_bundle: Path, *, lsregister: Path = _LSREGISTER
+) -> None:
+    if lsregister.exists():
+        subprocess.run(
+            [str(lsregister), "-u", str(app_bundle)],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    shutil.rmtree(app_bundle, ignore_errors=True)
+
+
+def cleanup_macos_shims(
+    shim_dir: Path | None,
+    bundle_id: str,
+    profile_root: Path,
+    removed_entries: dict[str, dict],
+    target_entries: dict[str, str | None],
+    prefs: dict,
+    *,
+    clean_foreign: bool = False,
+    lsregister: Path = _LSREGISTER,
+) -> list[Path]:
+    if shim_dir is None or not shim_dir.is_dir():
+        return []
+
+    to_remove: list[Path] = []
+    seen_paths: set[Path] = set()
+
+    if clean_foreign:
+        for foreign in scan_macos_foreign_shims(shim_dir, bundle_id, profile_root):
+            seen_paths.add(foreign)
+            to_remove.append(foreign)
+
+    if removed_entries:
+        rem_ids = removed_app_ids(set(removed_entries), list(target_entries), prefs)
+        kept_ids = candidate_app_ids(set(target_entries), prefs)
+        kept_canon = {canonical_pwa_url(u) for u in target_entries}
+        kept_origins = {pwa_origin(u) for u in kept_canon if pwa_origin(u)}
+        kept_names = {n for n in target_entries.values() if n}
+        rem_canon = {canonical_pwa_url(u) for u in removed_entries} - kept_canon
+        rem_origins = (
+            {pwa_origin(u) for u in rem_canon if pwa_origin(u)} - kept_origins
+        )
+        rem_names = {
+            e["fallback_app_name"]
+            for e in removed_entries.values()
+            if isinstance(e.get("fallback_app_name"), str) and e["fallback_app_name"]
+        } - kept_names
+
+        for app_bundle in sorted(shim_dir.glob("*.app")):
+            if app_bundle in seen_paths:
+                continue
+            info = _read_macos_shim_info(app_bundle)
+            if info is None or info.get("CrBundleIdentifier") != bundle_id:
+                continue
+            udd = info.get("CrAppModeUserDataDir")
+            if isinstance(udd, str) and udd and not _path_within(Path(udd), profile_root):
+                continue
+
+            shortcut_id = info.get("CrAppModeShortcutID", "")
+            shortcut_url = info.get("CrAppModeShortcutURL", "")
+            shortcut_name = info.get("CrAppModeShortcutName", "")
+
+            matched = shortcut_id in rem_ids
+            if not matched and isinstance(shortcut_url, str) and shortcut_url:
+                s_canon = canonical_pwa_url(shortcut_url)
+                s_orig = pwa_origin(s_canon)
+                matched = (
+                    s_canon in rem_canon
+                    or (bool(s_orig) and s_orig in rem_origins)
+                    or (
+                        any(s_canon.startswith(r) for r in rem_canon)
+                        and not any(s_canon.startswith(k) for k in kept_canon)
+                    )
+                )
+            if (
+                not matched
+                and isinstance(shortcut_name, str)
+                and shortcut_name
+                and shortcut_id not in kept_ids
+            ):
+                s_orig = pwa_origin(shortcut_url) if isinstance(shortcut_url, str) else ""
+                if not s_orig or s_orig not in kept_origins:
+                    matched = shortcut_name in rem_names or any(
+                        shortcut_name.startswith(f"{n} - ") for n in rem_names
+                    )
+
+            if matched:
+                seen_paths.add(app_bundle)
+                to_remove.append(app_bundle)
+
+    for app_bundle in to_remove:
+        unregister_and_remove_macos_shim(app_bundle, lsregister=lsregister)
+    return to_remove
+
+
+def _parse_linux_desktop(text: str) -> tuple[str | None, str | None, str | None]:
+    """Return ``(app_id, profile_dir, display_name)`` from a ``.desktop``."""
+    app_id: str | None = None
+    prof_dir: str | None = None
+    name: str | None = None
+    for line in text.splitlines():
+        if line.startswith("Name=") and name is None:
+            name = line.split("=", 1)[1].strip()
+        elif line.startswith("Exec=") and app_id is None:
+            m_id = _APP_ID_RE.search(line)
+            if m_id:
+                app_id = m_id.group(1)
+            m_prof = _PROFILE_DIR_RE.search(line)
+            if m_prof:
+                prof_dir = m_prof.group(1) or m_prof.group(2)
+    return app_id, prof_dir, name
+
+
+def cleanup_linux_removed_launchers(
+    paths: LinuxHealPaths,
+    profile_name: str,
+    removed_entries: dict[str, dict],
+    target_entries: dict[str, str | None],
+    prefs: dict,
+) -> list[Path]:
+    """Delete ``.desktop`` launchers, hicolor icons, and heal snapshots for
+    URLs removed from ``[pwa]``."""
+    if not removed_entries:
+        return []
+
+    rem_ids = removed_app_ids(set(removed_entries), list(target_entries), prefs)
+    kept_ids = candidate_app_ids(set(target_entries), prefs)
+    kept_canon = {canonical_pwa_url(u) for u in target_entries}
+    kept_origins = {pwa_origin(u) for u in kept_canon if pwa_origin(u)}
+    kept_names = {n for n in target_entries.values() if n}
+    rem_names = {
+        e["fallback_app_name"]
+        for e in removed_entries.values()
+        if isinstance(e.get("fallback_app_name"), str) and e["fallback_app_name"]
+    } - kept_names
+
+    rem_url_labels: set[str] = set()
+    for u in removed_entries:
+        canon = canonical_pwa_url(u)
+        orig = pwa_origin(canon)
+        if canon not in kept_canon:
+            rem_url_labels.add(u)
+            rem_url_labels.add(canon)
+            rem_url_labels.add(canon.rstrip("/"))
+        if orig and orig not in kept_origins:
+            host = urllib.parse.urlsplit(canon).hostname
+            if host:
+                rem_url_labels.add(host)
+
+    candidates: dict[str, Path] = {}
+    for directory in (paths.apps_dir, paths.snapshot_dir):
+        if directory.is_dir():
+            for f in sorted(directory.glob("brave*.desktop")):
+                candidates.setdefault(f.name, f)
+
+    icons_root = paths.apps_dir.parent / "icons" / "hicolor"
+    removed_paths: list[Path] = []
+    for filename, sample_path in candidates.items():
+        try:
+            text = sample_path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        app_id, prof_dir, desktop_name = _parse_linux_desktop(text)
+        if not app_id:
+            continue
+        if prof_dir is not None and prof_dir != profile_name:
+            continue
+
+        matched = app_id in rem_ids
+        if not matched and desktop_name and app_id not in kept_ids:
+            matched = (
+                desktop_name in rem_names
+                or any(desktop_name.startswith(f"{n} - ") for n in rem_names)
+                or desktop_name in rem_url_labels
+            )
+        if not matched:
+            continue
+
+        app_file = paths.apps_dir / filename
+        snap_file = paths.snapshot_dir / filename
+        app_file.unlink(missing_ok=True)
+        snap_file.unlink(missing_ok=True)
+        if icons_root.is_dir():
+            stem = sample_path.stem
+            for icon in icons_root.glob(f"*/apps/{stem}.*"):
+                icon.unlink(missing_ok=True)
+        removed_paths.append(app_file)
+
+    return removed_paths
+
+
 @dataclass
 class PwaConfig:
     """Browser-specific PWA policy paths."""
@@ -511,13 +889,20 @@ def check_install_supported(cfg: PwaConfig, prefs_path: Path) -> None:
             )
 
 
-def validate_entries(raw: object) -> list[tuple[str, str | None]]:
+def validate_entries(
+    raw: object,
+    *,
+    platform: str | None = _AUTO_PLATFORM,
+) -> list[tuple[str, str | None]]:
     """``(url, name)`` per ``[pwa]`` entry, in order, duplicates dropped.
 
-    An entry is a URL string or ``{ url = "...", name = "..." }``. ``name``
-    becomes the policy's ``fallback_app_name``: the name Brave gives an app
-    it can only install as a placeholder -- no manifest, or a login wall in
-    front of it -- which otherwise shows up as the bare URL."""
+    An entry is a URL string or ``{ url = "...", name = "...", platforms = [...] }``.
+    ``name`` becomes the policy's ``fallback_app_name``: the name Brave gives
+    an app it can only install as a placeholder -- no manifest, or a login
+    wall in front of it -- which otherwise shows up as the bare URL.
+    ``platforms`` filters the entry to a subset of ``linux``, ``macos``,
+    ``windows``; every entry is validated before filtering so typos on
+    another OS's entry still fail immediately."""
     if not isinstance(raw, dict):
         sys.exit("error: [pwa] must be a table")
     extra = set(raw.keys()) - {"urls"}
@@ -529,30 +914,61 @@ def validate_entries(raw: object) -> list[tuple[str, str | None]]:
     urls = raw.get("urls", [])
     if not isinstance(urls, list):
         sys.exit("error: [pwa] urls must be an array of strings")
+
+    resolved_platform = (
+        current_platform_name() if platform == _AUTO_PLATFORM else platform
+    )
+    if resolved_platform is not None and resolved_platform not in VALID_PLATFORMS:
+        sys.exit(
+            f"error: unknown target platform {resolved_platform!r} "
+            f"(expected one of {list(VALID_PLATFORMS)})"
+        )
+
     seen: set[str] = set()
     out: list[tuple[str, str | None]] = []
     for u in urls:
         name = None
+        entry_platforms: list[str] | None = None
         if isinstance(u, dict):
-            bad = set(u) - {"url", "name"}
+            bad = set(u) - {"url", "name", "platforms"}
             if bad:
                 sys.exit(
                     f"error: [pwa] url table has unsupported keys: {sorted(bad)} "
-                    f'(expected {{ url = "...", name = "..." }})'
+                    f'(expected {{ url = "...", name = "...", platforms = [...] }})'
                 )
             name = u.get("name")
             if name is not None and (not isinstance(name, str) or not name.strip()):
                 sys.exit(f"error: [pwa] name must be a non-empty string, got {name!r}")
+            if "platforms" in u:
+                plats = u["platforms"]
+                if not isinstance(plats, list) or not plats:
+                    sys.exit(
+                        f"error: [pwa] platforms must be a non-empty array of "
+                        f"{list(VALID_PLATFORMS)}, got {plats!r}"
+                    )
+                for p_item in plats:
+                    if not isinstance(p_item, str) or p_item not in VALID_PLATFORMS:
+                        sys.exit(
+                            f"error: [pwa] invalid platform {p_item!r} "
+                            f"(expected one of {list(VALID_PLATFORMS)})"
+                        )
+                entry_platforms = plats
             u = u.get("url")
             if not isinstance(u, str):
                 sys.exit('error: [pwa] url table needs a string `url = "https://..."`')
         elif not isinstance(u, str):
             sys.exit(
-                f"error: [pwa] url entries must be strings or {{ url, name }} "
-                f"tables, got {type(u).__name__}"
+                f"error: [pwa] url entries must be strings or "
+                f"{{ url, name, platforms }} tables, got {type(u).__name__}"
             )
         if not u.startswith("https://"):
             sys.exit(f"error: [pwa] invalid url {u!r} (must start with https://)")
+        if (
+            resolved_platform is not None
+            and entry_platforms is not None
+            and resolved_platform not in entry_platforms
+        ):
+            continue
         if u in seen:
             continue
         seen.add(u)
@@ -560,8 +976,12 @@ def validate_entries(raw: object) -> list[tuple[str, str | None]]:
     return out
 
 
-def validate_table(raw: object) -> list[str]:
-    return [url for url, _ in validate_entries(raw)]
+def validate_table(
+    raw: object,
+    *,
+    platform: str | None = _AUTO_PLATFORM,
+) -> list[str]:
+    return [url for url, _ in validate_entries(raw, platform=platform)]
 
 
 def entry_for(url: str, name: str | None = None) -> dict[str, Any]:
@@ -753,6 +1173,7 @@ def plan_apply(
     prefs: dict,
     raw_table: object,
     launcher_heal: LauncherHeal | None = None,
+    launcher_cleanup: LauncherCleanup | None = None,
 ) -> Plan:
     """Build a Plan for the [pwa] table.
 
@@ -760,9 +1181,9 @@ def plan_apply(
     passed in by the browser wrapper so that tests can monkeypatch
     the browser module's attributes and the changes are visible here.
 
-    ``launcher_heal`` is diffed separately from the policy, so a machine
-    whose policy already matches still gets the heal installed -- and that
-    run writes no policy, so it does not need sudo for anything.
+    ``launcher_heal`` and ``launcher_cleanup`` are diffed separately from
+    the policy, so a machine whose policy already matches still gets its
+    heal installed or foreign shims pruned without needing sudo.
     """
     check_platform_supported(policy_file)
     check_install_supported(cfg, prefs_path)
@@ -770,10 +1191,12 @@ def plan_apply(
     target = validate_entries(raw_table)
     target_urls = [url for url, _ in target]
     target_names = {url: name for url, name in target if name}
+    target_map: dict[str, str | None] = {url: name for url, name in target}
     current = read_policy_fn()
 
     diff = diff_summary(current, target_urls, target_names)
     policy_dirty = bool(diff)
+    removed_entries = {u: current[u] for u in set(current) - set(target_urls)}
 
     heal_action = None
     if launcher_heal is not None:
@@ -783,6 +1206,14 @@ def plan_apply(
         elif not target_urls and launcher_heal.present():
             heal_action = launcher_heal.remove
             diff.append(f"  - launcher heal (systemd --user {_LINUX_HEAL_UNIT}.path)")
+
+    orphan_lines = (
+        launcher_cleanup.orphan_diff() if launcher_cleanup is not None else []
+    )
+    diff.extend(orphan_lines)
+    run_cleanup = launcher_cleanup is not None and bool(
+        removed_entries or orphan_lines
+    )
 
     def apply_fn(_prefs: dict) -> None:
         pass
@@ -812,6 +1243,8 @@ def plan_apply(
                 )
         if heal_action is not None:
             heal_action()
+        if run_cleanup and launcher_cleanup is not None:
+            launcher_cleanup.clean(removed_entries, target_map)
 
     return Plan(
         namespace=NAMESPACE,
@@ -819,6 +1252,7 @@ def plan_apply(
         apply_fn=apply_fn,
         verify_fn=verify_fn,
         external_apply_fn=external_apply_fn,
+        needs_escalation=policy_dirty,
     )
 
 

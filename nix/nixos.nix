@@ -3,7 +3,7 @@
 { config, lib, ... }:
 let
   cfg = config.services.dotbrave;
-  entries = (import ./pwa-policy.nix { inherit lib; }).entriesFrom cfg.config;
+  entries = (import ./pwa-policy.nix { inherit lib; }).entriesFromFor "linux" cfg.config;
 in
 {
   options.services.dotbrave = {

@@ -16,7 +16,7 @@
 { config, lib, pkgs, ... }:
 let
   cfg = config.services.dotbrave;
-  entries = (import ./pwa-policy.nix { inherit lib; }).entriesFrom cfg.config;
+  entries = (import ./pwa-policy.nix { inherit lib; }).entriesFromFor "macos" cfg.config;
 
   bundle = "com.brave.Browser";
   label = "org.dotbrave.${bundle}.pwa";

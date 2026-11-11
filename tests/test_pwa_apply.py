@@ -591,3 +591,435 @@ def test_generated_header_does_not_advertise_a_removed_subcommand() -> None:
                 if forbidden in line:
                     hits.append(f"{path}:{lineno}:{line}")
     assert not hits, "removed subcommand still advertised:\n" + "\n".join(hits)
+
+
+# ---------------------------------------------------------------------------
+# Per-entry `platforms` filtering + immediate OS launcher cleanup
+# ---------------------------------------------------------------------------
+
+
+def test_validate_filters_by_platforms_and_validates_skipped_entries() -> None:
+    from dotbrave._base import pwa as base
+
+    table = {
+        "urls": [
+            "https://all.example/",
+            {
+                "url": "https://linux.example/",
+                "name": "Linux App",
+                "platforms": ["linux"],
+            },
+            {
+                "url": "https://desk.example/",
+                "platforms": ["macos", "windows"],
+            },
+            {
+                "url": "https://per-os.example/",
+                "name": "Linux Variant",
+                "platforms": ["linux"],
+            },
+            {
+                "url": "https://per-os.example/",
+                "name": "Mac Variant",
+                "platforms": ["macos"],
+            },
+        ]
+    }
+    assert base.validate_entries(table, platform="linux") == [
+        ("https://all.example/", None),
+        ("https://linux.example/", "Linux App"),
+        ("https://per-os.example/", "Linux Variant"),
+    ]
+    assert base.validate_entries(table, platform="macos") == [
+        ("https://all.example/", None),
+        ("https://desk.example/", None),
+        ("https://per-os.example/", "Mac Variant"),
+    ]
+    assert base.validate_entries(table, platform="windows") == [
+        ("https://all.example/", None),
+        ("https://desk.example/", None),
+    ]
+
+    with pytest.raises(SystemExit, match=r"invalid platform"):
+        base.validate_entries(
+            {"urls": [{"url": "https://a.example/", "platforms": ["freebsd"]}]},
+            platform="macos",
+        )
+    with pytest.raises(SystemExit, match=r"non-empty array"):
+        base.validate_entries(
+            {"urls": [{"url": "https://a.example/", "platforms": []}]},
+            platform="macos",
+        )
+    # Invalid URL on a Linux-only entry must still fail when validated on macOS.
+    with pytest.raises(SystemExit, match=r"must start with https://"):
+        base.validate_entries(
+            {
+                "urls": [
+                    "https://ok.example/",
+                    {"url": "http://bad.example/", "platforms": ["linux"]},
+                ]
+            },
+            platform="macos",
+        )
+
+
+def test_crx_app_id_and_removed_app_ids() -> None:
+    from dotbrave._base import pwa as base
+
+    # Verified against live Chromium GenerateAppIdFromManifestId outputs.
+    assert (
+        base.crx_app_id("https://chatgpt.com/")
+        == "cadlkienfkclaiaibeoongdcgmdikeeg"
+    )
+    assert (
+        base.crx_app_id("https://www.youtube.com/?feature=ytca")
+        == "agimnkijcaahngcdmfeangaknmldooml"
+    )
+    assert (
+        base.canonical_pwa_url("https://chat.example")
+        == "https://chat.example/"
+    )
+
+    prefs = {
+        "profile": {
+            "content_settings": {
+                "exceptions": {
+                    "app_banner": {
+                        "https://chat.example:443,*": {
+                            "setting": {
+                                "https://chat.example/?utm_source=pwa_install": 1.0
+                            }
+                        },
+                        "https://keep.example:443,*": {
+                            "setting": {
+                                "https://keep.example/manifest": 1.0
+                            }
+                        },
+                    }
+                }
+            }
+        }
+    }
+    rem = base.removed_app_ids(
+        {"https://chat.example/"},
+        ["https://keep.example/"],
+        prefs,
+    )
+    assert base.crx_app_id("https://chat.example/") in rem
+    assert base.crx_app_id("https://chat.example/?utm_source=pwa_install") in rem
+    assert base.crx_app_id("https://keep.example/manifest") not in rem
+
+
+def _write_macos_shim(
+    shim_dir: Path,
+    app_name: str,
+    *,
+    bundle_id: str,
+    app_id: str,
+    url: str,
+    shortcut_name: str,
+    user_data_dir: Path,
+) -> Path:
+    app_bundle = shim_dir / f"{app_name}.app"
+    contents = app_bundle / "Contents"
+    contents.mkdir(parents=True, exist_ok=True)
+    info = {
+        "CrBundleIdentifier": bundle_id,
+        "CrAppModeShortcutID": app_id,
+        "CrAppModeShortcutURL": url,
+        "CrAppModeShortcutName": shortcut_name,
+        "CrAppModeUserDataDir": str(
+            user_data_dir / "-" / "Web Applications" / f"_crx_{app_id}"
+        ),
+    }
+    with (contents / "Info.plist").open("wb") as f:
+        plistlib.dump(info, f, fmt=plistlib.FMT_BINARY)
+    return app_bundle
+
+
+def test_macos_shim_cleanup_removes_uninstalled_and_foreign_shims(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dotbrave._base import pwa as base
+
+    profile_root = tmp_path / "Brave-Browser"
+    profile_root.mkdir()
+    foreign_root = tmp_path / "brave-debug"
+    foreign_root.mkdir()
+    shim_dir = tmp_path / "Applications" / "Brave Browser Apps.localized"
+
+    manifest_id = base.crx_app_id("https://chat.example/?utm_source=pwa_install")
+    bg_id = base.crx_app_id("https://mail.example/webapp/id")
+    kept_id = base.crx_app_id("https://claude.example/")
+
+    removed_manifest_app = _write_macos_shim(
+        shim_dir,
+        "ChatApp",
+        bundle_id="com.brave.Browser",
+        app_id=manifest_id,
+        url="https://chat.example/",
+        shortcut_name="ChatApp",
+        user_data_dir=profile_root,
+    )
+    removed_bg_app = _write_macos_shim(
+        shim_dir,
+        "MailApp",
+        bundle_id="com.brave.Browser",
+        app_id=bg_id,
+        url="https://mail.example/mail/?usp=installed_webapp",
+        shortcut_name="MailApp",
+        user_data_dir=profile_root,
+    )
+    kept_real_app = _write_macos_shim(
+        shim_dir,
+        "Claude",
+        bundle_id="com.brave.Browser",
+        app_id=kept_id,
+        url="https://claude.example/",
+        shortcut_name="Claude",
+        user_data_dir=profile_root,
+    )
+    foreign_dup_app = _write_macos_shim(
+        shim_dir,
+        "Claude 1",
+        bundle_id="com.brave.Browser",
+        app_id=kept_id,
+        url="https://claude.example/",
+        shortcut_name="Claude",
+        user_data_dir=foreign_root,
+    )
+    chrome_app = _write_macos_shim(
+        shim_dir,
+        "OtherBrowser",
+        bundle_id="com.google.Chrome",
+        app_id=manifest_id,
+        url="https://chat.example/",
+        shortcut_name="ChatApp",
+        user_data_dir=foreign_root,
+    )
+
+    fake_lsreg = tmp_path / "lsregister"
+    fake_lsreg.write_text("")
+    unregistered: list[Path] = []
+
+    def fake_run(cmd, *_a, **_k):
+        if Path(cmd[0]) == fake_lsreg and cmd[1] == "-u":
+            unregistered.append(Path(cmd[2]))
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(base.subprocess, "run", fake_run)
+
+    prefs = {
+        "profile": {
+            "content_settings": {
+                "exceptions": {
+                    "app_banner": {
+                        "https://chat.example:443,*": {
+                            "setting": {
+                                "https://chat.example/?utm_source=pwa_install": 1.0
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    removed = base.cleanup_macos_shims(
+        shim_dir,
+        "com.brave.Browser",
+        profile_root,
+        {
+            "https://chat.example/": {"url": "https://chat.example/"},
+            "https://mail.example/": {
+                "url": "https://mail.example/",
+                "fallback_app_name": "MailApp",
+            },
+        },
+        {"https://claude.example/": None},
+        prefs,
+        clean_foreign=True,
+        lsregister=fake_lsreg,
+    )
+
+    assert set(removed) == {
+        removed_manifest_app,
+        removed_bg_app,
+        foreign_dup_app,
+    }
+    assert set(unregistered) == {
+        removed_manifest_app,
+        removed_bg_app,
+        foreign_dup_app,
+    }
+    assert not removed_manifest_app.exists()
+    assert not removed_bg_app.exists()
+    assert not foreign_dup_app.exists()
+    assert kept_real_app.exists()
+    assert chrome_app.exists()
+
+
+def test_foreign_shim_cleanup_runs_when_policy_already_matches_without_sudo(
+    fake_policy: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from dotbrave._base import orchestrator as orch
+    from dotbrave._base import pwa as base
+
+    real_root = tmp_path / "real-root"
+    (real_root / "Default").mkdir(parents=True)
+    (real_root / "Default" / "Preferences").write_text(
+        json.dumps({"some": "thing"}), encoding="utf-8"
+    )
+    throwaway_root = tmp_path / "throwaway-root"
+    throwaway_root.mkdir()
+
+    monkeypatch.setattr(brave_pkg, "brave_running", lambda: False)
+    cfg = tmp_path / "brave.toml"
+    cfg.write_text('[pwa]\nurls = ["https://squoosh.app/"]\n')
+    _apply(real_root, cfg)
+    capsys.readouterr()
+
+    shim_dir = tmp_path / "Apps.localized"
+    foreign_app = _write_macos_shim(
+        shim_dir,
+        "Squoosh 1",
+        bundle_id="com.brave.Browser",
+        app_id=base.crx_app_id("https://squoosh.app/"),
+        url="https://squoosh.app/",
+        shortcut_name="Squoosh",
+        user_data_dir=throwaway_root,
+    )
+
+    # Disallow sudo completely: policy already matches, so foreign shim
+    # cleanup must need zero privilege escalation.
+    monkeypatch.setattr(orch, "_already_privileged", lambda: False)
+
+    def forbid_sudo(cmd, *_a, **_k):
+        if cmd and cmd[0] == "sudo":
+            raise AssertionError(f"unexpected sudo call: {cmd}")
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(orch.subprocess, "run", forbid_sudo)
+    monkeypatch.setattr(
+        pwa,
+        "_launcher_cleanup",
+        lambda _pp, prefs: base.LauncherCleanup(
+            orphan_diff=lambda: [
+                f"  - {p.name} (foreign profile shim)"
+                for p in base.scan_macos_foreign_shims(
+                    shim_dir, "com.brave.Browser", real_root
+                )
+            ],
+            clean=lambda rem, tgt: base.cleanup_macos_shims(
+                shim_dir,
+                "com.brave.Browser",
+                real_root,
+                rem,
+                tgt,
+                prefs,
+                clean_foreign=True,
+                lsregister=tmp_path / "no-lsregister",
+            ),
+        ),
+    )
+
+    _apply(real_root, cfg)
+    out = capsys.readouterr().out
+    assert "- Squoosh 1.app (foreign profile shim)" in out
+    assert not foreign_app.exists()
+
+
+def test_linux_launcher_cleanup_removes_desktop_icons_and_heal_snapshot(
+    tmp_path: Path,
+) -> None:
+    from dotbrave._base import pwa as base
+
+    paths = base.LinuxHealPaths(
+        apps_dir=tmp_path / "share" / "applications",
+        state_dir=tmp_path / "state" / "dotbrave",
+        unit_dir=tmp_path / "config" / "systemd" / "user",
+    )
+    paths.apps_dir.mkdir(parents=True)
+    paths.snapshot_dir.mkdir(parents=True)
+
+    rem_id = base.crx_app_id("https://chat.example/?utm_source=pwa_install")
+    bg_id = base.crx_app_id("https://deep.example/custom-manifest")
+    kept_id = base.crx_app_id("https://claude.example/")
+
+    def write_launcher(app_id: str, prof: str, name: str) -> tuple[Path, Path, Path]:
+        fname = f"brave-{app_id}-{prof}.desktop"
+        body = (
+            "[Desktop Entry]\n"
+            f"Name={name}\n"
+            f"Exec=brave --profile-directory={prof} --app-id={app_id}\n"
+        )
+        app_f = paths.apps_dir / fname
+        snap_f = paths.snapshot_dir / fname
+        icon_f = (
+            paths.apps_dir.parent
+            / "icons"
+            / "hicolor"
+            / "48x48"
+            / "apps"
+            / f"brave-{app_id}-{prof}.png"
+        )
+        icon_f.parent.mkdir(parents=True, exist_ok=True)
+        app_f.write_text(body, encoding="utf-8")
+        snap_f.write_text(body, encoding="utf-8")
+        icon_f.write_bytes(b"png")
+        return app_f, snap_f, icon_f
+
+    rem_app, rem_snap, rem_icon = write_launcher(rem_id, "Default", "ChatApp")
+    bg_app, bg_snap, bg_icon = write_launcher(
+        bg_id, "Default", "DeepSeek - Into the Unknown"
+    )
+    kept_app, kept_snap, kept_icon = write_launcher(kept_id, "Default", "Claude")
+    other_prof_app, other_prof_snap, other_prof_icon = write_launcher(
+        rem_id, "Profile_1", "ChatApp"
+    )
+
+    prefs = {
+        "profile": {
+            "content_settings": {
+                "exceptions": {
+                    "app_banner": {
+                        "https://chat.example:443,*": {
+                            "setting": {
+                                "https://chat.example/?utm_source=pwa_install": 1.0
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    deleted = base.cleanup_linux_removed_launchers(
+        paths,
+        "Default",
+        {
+            "https://chat.example/": {"url": "https://chat.example/"},
+            "https://deep.example/": {
+                "url": "https://deep.example/",
+                "fallback_app_name": "DeepSeek",
+            },
+        },
+        {"https://claude.example/": "Claude"},
+        prefs,
+    )
+
+    assert set(deleted) == {rem_app, bg_app}
+    for gone in (rem_app, rem_snap, rem_icon, bg_app, bg_snap, bg_icon):
+        assert not gone.exists()
+    for alive in (
+        kept_app,
+        kept_snap,
+        kept_icon,
+        other_prof_app,
+        other_prof_snap,
+        other_prof_icon,
+    ):
+        assert alive.exists()

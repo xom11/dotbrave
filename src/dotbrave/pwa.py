@@ -94,6 +94,13 @@ def _check_install_supported(prefs_path: Path) -> None:
     _base.check_install_supported(_PWA_CONFIG, prefs_path)
 
 
+_BUNDLE_CHANNEL = {
+    "com.brave.Browser": "stable",
+    "com.brave.Browser.beta": "beta",
+    "com.brave.Browser.nightly": "nightly",
+}
+
+
 def _launcher_heal() -> _base.LauncherHeal | None:
     if not sys.platform.startswith("linux"):
         return None
@@ -103,6 +110,67 @@ def _launcher_heal() -> _base.LauncherHeal | None:
         install=lambda: _base.install_linux_launcher_heal(_base.linux_heal_paths()),
         remove=lambda: _base.remove_linux_launcher_heal(_base.linux_heal_paths()),
     )
+
+
+def _launcher_cleanup(
+    prefs_path: Path, prefs: dict
+) -> _base.LauncherCleanup | None:
+    if sys.platform.startswith("linux"):
+        from dotbrave.browser import CHANNELS, _default_profile_root
+
+        profile_root = prefs_path.parent.parent
+        is_default = any(
+            (d := _default_profile_root(ch)) is not None
+            and _base._path_within(profile_root, d)
+            and _base._path_within(d, profile_root)
+            for ch in CHANNELS
+        )
+        if not is_default:
+            return None
+        return _base.LauncherCleanup(
+            orphan_diff=lambda: [],
+            clean=lambda removed, target: _base.cleanup_linux_removed_launchers(
+                _base.linux_heal_paths(),
+                prefs_path.parent.name,
+                removed,
+                target,
+                prefs,
+            ),
+        )
+    if sys.platform == "darwin" and POLICY_FILE is not None:
+        from dotbrave.browser import _default_profile_root
+
+        bundle_id = _base.macos_bundle_id(POLICY_FILE)
+        shim_dir = _base.macos_shim_dir(bundle_id)
+        channel = _BUNDLE_CHANNEL.get(bundle_id)
+        if shim_dir is None or channel is None:
+            return None
+        default_root = _default_profile_root(channel)
+        profile_root = prefs_path.parent.parent
+        if (
+            default_root is None
+            or not _base._path_within(profile_root, default_root)
+            or not _base._path_within(default_root, profile_root)
+        ):
+            return None
+        return _base.LauncherCleanup(
+            orphan_diff=lambda: [
+                f"  - {p.name} (foreign profile shim)"
+                for p in _base.scan_macos_foreign_shims(
+                    shim_dir, bundle_id, profile_root
+                )
+            ],
+            clean=lambda removed, target: _base.cleanup_macos_shims(
+                shim_dir,
+                bundle_id,
+                profile_root,
+                removed,
+                target,
+                prefs,
+                clean_foreign=True,
+            ),
+        )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +187,7 @@ def plan_apply(prefs_path: Path, prefs: dict, raw_table: object) -> Plan:
         prefs,
         raw_table,
         _launcher_heal(),
+        _launcher_cleanup(prefs_path, prefs),
     )
 
 

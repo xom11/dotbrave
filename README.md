@@ -179,15 +179,19 @@ dotbrave apply brave.toml              # live apply if Brave is running
   set in the Brave UI instead.
 - **PWA URLs**: every entry installs with
   `default_launch_container = "window"` and `create_desktop_shortcut = true`.
-  An entry can be `{ url = "https://www.notion.so/", name = "Notion" }`:
+  An entry can be `{ url = "https://www.notion.so/", name = "Notion", platforms = ["linux", "macos"] }`:
   `name` becomes the policy's `fallback_app_name`, the name Brave gives an
   app it can only install as a placeholder (no manifest, or a login wall in
   front of it) — otherwise the launcher is named after the bare URL. Brave
   does not rename a placeholder it already installed; the name lands at the
-  app's next install.
-  `[pwa]` is the only namespace that needs elevated privileges: it writes a
-  managed-policy file (sudo on Linux/macOS) or the Windows Registry
-  (Administrator). No `[pwa]` diff → no policy write.
+  app's next install. Optional `platforms` (`"linux"`, `"macos"`, `"windows"`)
+  restricts an entry to those OSes in both the CLI and Nix modules — useful
+  when a web app is only needed where no native desktop client exists.
+  Removing a URL immediately removes its OS launcher (`.app` shim on macOS,
+  `.desktop` + icons + heal snapshot on Linux), and on macOS `apply` also
+  prunes duplicate `.app` shims left behind by throwaway `--user-data-dir`
+  launches. `[pwa]` only needs elevated privileges when the managed-policy
+  file (sudo on Linux/macOS) or Windows Registry (Administrator) changes.
 - **Empty header** (e.g. `[settings]` with no entries) wipes everything
   dotbrave previously managed in that namespace. **Missing header** = skip
   the namespace entirely.
@@ -245,7 +249,10 @@ land, so one `apply --undo` reverts the whole run.
 
 A running Brave is checked for an endpoint three ways before dotbrave
 concludes it has none: the port dotbrave itself launched and recorded, the
-browser's own `DevToolsActivePort`, and the `--remote-debugging-port` on
+browser's own `DevToolsActivePort` (both `--remote-debugging-port=0` HTTP
+endpoints and interactive `brave://inspect/#remote-debugging` Browser
+WebSocket endpoints; `--unattended` skips the latter so background runs never
+trigger an approval prompt), and the `--remote-debugging-port` on
 the running process's command line. That last one matters more than it
 sounds — Brave writes `DevToolsActivePort` only when the port is dynamic
 (`--remote-debugging-port=0`), so a browser you started on a fixed port

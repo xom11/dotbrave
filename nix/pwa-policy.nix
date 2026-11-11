@@ -14,7 +14,9 @@ let
   # only validation [pwa] gets. Everything below is a hard eval failure rather
   # than a filter -- a policy that quietly dropped a malformed URL would look
   # exactly like one that worked.
-  validUrls = tomlPath: doc:
+  validPlatforms = [ "linux" "macos" "windows" ];
+
+  validUrls = platform: tomlPath: doc:
     let
       at = "dotbrave: ${tomlPath}: [pwa]";
 
@@ -48,25 +50,49 @@ let
         else
           u;
 
-      # -> { url; name; } with name = null when the entry is a bare string.
+      checkPlatforms = ps:
+        if !(builtins.isList ps && ps != [ ]) then
+          throw "${at} platforms must be a non-empty array of ${pretty validPlatforms}, got ${pretty ps}"
+        else
+          let
+            badP = lib.filter (p: !(builtins.isString p && builtins.elem p validPlatforms)) ps;
+          in
+          if badP != [ ] then
+            throw "${at} invalid platform ${pretty (builtins.head badP)} (expected one of ${pretty validPlatforms})"
+          else
+            ps;
+
+      # -> { url; name; platforms; } with null defaults on bare strings.
       checkEntry = e:
         if builtins.isString e then
-          { url = checkHttps e; name = null; }
+          { url = checkHttps e; name = null; platforms = null; }
         else if builtins.isAttrs e then
-          let bad = builtins.attrNames (builtins.removeAttrs e [ "url" "name" ]); in
+          let bad = builtins.attrNames (builtins.removeAttrs e [ "url" "name" "platforms" ]); in
           if bad != [ ] then
             throw ("${at} url table has unsupported keys: "
               + lib.concatStringsSep ", " bad
-              + '' (expected { url = "...", name = "..." })'')
+              + '' (expected { url = "...", name = "...", platforms = [...] })'')
           else if !(builtins.isString (e.url or null)) then
             throw ''${at} url table needs a string `url = "https://..."`''
           else if (e ? name) && !(builtins.isString e.name && lib.trim e.name != "") then
             throw "${at} name must be a non-empty string, got ${pretty e.name}"
           else
-            { url = checkHttps e.url; name = e.name or null; }
+            {
+              url = checkHttps e.url;
+              name = e.name or null;
+              platforms = if e ? platforms then checkPlatforms e.platforms else null;
+            }
         else
-          throw ("${at} url entries must be strings or { url, name } tables, "
+          throw ("${at} url entries must be strings or { url, name, platforms } tables, "
             + "got ${builtins.typeOf e}: ${pretty e}");
+
+      checked = map checkEntry urls;
+
+      filtered =
+        if platform == null then
+          checked
+        else
+          lib.filter (e: e.platforms == null || builtins.elem platform e.platforms) checked;
 
       # Duplicate URLs are dropped rather than rejected, first one wins,
       # matching Python.
@@ -76,22 +102,29 @@ let
           [ ]
           entries;
     in
-    lib.throwIf (!builtins.isAttrs raw)
-      "${at} must be a table"
-      (lib.throwIf (extra != [ ])
-        ("${at} has unsupported keys: ${lib.concatStringsSep ", " extra}. "
-          + "Only `urls = [...]` is supported")
-        (lib.throwIf (!builtins.isList urls)
-          "${at} urls must be an array of strings"
-          (dedupe (map checkEntry urls))));
-in
-{
-  entriesFrom = tomlPath:
+    lib.throwIf (platform != null && !(builtins.elem platform validPlatforms))
+      "dotbrave: unknown target platform ${pretty platform} (expected one of ${pretty validPlatforms})"
+      (lib.throwIf (!builtins.isAttrs raw)
+        "${at} must be a table"
+        (lib.throwIf (extra != [ ])
+          ("${at} has unsupported keys: ${lib.concatStringsSep ", " extra}. "
+            + "Only `urls = [...]` is supported")
+          (lib.throwIf (!builtins.isList urls)
+            "${at} urls must be an array of strings"
+            # Force every entry before platform filtering so broken entries on
+            # another OS still fail evaluation immediately.
+            (builtins.deepSeq checked (dedupe filtered)))));
+
+  renderEntries = platform: tomlPath:
     map
       (e: {
         inherit (e) url;
         default_launch_container = "window";
         create_desktop_shortcut = true;
       } // lib.optionalAttrs (e.name != null) { fallback_app_name = e.name; })
-      (validUrls tomlPath (builtins.fromTOML (builtins.readFile tomlPath)));
+      (validUrls platform tomlPath (builtins.fromTOML (builtins.readFile tomlPath)));
+in
+{
+  entriesFrom = renderEntries null;
+  entriesFromFor = renderEntries;
 }

@@ -861,6 +861,9 @@ def apply_live(
             "Brave", sorted(set(removals) | set(unresolved_shortcuts))
         )
     client = CdpClient(port)
+    bind = getattr(client, "bind_profile_root", None)
+    if bind is not None:
+        bind(profile_dir.parent)
     target: dict = {}
     created = False
     backup_taken = False
@@ -1008,4 +1011,7 @@ def apply_live(
     finally:
         if created:
             client.close_page(target)
+        close_fn = getattr(client, "close", None)
+        if close_fn is not None:
+            close_fn()
     print("ok -- live applied through Brave DevTools endpoint")

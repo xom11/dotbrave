@@ -9,11 +9,13 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _no_launcher_heal(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep every [pwa] apply away from the real ~/.config/systemd/user.
-    Tests of the heal itself re-patch ``pwa._launcher_heal``."""
+    """Keep every [pwa] apply away from real OS launcher directories.
+    Tests of the heal or cleanup re-patch ``pwa._launcher_heal`` /
+    ``pwa._launcher_cleanup``."""
     from dotbrave import pwa
 
     monkeypatch.setattr(pwa, "_launcher_heal", lambda: None)
+    monkeypatch.setattr(pwa, "_launcher_cleanup", lambda *_a, **_k: None)
 
 
 @pytest.fixture

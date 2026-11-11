@@ -28,6 +28,7 @@ else:
     import tomli as tomllib  # type: ignore[no-redef]
 
 from dotbrave._base.cdp import (
+    devtools_port_is_ws_only,
     find_devtools_port,
     live_port_from_cmdline,
     pick_unused_port,
@@ -361,7 +362,7 @@ def cmd_apply(
     unattended = getattr(args, "unattended", False)
 
     def _needs_root(p) -> bool:
-        return p.external_apply_fn is not None and not p.empty
+        return p.requires_escalation
 
     if (
         unattended
@@ -378,9 +379,7 @@ def cmd_apply(
         if not non_empty:
             return
 
-    needs_escalation = any(
-        p.external_apply_fn is not None and not p.empty for p in plans
-    )
+    needs_escalation = any(p.requires_escalation for p in plans)
     if needs_escalation and not _already_privileged():
         if sys.platform == "win32":
             import ctypes
@@ -465,6 +464,14 @@ def cmd_apply(
             # the close there is no process left to ask.
             saved_cmdline = find_cmdline_fn()
             live_port = find_devtools_port(args.profile_root, args.profile)
+            if (
+                live_port is not None
+                and unattended
+                and devtools_port_is_ws_only(args.profile_root, live_port)
+            ):
+                # Connecting to a brave://inspect/#remote-debugging WebSocket
+                # prompts for interactive approval in Brave if not yet granted.
+                live_port = None
             if live_port is None:
                 # Neither file source covers a browser the user started
                 # with a fixed --remote-debugging-port; its command line
@@ -586,7 +593,10 @@ def cmd_apply(
                 relaunch_live_port = live_port
                 was_closed = True
             else:
-                remember_devtools_port(args.profile_root, args.profile, live_port)
+                if not devtools_port_is_ws_only(args.profile_root, live_port):
+                    remember_devtools_port(
+                        args.profile_root, args.profile, live_port
+                    )
                 return
         elif graceful_close_fn is None:
             sys.exit(

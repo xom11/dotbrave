@@ -22,6 +22,7 @@ let
   evalFails = expr: !(builtins.tryEval (builtins.deepSeq expr expr)).success;
 
   entriesOf = name: text: policy.entriesFrom (builtins.toFile name text);
+  entriesFor = plat: name: text: policy.entriesFromFor plat (builtins.toFile name text);
 
   entry = url: {
     inherit url;
@@ -106,6 +107,62 @@ let
     blank-name-is-refused = evalFails (entriesOf "entry-blank.toml" ''
       [pwa]
       urls = [ { url = "https://a.example/", name = " " } ]
+    '');
+
+    platforms-filters-per-os =
+      let
+        cfg = ''
+          [pwa]
+          urls = [
+            "https://all.example/",
+            { url = "https://linux.example/", name = "L", platforms = [ "linux" ] },
+            { url = "https://desk.example/", platforms = [ "macos", "windows" ] },
+          ]
+        '';
+      in
+      (entriesFor "linux" "plat-l.toml" cfg == [
+        (entry "https://all.example/")
+        (entry "https://linux.example/" // { fallback_app_name = "L"; })
+      ])
+      && (entriesFor "macos" "plat-m.toml" cfg == [
+        (entry "https://all.example/")
+        (entry "https://desk.example/")
+      ])
+      && (entriesFor "windows" "plat-w.toml" cfg == [
+        (entry "https://all.example/")
+        (entry "https://desk.example/")
+      ]);
+
+    platforms-per-os-duplicate-url-picks-matching-entry =
+      let
+        cfg = ''
+          [pwa]
+          urls = [
+            { url = "https://a.example/", name = "Linux A", platforms = [ "linux" ] },
+            { url = "https://a.example/", name = "Mac A", platforms = [ "macos" ] },
+          ]
+        '';
+      in
+      entriesFor "macos" "plat-dup.toml" cfg == [
+        (entry "https://a.example/" // { fallback_app_name = "Mac A"; })
+      ];
+
+    platforms-invalid-value-is-refused = evalFails (entriesFor "macos" "plat-bad.toml" ''
+      [pwa]
+      urls = [ { url = "https://a.example/", platforms = [ "freebsd" ] } ]
+    '');
+
+    platforms-empty-list-is-refused = evalFails (entriesFor "macos" "plat-empty.toml" ''
+      [pwa]
+      urls = [ { url = "https://a.example/", platforms = [] } ]
+    '');
+
+    platforms-skipped-entry-is-still-validated = evalFails (entriesFor "macos" "plat-skip-bad.toml" ''
+      [pwa]
+      urls = [
+        "https://ok.example/",
+        { url = "http://broken.example/", platforms = [ "linux" ] },
+      ]
     '');
   };
 

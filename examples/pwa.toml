@@ -13,11 +13,12 @@
 #     picks the policy up by itself: within a minute on Linux, about ten
 #     minutes on Windows. macOS reads it at the next launch.
 #
-# An entry can also be { url = "...", name = "..." }. `name` is used when
-# Brave can only install the app as a placeholder -- no manifest, or a
-# login wall in front of it -- which is otherwise named after the URL.
-# Force-installed apps cannot be removed via the Brave UI; delete the URL
-# here and re-apply to uninstall.
+# An entry can also be { url = "...", name = "...", platforms = ["linux"] }.
+# `name` is used when Brave can only install the app as a placeholder -- no
+# manifest, or a login wall in front of it -- which is otherwise named after
+# the URL. `platforms` ("linux", "macos", "windows") restricts an entry to a
+# subset of OSes. Force-installed apps cannot be removed via the Brave UI;
+# delete the URL here and re-apply to uninstall.
 
 [pwa]
 urls = [

@@ -39,10 +39,19 @@ class Plan:
     state_payload: dict[str, Any] | None = None
     external_apply_fn: Callable[[], None] | None = None
     warnings: list[str] = field(default_factory=list)
+    needs_escalation: bool | None = None
 
     @property
     def empty(self) -> bool:
         return not self.diff_lines
+
+    @property
+    def requires_escalation(self) -> bool:
+        if self.empty:
+            return False
+        if self.needs_escalation is not None:
+            return self.needs_escalation
+        return self.external_apply_fn is not None
 
 
 def find_preferences(profile_root: Path, profile: str) -> Path:
