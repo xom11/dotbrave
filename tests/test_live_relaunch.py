@@ -200,21 +200,23 @@ def test_failed_relaunch_after_apply_reopens_browser_and_succeeds(
             browser_name="Brave", keys=["brave.tabs.vertical_tabs_collapsed"]
         )
 
+    up = [True]  # đóng xong là tắt; relaunch chết; lần mở lại thì sống
     orchestrator.cmd_apply(
         _args(prefs_root, _config(tmp_path)),
         display_name="Brave",
-        running_fn=lambda: True,
+        running_fn=lambda: up[0],
         find_cmdline_fn=lambda: ORIGINAL_CMDLINE,
-        restart_fn=lambda c: restarted.append(c) or c,
+        restart_fn=lambda c: restarted.append(c) or up.__setitem__(0, True) or c,
         build_plans_fn=lambda p, prefs, doc, **kw: [_settings_plan()],
         live_apply_fn=_live_apply,
-        graceful_close_fn=lambda: None,
+        graceful_close_fn=lambda: up.__setitem__(0, False),
         launch_live_fn=lambda *a, **k: ["brave-browser"],
     )
 
     out = capsys.readouterr()
     assert "ok -- applied and verified" in out.out
     assert restarted == [ORIGINAL_CMDLINE], "phải mở lại Brave bằng cờ gốc"
+    assert "was reopened with its original command line." in out.err
 
 
 # --------------------------------------------------------------------------
@@ -323,16 +325,17 @@ def test_failed_relaunch_before_apply_reopens_browser_then_fails(
     monkeypatch.setattr(orchestrator, "wait_for_devtools_endpoint", _boom)
     restarted: list[list[str]] = []
 
+    up = [True]
     with pytest.raises(SystemExit):
         orchestrator.cmd_apply(
             _args(prefs_root, _config(tmp_path)),
             display_name="Brave",
-            running_fn=lambda: True,
+            running_fn=lambda: up[0],
             find_cmdline_fn=lambda: ORIGINAL_CMDLINE,
-            restart_fn=lambda c: restarted.append(c) or c,
+            restart_fn=lambda c: restarted.append(c) or up.__setitem__(0, True) or c,
             build_plans_fn=lambda p, prefs, doc, **kw: [_settings_plan()],
             live_apply_fn=lambda *a, **k: None,
-            graceful_close_fn=lambda: None,
+            graceful_close_fn=lambda: up.__setitem__(0, False),
             launch_live_fn=lambda *a, **k: ["brave-browser"],
         )
 
@@ -348,6 +351,11 @@ def test_failed_relaunch_before_apply_reopens_browser_then_fails(
 # ("Missing X server or $DISPLAY", 0,16 giây với Chromium), lần mở lại bằng
 # cmdline gốc cũng chết y vậy -- vậy mà vẫn in "was reopened with its
 # original command line." Sau đó không còn tiến trình Brave nào.
+#
+# 0.7.1 đọc display từ /proc/<pid>/environ của chính Brave và vẫn hỏng y
+# vậy: setproctitle của Chromium ghi đè vùng đó, Brave 1.98 đọc ra 14 KB
+# toàn NUL (cả tiến trình con cũng thế). 0.7.1 coi `{}` là "headless" nên
+# không chặn. Môi trường thật nằm ở tiến trình cha (`.brave-wrapped`).
 
 on_linux = pytest.mark.skipif(
     not sys.platform.startswith("linux"), reason="reads /proc"
@@ -364,7 +372,7 @@ def _linux_proc(monkeypatch, session_env):
     proc = _make_browser_process("stable")
     monkeypatch.setattr(proc, "pids", lambda: ["4242"])
     monkeypatch.setattr(process_mod, "_read_cmdline", lambda pid: ORIGINAL_CMDLINE)
-    monkeypatch.setattr(process_mod, "_read_session_env", lambda pid: session_env)
+    monkeypatch.setattr(process_mod, "_find_session_env", lambda pid: session_env)
     return proc
 
 
@@ -405,7 +413,8 @@ def test_relaunch_keeps_this_shells_env_when_it_has_a_display(monkeypatch):
 
 
 def test_no_display_anywhere_blocks_the_close(monkeypatch):
-    """Không đọc được môi trường của Brave, shell không có display: chặn."""
+    """Không tìm được display ở Brave lẫn tiến trình cha, shell cũng không
+    có: chặn."""
     monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
     monkeypatch.delenv("DISPLAY", raising=False)
     proc = _linux_proc(monkeypatch, None)
@@ -416,15 +425,59 @@ def test_no_display_anywhere_blocks_the_close(monkeypatch):
     assert "$WAYLAND_DISPLAY" in reason and "offline" in reason
 
 
-def test_headless_browser_without_display_is_not_blocked(monkeypatch):
-    """Đọc được môi trường mà chính Brave cũng không có display (headless):
-    mở lại giống hệt thì không tệ hơn, nên không chặn."""
+def test_only_a_headless_command_line_exempts_a_browser_without_display(
+    monkeypatch,
+):
+    """Môi trường rỗng không chứng minh gì (setproctitle); chỉ cmdline
+    headless mới được miễn."""
     monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
     monkeypatch.delenv("DISPLAY", raising=False)
-    proc = _linux_proc(monkeypatch, {})
+    proc = _linux_proc(monkeypatch, None)
     proc.find_main_cmdline()
+    assert proc.relaunch_blocker() is not None
 
+    monkeypatch.setattr(
+        process_mod, "_read_cmdline",
+        lambda pid: [*ORIGINAL_CMDLINE, "--ozone-platform=headless"],
+    )
+    proc.find_main_cmdline()
     assert proc.relaunch_blocker() is None
+
+
+@on_linux
+def test_session_env_comes_from_the_launcher_when_the_browser_is_blank(
+    monkeypatch,
+):
+    """Brave đọc ra rỗng (setproctitle): lấy từ tiến trình cha gần nhất có
+    display."""
+    me, parent = str(os.getpid()), str(os.getppid())
+    envs = {me: {}, parent: {"WAYLAND_DISPLAY": "wayland-9"}}
+    monkeypatch.setattr(
+        process_mod, "_read_session_env", lambda pid: envs.get(pid, {})
+    )
+
+    assert process_mod._find_session_env(me) == {"WAYLAND_DISPLAY": "wayland-9"}
+    envs[parent] = {"XDG_SESSION_TYPE": "wayland"}
+    assert process_mod._find_session_env(me) is None
+
+
+@on_linux
+def test_singleton_lock_held_only_by_a_live_local_pid(tmp_path):
+    import socket
+
+    lock = tmp_path / "SingletonLock"
+    host = socket.gethostname()
+    assert process_mod.singleton_lock_held(tmp_path) is False
+    lock.symlink_to(f"{host}-{os.getpid()}")
+    assert process_mod.singleton_lock_held(tmp_path) is True
+    lock.unlink()
+    child = subprocess.Popen(["true"])
+    child.wait()
+    lock.symlink_to(f"{host}-{child.pid}")
+    assert process_mod.singleton_lock_held(tmp_path) is False, "stale lock"
+    lock.unlink()
+    lock.symlink_to(f"another-host-{os.getpid()}")
+    assert process_mod.singleton_lock_held(tmp_path) is False
 
 
 @on_linux
@@ -522,17 +575,18 @@ def test_reopen_that_dies_is_reported_not_claimed(
 
     monkeypatch.setattr(orchestrator, "wait_for_devtools_endpoint", _boom)
     restarted: list[list[str]] = []
+    up = [True]
 
     with pytest.raises(SystemExit) as exc:
         orchestrator.cmd_apply(
             _args(prefs_root, _config(tmp_path)),
             display_name="Brave",
-            running_fn=lambda: not restarted,
+            running_fn=lambda: up[0],
             find_cmdline_fn=lambda: ORIGINAL_CMDLINE,
             restart_fn=lambda c: restarted.append(c) or c,
             build_plans_fn=lambda p, prefs, doc, **kw: [_settings_plan()],
             live_apply_fn=lambda *a, **k: None,
-            graceful_close_fn=lambda: None,
+            graceful_close_fn=lambda: up.__setitem__(0, False),
             launch_live_fn=lambda *a, **k: ["brave-browser"],
         )
 
@@ -562,3 +616,123 @@ def test_restart_that_dies_after_apply_warns_and_exits_zero(
     out = capsys.readouterr()
     assert "ok -- applied and verified" in out.out
     assert "is not running" in out.err and "start it manually" in out.err
+
+
+def _bootstrap_that_times_out(monkeypatch):
+    monkeypatch.setattr(orchestrator, "find_devtools_port", lambda r, p: None)
+    monkeypatch.setattr(orchestrator, "pick_unused_port", lambda: 9222)
+
+    def _boom(port, display_name, **kw):
+        raise SystemExit("error: Brave did not expose a DevTools endpoint")
+
+    monkeypatch.setattr(orchestrator, "wait_for_devtools_endpoint", _boom)
+    monkeypatch.setattr(orchestrator, "_PREVIOUS_EXIT_TIMEOUT_S", 5.0)
+    monkeypatch.setattr(orchestrator.time, "sleep", lambda s: None)
+
+
+def test_reopen_waits_for_the_failed_relaunch_to_finish_exiting(
+    prefs_root, tmp_path, monkeypatch
+):
+    """Mở lại khi bản relaunch còn đang thoát thì lệnh mới trao cmdline cho
+    nó qua singleton rồi chết theo -- phải đợi nó thoát hẳn đã."""
+    _bootstrap_that_times_out(monkeypatch)
+    events: list[str] = []
+    phase = {"state": "up", "exiting_polls": 3}
+
+    def _running():
+        if phase["state"] == "exiting":
+            phase["exiting_polls"] -= 1
+            if phase["exiting_polls"] <= 0:
+                phase["state"] = "gone"
+            events.append("poll")
+            return True
+        return phase["state"] in ("up", "reopened")
+
+    def _launch(*a, **k):
+        phase["state"] = "exiting"
+        return ["brave-browser"]
+
+    def _restart(c):
+        events.append("restart")
+        phase["state"] = "reopened"
+        return c
+
+    with pytest.raises(SystemExit) as exc:
+        orchestrator.cmd_apply(
+            _args(prefs_root, _config(tmp_path)),
+            display_name="Brave",
+            running_fn=_running,
+            find_cmdline_fn=lambda: ORIGINAL_CMDLINE,
+            restart_fn=_restart,
+            build_plans_fn=lambda p, prefs, doc, **kw: [_settings_plan()],
+            live_apply_fn=lambda *a, **k: None,
+            graceful_close_fn=lambda: phase.__setitem__("state", "gone"),
+            launch_live_fn=_launch,
+        )
+
+    assert events == ["poll", "poll", "poll", "restart"]
+    assert "Brave was reopened with its original command line." in str(exc.value)
+
+
+def test_relaunch_that_survived_without_endpoint_is_not_reopened_twice(
+    prefs_root, tmp_path, monkeypatch
+):
+    """Bản relaunch vẫn sống (chỉ là không có endpoint): đó là trình duyệt
+    của người dùng rồi, đừng mở thêm cái nữa."""
+    _bootstrap_that_times_out(monkeypatch)
+    monkeypatch.setattr(orchestrator, "_PREVIOUS_EXIT_TIMEOUT_S", 0.0)
+    restarted: list[list[str]] = []
+
+    with pytest.raises(SystemExit) as exc:
+        orchestrator.cmd_apply(
+            _args(prefs_root, _config(tmp_path)),
+            display_name="Brave",
+            running_fn=lambda: True,
+            find_cmdline_fn=lambda: ORIGINAL_CMDLINE,
+            restart_fn=lambda c: restarted.append(c) or c,
+            build_plans_fn=lambda p, prefs, doc, **kw: [_settings_plan()],
+            live_apply_fn=lambda *a, **k: None,
+            graceful_close_fn=lambda: None,
+            launch_live_fn=lambda *a, **k: ["brave-browser"],
+        )
+
+    assert restarted == []
+    assert "running again" in str(exc.value)
+
+
+@on_linux
+def test_reopen_waits_for_a_live_singleton_lock_to_go(
+    prefs_root, tmp_path, monkeypatch
+):
+    """Không còn pid nào trong phạm vi nhưng SingletonLock vẫn do một tiến
+    trình sống giữ: vẫn phải đợi."""
+    import socket
+
+    _bootstrap_that_times_out(monkeypatch)
+    lock = prefs_root / "SingletonLock"
+    lock.symlink_to(f"{socket.gethostname()}-{os.getpid()}")
+    polls = {"n": 0}
+    restarted: list[bool] = []
+
+    def _running():
+        if not restarted:
+            polls["n"] += 1
+            if polls["n"] == 3 and lock.is_symlink():
+                lock.unlink()
+            return polls["n"] == 1  # chỉ lần kiểm tra đầu: Brave đang chạy
+        return True
+
+    with pytest.raises(SystemExit):
+        orchestrator.cmd_apply(
+            _args(prefs_root, _config(tmp_path)),
+            display_name="Brave",
+            running_fn=_running,
+            find_cmdline_fn=lambda: ORIGINAL_CMDLINE,
+            restart_fn=lambda c: restarted.append(lock.is_symlink()) or c,
+            build_plans_fn=lambda p, prefs, doc, **kw: [_settings_plan()],
+            live_apply_fn=lambda *a, **k: None,
+            graceful_close_fn=lambda: None,
+            launch_live_fn=lambda *a, **k: ["brave-browser"],
+        )
+
+    assert restarted == [False], "restart must wait for the lock to go"

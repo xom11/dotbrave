@@ -24,12 +24,14 @@ def _desktop_session(monkeypatch: pytest.MonkeyPatch) -> None:
 
     CI runners (and an agent's shell) have no display, so the Linux
     relaunch guard would refuse every close a test drives.  Tests of the
-    guard delete these again.  The post-restart grace is skipped too: the
-    process callbacks here are fakes that answer instantly."""
+    guard delete these again.  The post-restart grace and the wait for a
+    previous instance to exit are skipped too: the process callbacks here
+    are fakes that answer instantly."""
     from dotbrave._base import orchestrator
 
     monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-test")
     monkeypatch.setattr(orchestrator, "_REOPEN_GRACE_S", 0.0)
+    monkeypatch.setattr(orchestrator, "_PREVIOUS_EXIT_TIMEOUT_S", 0.0)
 
 
 @pytest.fixture

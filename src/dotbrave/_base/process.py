@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -176,10 +177,12 @@ _SESSION_ENV_KEYS = (
 
 
 def _read_session_env(pid: str) -> dict[str, str] | None:
-    """The desktop-session variables a running Linux process started with.
+    """The desktop-session variables in ``/proc/<pid>/environ``.
 
-    ``None`` when ``/proc/<pid>/environ`` cannot be read -- a different
-    answer from ``{}``, which means the process genuinely had none.
+    ``None`` when it cannot be read.  ``{}`` does NOT mean the process
+    had none: Chromium's setproctitle overwrites its own environ area, so
+    every Brave process reads back as all NULs -- see
+    :func:`_find_session_env`.
     """
     try:
         raw = Path(f"/proc/{pid}/environ").read_bytes()
@@ -192,6 +195,77 @@ def _read_session_env(pid: str) -> dict[str, str] | None:
         if sep and name in _SESSION_ENV_KEYS:
             env[name] = value.decode("utf-8", "replace")
     return env
+
+
+def _parent_pid(pid: str) -> str | None:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    # Fields after the parenthesised comm: state, ppid, ...
+    fields = stat.rpartition(")")[2].split()
+    return fields[1] if len(fields) > 1 else None
+
+
+def _find_session_env(pid: str) -> dict[str, str] | None:
+    """Session variables of the nearest process, from ``pid`` up, that has
+    a display; ``None`` when no process of ours on the way up has one.
+
+    The browser itself is only the first place to look.  Measured on
+    Brave 1.98 (Linux): ``/proc/<main pid>/environ`` is 14 KB of NULs and
+    so is every child's, because Chromium's setproctitle reuses that
+    memory for the process title.  Its launcher still holds the
+    environment Brave was started with -- nixpkgs' ``.brave-wrapped``
+    stays alive as the parent, as does a terminal or an app launcher.
+    """
+    uid = os.getuid()
+    for _ in range(32):
+        if pid in ("", "0", "1"):
+            return None
+        try:
+            if os.stat(f"/proc/{pid}").st_uid != uid:
+                return None
+        except OSError:
+            return None
+        env = _read_session_env(pid)
+        if env and (env.get("WAYLAND_DISPLAY") or env.get("DISPLAY")):
+            return env
+        pid = _parent_pid(pid) or ""
+    return None
+
+
+def _is_headless(args: list[str]) -> bool:
+    return any(
+        a == "--headless"
+        or a.startswith("--headless=")
+        or a == "--ozone-platform=headless"
+        for a in args
+    )
+
+
+def singleton_lock_held(profile_root) -> bool:
+    """Whether a live process on this host holds the profile's SingletonLock.
+
+    Chromium's lock is a symlink to ``<hostname>-<pid>``.  A dead or
+    zombie pid is a stale lock, which the next launch takes over by
+    itself; a live one makes that launch hand its command line to the
+    holder and exit.  No symlink (Windows, or nothing running) is
+    "not held".
+    """
+    try:
+        target = os.readlink(Path(profile_root) / "SingletonLock")
+    except (OSError, NotImplementedError):
+        return False
+    host, sep, pid = target.rpartition("-")
+    if not sep or not pid.isdigit() or host != socket.gethostname():
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return not _is_zombie(pid)
 
 
 def _is_zombie(pid: str) -> bool:
@@ -319,11 +393,11 @@ class BrowserProcess:
         # (pgrep/pkill -x) behavior.
         self.user_data_dir: str | None = None
         self.default_user_data_dir: str | None = None
-        # Linux: the desktop-session environment of the main process
-        # `find_main_cmdline` last found, read while it is still alive --
-        # after the close there is no process left to ask.  None when it
-        # could not be read (or nothing was found).
+        # Linux: the desktop session of the browser `find_main_cmdline`
+        # last found, read while it is still alive -- after the close
+        # there is no process left to ask.  None when none was found.
         self._session_env: dict[str, str] | None = None
+        self._needs_display = True
 
     def scope_to_profile(
         self, user_data_dir, default_user_data_dir=None
@@ -479,6 +553,7 @@ class BrowserProcess:
         environment for :meth:`relaunch_blocker` and the relaunch itself.
         """
         self._session_env = None
+        self._needs_display = True
         for pid in self.pids():
             args = _read_cmdline(pid)
             if not args:
@@ -486,18 +561,20 @@ class BrowserProcess:
             if any("--type=" in a for a in args):
                 continue
             if not _is_macos() and not _is_windows():
-                self._session_env = _read_session_env(pid)
+                self._session_env = _find_session_env(pid)
+                self._needs_display = not _is_headless(args)
             return args
         return None
 
     def _launch_env(self) -> dict[str, str] | None:
         """Environment for a Linux relaunch; ``None`` inherits ours as-is.
 
-        Fills in only what this shell lacks, from the browser that is
-        being closed: run from SSH or a sandboxed shell, dotbrave has no
-        ``$WAYLAND_DISPLAY``/``$DISPLAY``, while the browser it closes
-        demonstrably had a working one.  Values this shell does have are
-        kept -- they are what the user asked for by running it here.
+        Fills in only what this shell lacks, from the session the browser
+        being closed was started in: run from SSH or a sandboxed shell,
+        dotbrave has no ``$WAYLAND_DISPLAY``/``$DISPLAY``, while that
+        browser demonstrably had a working one.  Values this shell does
+        have are kept -- they are what the user asked for by running it
+        here.
         """
         if _is_macos() or _is_windows() or not self._session_env:
             return None
@@ -513,21 +590,21 @@ class BrowserProcess:
 
         Call after :meth:`find_main_cmdline`.  Linux only: a relaunch with
         neither ``$WAYLAND_DISPLAY`` nor ``$DISPLAY`` dies at startup, so
-        the browser dotbrave closed never comes back.  A browser whose own
-        environment was read and had no display either (headless) is not
-        blocked -- relaunching it the same way is no worse.
+        the browser dotbrave closed never comes back.  Only a browser
+        whose own command line says headless is exempt -- an empty
+        environment proves nothing (see :func:`_find_session_env`).
         """
         if _is_macos() or _is_windows():
             return None
         env = self._launch_env() or os.environ
         if env.get("WAYLAND_DISPLAY") or env.get("DISPLAY"):
             return None
-        if self._session_env is not None:
+        if not self._needs_display:
             return None
         return (
             f"this shell has neither $WAYLAND_DISPLAY nor $DISPLAY (SSH, a "
-            f"service, a sandboxed shell?) and the running "
-            f"{self.display_name}'s environment could not be read, so a "
+            f"service, a sandboxed shell?) and neither does the running "
+            f"{self.display_name} or any process that launched it, so a "
             f"relaunch from here would die on startup. Run this from a "
             f"terminal inside the desktop session, or close "
             f"{self.display_name} yourself and rerun to apply offline."

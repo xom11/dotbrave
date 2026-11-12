@@ -275,11 +275,40 @@ def _survived_restart(running_fn: Callable[[], bool]) -> bool | None:
         return None
 
 
+#: How long the reopen waits for the relaunch it replaces to finish exiting.
+_PREVIOUS_EXIT_TIMEOUT_S = 10.0
+
+
+def _previous_instance_gone(
+    running_fn: Callable[[], bool], profile_root: Path
+) -> bool:
+    """Wait until no browser runs on the profile and its SingletonLock is
+    free or stale; False when one is still up after the timeout.
+
+    A launch made while the failed relaunch is still on its way out hands
+    its command line to that instance through the singleton and exits
+    with it -- and a relaunch that is still up is the user's browser
+    (just without an endpoint), which a reopen must not duplicate.
+    """
+    deadline = time.monotonic() + _PREVIOUS_EXIT_TIMEOUT_S
+    while True:
+        try:
+            running = running_fn()
+        except _process.ProcessStateUnknown:
+            running = False
+        if not running and not _process.singleton_lock_held(profile_root):
+            return True
+        if time.monotonic() >= deadline:
+            return not running
+        time.sleep(0.1)
+
+
 def _reopen_after_failed_relaunch(
     saved_cmdline: list[str] | None,
     restart_fn: Callable[[list[str]], list[str]],
     display_name: str,
     running_fn: Callable[[], bool],
+    profile_root: Path,
 ) -> str:
     """Put the browser back after a relaunch that never came up.
 
@@ -297,6 +326,11 @@ def _reopen_after_failed_relaunch(
         return (
             f"{display_name} is closed and its original command line was "
             f"not captured -- restart it manually."
+        )
+    if not _previous_instance_gone(running_fn, profile_root):
+        return (
+            f"{display_name} is running again (the relaunch came up without "
+            f"a live endpoint); it was not reopened a second time."
         )
     try:
         restart_fn(saved_cmdline)
@@ -560,7 +594,11 @@ def cmd_apply(
                     # failure -- but the browser we closed is ours to
                     # restore before reporting it.
                     note = _reopen_after_failed_relaunch(
-                        saved_cmdline, restart_fn, display_name, running_fn
+                        saved_cmdline,
+                        restart_fn,
+                        display_name,
+                        running_fn,
+                        args.profile_root,
                     )
                     sys.exit(f"{e}\n{note}")
                 # That close flushed the browser's own PrefService over this
@@ -755,7 +793,11 @@ def cmd_apply(
             # reopen the browser again for a run with nothing left to do.
             # Report the relaunch on stderr, put the browser back, exit 0.
             note = _reopen_after_failed_relaunch(
-                saved_cmdline, restart_fn, display_name, running_fn
+                saved_cmdline,
+                restart_fn,
+                display_name,
+                running_fn,
+                args.profile_root,
             )
             _warn(
                 f"warning: config applied, but the live relaunch failed:\n"

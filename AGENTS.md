@@ -290,16 +290,36 @@ Preserve these contracts unless a change explicitly redesigns them:
    sandboxed shell) has neither `$WAYLAND_DISPLAY` nor `$DISPLAY`, and a
    Chromium started there exits in 0.16s ("Missing X server or
    $DISPLAY") -- the relaunch and the reopen both died while dotbrave
-   printed `was reopened`. So `find_main_cmdline` also reads the main
-   process's session variables from `/proc/<pid>/environ`, the relaunch
-   fills in whichever this shell lacks (never overriding one it has), and
-   `relaunch_blocker` (`close_blocker_fn`) refuses every close, before
-   anything is written, when neither source has a display. And `pgrep -x`
-   lists zombies, whose empty cmdline the profile scope reads as a
-   flagless default-root launch -- a relaunch that died still counted as
-   running. `_pids_unix` drops zombies, and every restart is confirmed
-   with `running_fn` after `_REOPEN_GRACE_S` before anything says it is
-   back.
+   printed `was reopened`. So `find_main_cmdline` also captures the
+   session variables, the relaunch fills in whichever this shell lacks
+   (never overriding one it has), and `relaunch_blocker`
+   (`close_blocker_fn`) refuses every close, before anything is written,
+   when no source has a display. **Not from the browser's own
+   `/proc/<pid>/environ`:** Chromium's setproctitle overwrites that
+   memory, and on Brave 1.98 it reads back as 14 KB of NULs in the main
+   process and every child. 0.7.1 read it, took `{}` for "headless", and
+   failed exactly as before. `_find_session_env` walks up to the nearest
+   ancestor that has a display (nixpkgs' `.brave-wrapped` stays alive as
+   the parent; so does a terminal or launcher); only a headless command
+   line exempts a browser from needing one. And `pgrep -x` lists zombies,
+   whose empty cmdline the profile scope reads as a flagless default-root
+   launch -- a relaunch that died still counted as running. `_pids_unix`
+   drops zombies; the reopen first waits for the failed relaunch to exit
+   and free `SingletonLock` (a launch made while it is on its way out
+   hands its command line to that instance and dies with it), and skips
+   reopening when that relaunch is in fact still up; every restart is
+   confirmed with `running_fn` after `_REOPEN_GRACE_S`.
+
+   **Live bootstrap on the default user-data-dir does work -- do not
+   "fix" it away.** Chrome 136+ ignores `--remote-debugging-port` on the
+   default data dir, and the Brave binary contains that error string, but
+   the check sits behind `BUILDFLAG(GOOGLE_CHROME_BRANDING)` in upstream
+   `remote_debugging_server.cc` (the string lives in
+   `browser_process_impl.cc`, compiled into every build), and brave-core
+   does not override it. Verified 12/11/2026: unbranded Chromium 156
+   served the endpoint on its own default dir passed explicitly. A
+   relaunch that "never exposes an endpoint" has so far always been a
+   relaunch that died -- check the display first.
 
    Two platform facts the relaunch path depends on, both measured rather
    than assumed. **macOS launches the binary inside the bundle, not
