@@ -212,6 +212,7 @@ def cmd_apply(args: argparse.Namespace) -> None:
             live_apply_fn=live_mod.apply_live,
             graceful_close_fn=BROWSER_PROCESS.close_and_wait,
             launch_live_fn=BROWSER_PROCESS.launch_live,
+            close_blocker_fn=BROWSER_PROCESS.relaunch_blocker,
         )
         return
 
@@ -228,6 +229,7 @@ def cmd_apply(args: argparse.Namespace) -> None:
         live_apply_fn=live_mod.apply_live,
         graceful_close_fn=proc.close_and_wait,
         launch_live_fn=proc.launch_live,
+        close_blocker_fn=proc.relaunch_blocker,
     )
 
 
@@ -288,6 +290,7 @@ def cmd_restore(args: argparse.Namespace) -> None:
             restart_fn=restart_brave,
             graceful_close_fn=BROWSER_PROCESS.close_and_wait,
             policy_location=str(policy_location),
+            close_blocker_fn=BROWSER_PROCESS.relaunch_blocker,
         )
         return
 
@@ -302,6 +305,7 @@ def cmd_restore(args: argparse.Namespace) -> None:
         restart_fn=proc.restart,
         graceful_close_fn=proc.close_and_wait,
         policy_location=str(policy_location),
+        close_blocker_fn=proc.relaunch_blocker,
     )
 
 

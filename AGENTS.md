@@ -285,6 +285,22 @@ Preserve these contracts unless a change explicitly redesigns them:
    tells callers the apply failed and invites a retry that closes and
    reopens Brave for nothing.
 
+   Two Linux facts in front of that, measured 12/11/2026 on labwc. A
+   shell outside the desktop session (SSH, a service, an agent's
+   sandboxed shell) has neither `$WAYLAND_DISPLAY` nor `$DISPLAY`, and a
+   Chromium started there exits in 0.16s ("Missing X server or
+   $DISPLAY") -- the relaunch and the reopen both died while dotbrave
+   printed `was reopened`. So `find_main_cmdline` also reads the main
+   process's session variables from `/proc/<pid>/environ`, the relaunch
+   fills in whichever this shell lacks (never overriding one it has), and
+   `relaunch_blocker` (`close_blocker_fn`) refuses every close, before
+   anything is written, when neither source has a display. And `pgrep -x`
+   lists zombies, whose empty cmdline the profile scope reads as a
+   flagless default-root launch -- a relaunch that died still counted as
+   running. `_pids_unix` drops zombies, and every restart is confirmed
+   with `running_fn` after `_REOPEN_GRACE_S` before anything says it is
+   back.
+
    Two platform facts the relaunch path depends on, both measured rather
    than assumed. **macOS launches the binary inside the bundle, not
    `open -a`**: LaunchServices can still consider the app running right

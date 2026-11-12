@@ -16,6 +16,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime
@@ -255,10 +256,30 @@ def _warn(message: str) -> None:
     print(message, file=sys.stderr)
 
 
+#: How long a restarted browser must survive before dotbrave says it is
+#: back.  One started without a usable display exits in well under a
+#: second, so a launch that "succeeded" proves nothing on its own.
+_REOPEN_GRACE_S = 3.0
+
+
+def _survived_restart(running_fn: Callable[[], bool]) -> bool | None:
+    """Whether the browser is still up a moment after a restart.
+
+    ``None`` when that cannot be determined -- callers then say nothing
+    rather than guess either way.
+    """
+    time.sleep(_REOPEN_GRACE_S)
+    try:
+        return running_fn()
+    except _process.ProcessStateUnknown:
+        return None
+
+
 def _reopen_after_failed_relaunch(
     saved_cmdline: list[str] | None,
     restart_fn: Callable[[list[str]], list[str]],
     display_name: str,
+    running_fn: Callable[[], bool],
 ) -> str:
     """Put the browser back after a relaunch that never came up.
 
@@ -283,7 +304,18 @@ def _reopen_after_failed_relaunch(
         return (
             f"could not reopen {display_name} ({e}) -- restart it manually."
         )
+    if _survived_restart(running_fn) is False:
+        return (
+            f"{display_name} was reopened with its original command line but "
+            f"is not running {_REOPEN_GRACE_S:g}s later -- it is closed now; "
+            f"restart it manually."
+        )
     return f"{display_name} was reopened with its original command line."
+
+
+def _close_blocked(close_blocker_fn: Callable[[], str | None] | None) -> str | None:
+    """Why the browser must not be closed (it would not come back), or None."""
+    return close_blocker_fn() if close_blocker_fn is not None else None
 
 
 def cmd_apply(
@@ -300,6 +332,9 @@ def cmd_apply(
     launch_live_fn: (
         Callable[[Path, str, int, str | None, list[str] | None], list[str]] | None
     ) = None,
+    # Called after find_cmdline_fn, before every close: a reason string
+    # means a relaunch could not bring the browser back, so it stays open.
+    close_blocker_fn: Callable[[], str | None] | None = None,
 ) -> None:
     """Unified apply orchestrator.
 
@@ -496,6 +531,14 @@ def cmd_apply(
                         f"{display_name} is running but cannot be "
                         f"re-launched for live apply"
                     )
+                blocked = _close_blocked(close_blocker_fn)
+                if blocked:
+                    sys.exit(
+                        "error: "
+                        f"{_partial_note(applied_external, non_empty)} -- "
+                        f"{display_name} is running without a live endpoint "
+                        f"and was left running: {blocked}"
+                    )
                 live_port = pick_unused_port()
                 print(
                     f"{display_name} is running without a live endpoint; "
@@ -517,7 +560,7 @@ def cmd_apply(
                     # failure -- but the browser we closed is ours to
                     # restore before reporting it.
                     note = _reopen_after_failed_relaunch(
-                        saved_cmdline, restart_fn, display_name
+                        saved_cmdline, restart_fn, display_name, running_fn
                     )
                     sys.exit(f"{e}\n{note}")
                 # That close flushed the browser's own PrefService over this
@@ -583,6 +626,14 @@ def cmd_apply(
                         f"live and cannot be re-launched for offline apply:\n"
                         f"{settings}"
                     )
+                blocked = _close_blocked(close_blocker_fn)
+                if blocked:
+                    sys.exit(
+                        f"error: {display_name} applied everything it could "
+                        f"live, but these are not applied and "
+                        f"{display_name} was left running: {blocked}\n"
+                        f"{settings}"
+                    )
                 print(
                     f"{display_name} applied everything it could live; "
                     f"closing it normally to finish these offline "
@@ -614,6 +665,13 @@ def cmd_apply(
                 )
                 return
             saved_cmdline = find_cmdline_fn()
+            blocked = _close_blocked(close_blocker_fn)
+            if blocked:
+                sys.exit(
+                    f"error: {_partial_note(applied_external, non_empty)} -- "
+                    f"{display_name} is running and was left running: "
+                    f"{blocked}"
+                )
             print(f"closing {display_name} normally for offline apply")
             graceful_close_fn()
             was_closed = True
@@ -697,7 +755,7 @@ def cmd_apply(
             # reopen the browser again for a run with nothing left to do.
             # Report the relaunch on stderr, put the browser back, exit 0.
             note = _reopen_after_failed_relaunch(
-                saved_cmdline, restart_fn, display_name
+                saved_cmdline, restart_fn, display_name, running_fn
             )
             _warn(
                 f"warning: config applied, but the live relaunch failed:\n"
@@ -710,6 +768,14 @@ def cmd_apply(
     elif saved_cmdline:
         used = restart_fn(saved_cmdline)
         print(f"restarting {display_name}: {' '.join(used)}")
+        if _survived_restart(running_fn) is False:
+            # Applied and verified already: a warning, not a failure (see
+            # the live relaunch above for why the exit code stays 0).
+            _warn(
+                f"warning: config applied, but {display_name} is not running "
+                f"{_REOPEN_GRACE_S:g}s after the restart -- it is closed now; "
+                f"start it manually."
+            )
     elif was_closed:
         print(
             f"{display_name} closed; could not capture original "
@@ -732,6 +798,7 @@ def cmd_restore(
     restart_fn: Callable[[list[str]], list[str]],
     graceful_close_fn: Callable[[], None],
     policy_location: str | None = None,
+    close_blocker_fn: Callable[[], str | None] | None = None,
 ) -> None:
     """Restore Preferences from a backup created by a prior ``apply``.
 
@@ -810,6 +877,12 @@ def cmd_restore(
         return
     if is_running:
         saved_cmdline = find_cmdline_fn()
+        blocked = _close_blocked(close_blocker_fn)
+        if blocked:
+            sys.exit(
+                f"error: nothing restored -- {display_name} is running and "
+                f"was left running: {blocked}"
+            )
         print(f"closing {display_name} normally for restore")
         graceful_close_fn()
         was_closed = True
@@ -835,6 +908,12 @@ def cmd_restore(
     if saved_cmdline:
         used = restart_fn(saved_cmdline)
         print(f"restarting {display_name}: {' '.join(used)}")
+        if _survived_restart(running_fn) is False:
+            _warn(
+                f"warning: Preferences restored, but {display_name} is not "
+                f"running {_REOPEN_GRACE_S:g}s after the restart -- it is "
+                f"closed now; start it manually."
+            )
     elif was_closed:
         print(
             f"{display_name} closed; could not capture original "

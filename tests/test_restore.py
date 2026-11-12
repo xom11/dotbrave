@@ -291,3 +291,32 @@ def test_apply_without_config_or_undo_errors(tmp_path: Path) -> None:
     with pytest.raises(SystemExit) as exc:
         brave_pkg.cmd_apply(args)
     assert "CONFIG" in str(exc.value)
+
+
+def test_restore_leaves_browser_running_when_relaunch_cannot_work(
+    profile_with_backups: tuple[Path, list[Path]], monkeypatch
+) -> None:
+    """No display in this shell and none readable from the running browser:
+    closing it would leave the user without one, so nothing is touched."""
+    from dotbrave._base import process as process_mod
+
+    calls: list[object] = []
+    monkeypatch.setattr(process_mod, "_is_windows", lambda: False)
+    monkeypatch.setattr(process_mod, "_is_macos", lambda: False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.setattr(brave_pkg, "brave_running", lambda: True)
+    monkeypatch.setattr(brave_pkg, "find_main_brave_cmdline", lambda: ["brave"])
+    monkeypatch.setattr(brave_pkg.BROWSER_PROCESS, "_session_env", None)
+    monkeypatch.setattr(
+        brave_pkg.BROWSER_PROCESS, "close_and_wait", lambda: calls.append("close")
+    )
+    profile_root, _ = profile_with_backups
+    prefs = profile_root / "Default" / "Preferences"
+    before = prefs.read_bytes()
+
+    with pytest.raises(SystemExit, match="nothing restored"):
+        _restore(profile_root)
+
+    assert calls == []
+    assert prefs.read_bytes() == before

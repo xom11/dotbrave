@@ -18,6 +18,20 @@ def _no_launcher_heal(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(pwa, "_launcher_cleanup", lambda *_a, **_k: None)
 
 
+@pytest.fixture(autouse=True)
+def _desktop_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run every test as if from a terminal inside the desktop session.
+
+    CI runners (and an agent's shell) have no display, so the Linux
+    relaunch guard would refuse every close a test drives.  Tests of the
+    guard delete these again.  The post-restart grace is skipped too: the
+    process callbacks here are fakes that answer instantly."""
+    from dotbrave._base import orchestrator
+
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-test")
+    monkeypatch.setattr(orchestrator, "_REOPEN_GRACE_S", 0.0)
+
+
 @pytest.fixture
 def fake_settings_profile_root(tmp_path: Path) -> Path:
     """Profile root for settings tests.

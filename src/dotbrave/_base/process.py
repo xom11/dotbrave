@@ -160,6 +160,56 @@ def _same_dir(a: str, b: str) -> bool:
     return os.path.realpath(a) == os.path.realpath(b)
 
 
+#: What a Linux browser needs from its environment to reach the desktop at
+#: all.  A shell outside the graphical session (SSH, a service, an agent's
+#: sandboxed shell) usually lacks the first two, and a Chromium started
+#: there exits in well under a second: "Missing X server or $DISPLAY".
+_SESSION_ENV_KEYS = (
+    "WAYLAND_DISPLAY",
+    "DISPLAY",
+    "XAUTHORITY",
+    "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "XDG_SESSION_TYPE",
+    "XDG_CURRENT_DESKTOP",
+)
+
+
+def _read_session_env(pid: str) -> dict[str, str] | None:
+    """The desktop-session variables a running Linux process started with.
+
+    ``None`` when ``/proc/<pid>/environ`` cannot be read -- a different
+    answer from ``{}``, which means the process genuinely had none.
+    """
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return None
+    env: dict[str, str] = {}
+    for entry in raw.split(b"\0"):
+        key, sep, value = entry.partition(b"=")
+        name = key.decode("utf-8", "replace")
+        if sep and name in _SESSION_ENV_KEYS:
+            env[name] = value.decode("utf-8", "replace")
+    return env
+
+
+def _is_zombie(pid: str) -> bool:
+    """Whether ``pid`` has exited and only awaits its parent's reap.
+
+    ``pgrep -x`` lists zombies, and a zombie's ``/proc`` cmdline is empty,
+    which the profile scope reads as a flagless default-root launch -- so
+    a relaunched browser that died at once still counted as running.
+    """
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return False
+    # The state field follows the parenthesised comm, which may itself
+    # contain spaces and parentheses.
+    return stat.rpartition(")")[2].split()[:1] == ["Z"]
+
+
 def _split_flat_cmdline(line: str) -> list[str]:
     """Turn a one-line command string back into argv-ish tokens.
 
@@ -269,6 +319,11 @@ class BrowserProcess:
         # (pgrep/pkill -x) behavior.
         self.user_data_dir: str | None = None
         self.default_user_data_dir: str | None = None
+        # Linux: the desktop-session environment of the main process
+        # `find_main_cmdline` last found, read while it is still alive --
+        # after the close there is no process left to ask.  None when it
+        # could not be read (or nothing was found).
+        self._session_env: dict[str, str] | None = None
 
     def scope_to_profile(
         self, user_data_dir, default_user_data_dir=None
@@ -394,6 +449,8 @@ class BrowserProcess:
         except subprocess.CalledProcessError:
             return []
         raw = out.decode().split()
+        if not _is_macos():
+            raw = [p for p in raw if not _is_zombie(p)]
         if self._linux_scoping_active():
             return self._apply_linux_filter(raw)
         return raw
@@ -416,15 +473,65 @@ class BrowserProcess:
             return []
 
     def find_main_cmdline(self) -> list[str] | None:
-        """The main browser process is the one without ``--type=...``."""
+        """The main browser process is the one without ``--type=...``.
+
+        On Linux this also records that process's desktop-session
+        environment for :meth:`relaunch_blocker` and the relaunch itself.
+        """
+        self._session_env = None
         for pid in self.pids():
             args = _read_cmdline(pid)
             if not args:
                 continue
             if any("--type=" in a for a in args):
                 continue
+            if not _is_macos() and not _is_windows():
+                self._session_env = _read_session_env(pid)
             return args
         return None
+
+    def _launch_env(self) -> dict[str, str] | None:
+        """Environment for a Linux relaunch; ``None`` inherits ours as-is.
+
+        Fills in only what this shell lacks, from the browser that is
+        being closed: run from SSH or a sandboxed shell, dotbrave has no
+        ``$WAYLAND_DISPLAY``/``$DISPLAY``, while the browser it closes
+        demonstrably had a working one.  Values this shell does have are
+        kept -- they are what the user asked for by running it here.
+        """
+        if _is_macos() or _is_windows() or not self._session_env:
+            return None
+        missing = {
+            k: v for k, v in self._session_env.items() if not os.environ.get(k)
+        }
+        if not missing:
+            return None
+        return {**os.environ, **missing}
+
+    def relaunch_blocker(self) -> str | None:
+        """Why closing the browser now would leave it closed, or None.
+
+        Call after :meth:`find_main_cmdline`.  Linux only: a relaunch with
+        neither ``$WAYLAND_DISPLAY`` nor ``$DISPLAY`` dies at startup, so
+        the browser dotbrave closed never comes back.  A browser whose own
+        environment was read and had no display either (headless) is not
+        blocked -- relaunching it the same way is no worse.
+        """
+        if _is_macos() or _is_windows():
+            return None
+        env = self._launch_env() or os.environ
+        if env.get("WAYLAND_DISPLAY") or env.get("DISPLAY"):
+            return None
+        if self._session_env is not None:
+            return None
+        return (
+            f"this shell has neither $WAYLAND_DISPLAY nor $DISPLAY (SSH, a "
+            f"service, a sandboxed shell?) and the running "
+            f"{self.display_name}'s environment could not be read, so a "
+            f"relaunch from here would die on startup. Run this from a "
+            f"terminal inside the desktop session, or close "
+            f"{self.display_name} yourself and rerun to apply offline."
+        )
 
     def kill_and_wait(self, timeout: float = 5.0) -> None:
         if _is_windows():
@@ -641,6 +748,7 @@ class BrowserProcess:
         Cross-session on Windows (e.g. dotbrave over SSH) the launch is
         routed through the interactive-session trampoline so the browser
         appears on the user's desktop instead of an invisible session.
+        Linux's equivalent is :meth:`_launch_env`.
         """
         if _is_windows() and _windows_console_session_mismatch():
             if self._spawn_via_console_trampoline(cmdline):
@@ -651,6 +759,7 @@ class BrowserProcess:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
+            env=self._launch_env(),
         )
 
     #: Flags this method owns.  A captured command line may carry its own
