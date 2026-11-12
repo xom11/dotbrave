@@ -991,34 +991,44 @@ def entry_for(url: str, name: str | None = None) -> dict[str, Any]:
     return entry
 
 
-def read_windows_registry_payload(windows_registry_key: str) -> dict:
+def read_windows_registry_strings(
+    windows_registry_key: str, policy_key: str = POLICY_KEY
+) -> list[str]:
+    """The non-empty REG_SZ values of one list policy's subkey."""
     try:
         key = winreg.OpenKey(
             winreg.HKEY_LOCAL_MACHINE,
-            windows_registry_key + "\\" + POLICY_KEY,
+            windows_registry_key + "\\" + policy_key,
             0,
             winreg.KEY_READ,
         )
     except OSError:
-        return {}
-    entries: list[dict] = []
+        return []
+    values: list[str] = []
     try:
         i = 0
         while True:
             try:
                 _name, value, vtype = winreg.EnumValue(key, i)
                 if vtype == winreg.REG_SZ and value:
-                    try:
-                        parsed = json.loads(value)
-                        if isinstance(parsed, dict):
-                            entries.append(parsed)
-                    except json.JSONDecodeError:
-                        pass
+                    values.append(value)
                 i += 1
             except OSError:
                 break
     finally:
         winreg.CloseKey(key)
+    return values
+
+
+def read_windows_registry_payload(windows_registry_key: str) -> dict:
+    entries: list[dict] = []
+    for value in read_windows_registry_strings(windows_registry_key, POLICY_KEY):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            entries.append(parsed)
     return {POLICY_KEY: entries} if entries else {}
 
 
@@ -1056,16 +1066,36 @@ def read_current_policy(
     return out
 
 
+def _policy_payload(
+    policy_file: Path | None,
+    windows_registry_key: str,
+    entries: list,
+    policy_key: str,
+) -> dict:
+    """macOS has one managed plist per bundle id, shared by every policy
+    dotbrave writes and by any other MDM key, so it is merged; on Linux
+    each namespace owns its own file in the policy directory."""
+    if sys.platform == "darwin":
+        merged = dict(read_existing_payload(policy_file, windows_registry_key))
+        merged[policy_key] = entries
+        return merged
+    return {policy_key: entries}
+
+
 def build_policy_payload(
     policy_file: Path | None,
     windows_registry_key: str,
-    entries: list[dict],
+    entries: list,
+    policy_key: str = POLICY_KEY,
 ) -> bytes:
+    return _serialize_payload(
+        _policy_payload(policy_file, windows_registry_key, entries, policy_key)
+    )
+
+
+def _serialize_payload(payload: dict) -> bytes:
     if sys.platform == "darwin":
-        merged = dict(read_existing_payload(policy_file, windows_registry_key))
-        merged[POLICY_KEY] = entries
-        return plistlib.dumps(merged, fmt=plistlib.FMT_BINARY)
-    payload = {POLICY_KEY: entries}
+        return plistlib.dumps(payload, fmt=plistlib.FMT_BINARY)
     return (json.dumps(payload, indent=2) + "\n").encode("utf-8")
 
 
@@ -1097,9 +1127,12 @@ def diff_summary(
 
 def write_windows_registry(
     windows_registry_key: str,
-    entries: list[dict],
+    entries: list,
+    policy_key: str = POLICY_KEY,
 ) -> None:
-    key_path = windows_registry_key + "\\" + POLICY_KEY
+    """A list policy is a subkey of numbered REG_SZ values: dict entries
+    (``WebAppInstallForceList``) as JSON, plain strings as themselves."""
+    key_path = windows_registry_key + "\\" + policy_key
     parent = winreg.CreateKeyEx(
         winreg.HKEY_LOCAL_MACHINE,
         windows_registry_key,
@@ -1119,7 +1152,8 @@ def write_windows_registry(
     )
     try:
         for i, entry_item in enumerate(entries, start=1):
-            winreg.SetValueEx(key, str(i), 0, winreg.REG_SZ, json.dumps(entry_item))
+            value = entry_item if isinstance(entry_item, str) else json.dumps(entry_item)
+            winreg.SetValueEx(key, str(i), 0, winreg.REG_SZ, value)
     finally:
         winreg.CloseKey(key)
 
@@ -1127,19 +1161,30 @@ def write_windows_registry(
 def sudo_write_policy(
     policy_file: Path | None,
     windows_registry_key: str,
-    entries: list[dict],
+    entries: list,
+    *,
+    policy_key: str = POLICY_KEY,
+    managed_keys: tuple[str, ...] = (POLICY_KEY,),
 ) -> None:
-    """Write policy entries via the platform-specific privileged path."""
+    """Write one list policy via the platform-specific privileged path.
+
+    ``managed_keys`` names every key dotbrave writes into the shared macOS
+    plist. The self-healing daemon restores the *whole* plist from its
+    source copy, so it stays installed while any of them is non-empty --
+    emptying ``[pwa]`` must not strip the pin and the daemon from a
+    ``[shields]`` list still living in the same file."""
     if sys.platform == "win32":
-        write_windows_registry(windows_registry_key, entries)
+        write_windows_registry(windows_registry_key, entries, policy_key)
         return
-    content = build_policy_payload(policy_file, windows_registry_key, entries)
+    payload = _policy_payload(policy_file, windows_registry_key, entries, policy_key)
+    content = _serialize_payload(payload)
+    keep = any(payload.get(k) for k in managed_keys)
     subprocess.run(
         ["sudo", "mkdir", "-p", "-m", "0755", str(policy_file.parent)],
         check=True,
     )
     if sys.platform == "darwin":
-        if entries:
+        if keep:
             _darwin_seed_daemon_source(policy_file, content)
         else:
             _darwin_stop_daemon(policy_file)
@@ -1151,14 +1196,14 @@ def sudo_write_policy(
         check=True,
     )
     if sys.platform == "darwin":
-        if entries:
+        if keep:
             _darwin_set_immutable(policy_file)
         subprocess.run(
             ["sudo", "killall", "cfprefsd"],
             check=False,
             stderr=subprocess.DEVNULL,
         )
-        if entries:
+        if keep:
             install_self_healing_daemon(policy_file, content)
         else:
             remove_self_healing_daemon(policy_file)

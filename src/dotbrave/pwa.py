@@ -18,6 +18,9 @@ from dotbrave._base.utils import Plan, find_preferences
 
 NAMESPACE = _base.NAMESPACE
 POLICY_KEY = _base.POLICY_KEY
+# Every key dotbrave writes into the one macOS managed plist ([shields]
+# shares it); see ``_base.sudo_write_policy``.
+MANAGED_POLICY_KEYS = (POLICY_KEY, "BraveShieldsDisabledForUrls")
 
 _PWA_CONFIG = _base.PwaConfig(
     browser_name="brave",
@@ -75,7 +78,10 @@ def _entry_for(url: str, name: str | None = None) -> dict[str, Any]:
 
 
 def _sudo_write_policy(entries: list[dict]) -> None:
-    _base.sudo_write_policy(POLICY_FILE, _WINDOWS_POLICY_KEY, entries)
+    _base.sudo_write_policy(
+        POLICY_FILE, _WINDOWS_POLICY_KEY, entries,
+        managed_keys=MANAGED_POLICY_KEYS,
+    )
 
 
 def _validate_table(raw: object) -> list[str]:

@@ -7,7 +7,7 @@ focused on implementation constraints.
 ## Project
 
 `dotbrave` manages Brave browser customizations from TOML files: managed
-tables `[shortcuts]`, `[settings]`, `[pwa]`, applied live when possible with
+tables `[shortcuts]`, `[settings]`, `[pwa]`, `[shields]`, applied live when possible with
 an automatic offline fallback, on Linux/macOS/Windows across the stable,
 beta, and nightly channels. It is a Python 3.11+ stdlib-only CLI package,
 extracted from the multi-browser `xom11/dotbrowser` project. The CLI is
@@ -44,7 +44,7 @@ pytest tests/test_platform.py tests/test_macos_pwa_daemon.py
   `browser.register(parser)`.
 - `src/dotbrave/browser.py`: channel/profile-root resolution, plan
   assembly, `cmd_*` handlers, registration.
-- `src/dotbrave/shortcuts.py`, `settings.py`, `pwa.py`: namespace wrappers
+- `src/dotbrave/shortcuts.py`, `settings.py`, `pwa.py`, `shields.py`: namespace wrappers
   (module-level state kept patchable for tests).
 - `src/dotbrave/live.py`: Brave live-apply routes (settingsPrivate, New
   Tab actions, CommandsService).
@@ -222,6 +222,14 @@ Preserve these contracts unless a change explicitly redesigns them:
    the reconcile is unverified -- the event is intermittent and resisted
    every attempt to trigger it on demand -- so the heal log is the
    instrument: a line in it means the pin failed that boot.
+   `[shields]` (`BraveShieldsDisabledForUrls`) is the same kind of
+   external policy and shares that macOS plist, so the daemon guards both:
+   `sudo_write_policy` keeps it while *any* key in `MANAGED_POLICY_KEYS` is
+   non-empty, and both writers seed its source with the merged plist. A
+   new key written into that plist must join `MANAGED_POLICY_KEYS`, or
+   emptying `[pwa]` boots the daemon out and unpins a file still holding
+   it. On Linux each namespace owns a whole file in the policy dir
+   (`dotbrave-shields.json`), because the Linux payload is not merged.
    On Linux the policy reaches every `--user-data-dir`, and a throwaway
    profile overwrites the real profile's launchers (same file names, its own
    data dir in `Exec`). A per-user systemd path unit runs
@@ -385,7 +393,9 @@ Preserve these contracts unless a change explicitly redesigns them:
 6. The CLI surface is exactly two actions, `apply` and `export`; new
    capabilities become flags on one of them, not new actions. `export`
    emits `[shortcuts]` diffs against `brave.default_accelerators`,
-   `[pwa]`, and a `[settings]` block that unions: currently-managed keys
+   `[pwa]`, `[shields]` only while its policy is non-empty (so an export of
+   a profile that never used it does not grow the table), and a
+   `[settings]` block that unions: currently-managed keys
    (so re-applying the export cannot reset them), allowlisted well-known
    keys (`KNOWN_SETTINGS` in `settings.py`; prefixes only ever get added
    -- Chromium/Brave do not rename shipped pref strings), and -- when an

@@ -78,6 +78,12 @@ privilege:
 | `nixosModules.default` | `[pwa]` via `/etc/brave/policies/managed/` | root |
 | `darwinModules.default` | `[pwa]` via a managed plist + self-healing LaunchDaemon — **exclusive owner of that plist**, see below | root |
 
+None of the modules manages `[shields]`; apply it with `dotbrave apply`
+from a terminal (an `--unattended` activation reports it and skips it).
+On a Mac running `darwinModules.default`, don't: the module rewrites the
+plist with `WebAppInstallForceList` as its only key, dropping
+`BraveShieldsDisabledForUrls` within a minute.
+
 Because the system modules already run as root, `[pwa]` never prompts for
 sudo. The home-manager module defaults to `skip = [ "pwa" ]` to match.
 Note the asymmetry: `[shortcuts]`/`[settings]` are read at activation
@@ -129,7 +135,7 @@ module has no on-disable hook to hang it on.)
 
 ## Build your own config
 
-A single TOML carries `[shortcuts]`, `[settings]` and `[pwa]`. One `apply`
+A single TOML carries `[shortcuts]`, `[settings]`, `[pwa]` and `[shields]`. One `apply`
 writes all three in a single backup + write cycle.
 
 ```toml
@@ -162,6 +168,14 @@ urls = [
   "https://squoosh.app/",
   "https://app.element.io/",
 ]
+
+[shields]
+# Brave Shields forced OFF on these sites (BraveShieldsDisabledForUrls
+# policy). Content-settings patterns: `[*.]example.com` covers the domain
+# and every subdomain.
+disabled = [
+  "[*.]messenger.com",
+]
 ```
 
 ```bash
@@ -192,6 +206,16 @@ dotbrave apply brave.toml              # live apply if Brave is running
   prunes duplicate `.app` shims left behind by throwaway `--user-data-dir`
   launches. `[pwa]` only needs elevated privileges when the managed-policy
   file (sudo on Linux/macOS) or Windows Registry (Administrator) changes.
+- **Shields patterns**: `[shields] disabled` writes Brave's
+  `BraveShieldsDisabledForUrls` managed policy, the declarative form of
+  flipping the Shields toggle off for a site — useful where a login hops
+  across domains and Shields' cross-site cookie blocking breaks it
+  (messenger.com signing in through facebook.com). Pattern syntax is
+  Brave's to judge: a bad one shows up as an error on `brave://policy`.
+  Same storage and privileges as `[pwa]`: on macOS it is merged into the
+  same managed plist (and loaded at Brave's next launch), on Linux it is
+  its own `/etc/brave/policies/managed/dotbrave-shields.json`, on Windows
+  `HKLM\Software\Policies\BraveSoftware\Brave\BraveShieldsDisabledForUrls`.
 - **Empty header** (e.g. `[settings]` with no entries) wipes everything
   dotbrave previously managed in that namespace. **Missing header** = skip
   the namespace entirely.
@@ -229,8 +253,8 @@ There are exactly two:
 
 | Action | What it does |
 |---|---|
-| `export [-o FILE] [-a] [--snapshot [--clear]]` | Read your customizations as round-trippable TOML: `[shortcuts]` (bindings that differ from Brave defaults; `-a/--all-shortcuts` lists every binding with its command name), `[settings]` (well-known user-facing keys, keys dotbrave manages, and keys changed since the last `--snapshot` baseline; MAC-protected keys appear as comments), and `[pwa]`. `--snapshot` captures the baseline instead of exporting; `--snapshot --clear` deletes it. |
-| `apply [-n] CONFIG \| --undo` | Write `[shortcuts]` + `[settings]` + `[pwa]` from a file or HTTPS URL. `-n/--dry-run` previews the diff. URL fetches print size + SHA-256; pin with `--expect-sha256 HEX`; plain HTTP refused unless `--allow-http`. `--undo` restores the most recent apply-time Preferences backup instead. |
+| `export [-o FILE] [-a] [--snapshot [--clear]]` | Read your customizations as round-trippable TOML: `[shortcuts]` (bindings that differ from Brave defaults; `-a/--all-shortcuts` lists every binding with its command name), `[settings]` (well-known user-facing keys, keys dotbrave manages, and keys changed since the last `--snapshot` baseline; MAC-protected keys appear as comments), `[pwa]`, and `[shields]` when that policy is non-empty. `--snapshot` captures the baseline instead of exporting; `--snapshot --clear` deletes it. |
+| `apply [-n] CONFIG \| --undo` | Write `[shortcuts]` + `[settings]` + `[pwa]` + `[shields]` from a file or HTTPS URL. `-n/--dry-run` previews the diff. URL fetches print size + SHA-256; pin with `--expect-sha256 HEX`; plain HTTP refused unless `--allow-http`. `--undo` restores the most recent apply-time Preferences backup instead. |
 
 To capture settings you only know how to change in the Brave UI: run
 `dotbrave export --snapshot`, change them in Brave, wait a few seconds
@@ -347,7 +371,9 @@ root-owned self-healing helper:
   and `com.brave.Browser.heal.sh` — the policy source of truth and the
   rewrite script.
 
-Applying an empty `[pwa]` table (`urls = []`) removes all of the above.
+The helper restores the whole plist, so it also keeps `[shields]` alive.
+Applying an empty `[pwa]` table (`urls = []`) removes all of the above —
+unless `[shields]` still lists sites, in which case the helper stays.
 
 On Linux the policy has a different side effect: it applies to **every**
 `--user-data-dir`, and a launcher's file name

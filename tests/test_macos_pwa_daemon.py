@@ -237,6 +237,91 @@ def test_empty_entries_remove_daemon(
     assert removed == [policy_file]
 
 
+_BOTH_KEYS = (pwa.POLICY_KEY, "BraveShieldsDisabledForUrls")
+
+
+def test_emptying_pwa_keeps_daemon_while_shields_lives_in_the_plist(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """The daemon restores the whole plist, [shields] included. Removing it
+    because [pwa] went empty would leave the shields list unpinned and
+    unhealed in the same file."""
+    _force_darwin(monkeypatch)
+    monkeypatch.setattr(pwa.subprocess, "run", _Recorder())
+    installed: list = []
+    removed: list = []
+    monkeypatch.setattr(pwa, "install_self_healing_daemon",
+                        lambda pf, content: installed.append(content))
+    monkeypatch.setattr(pwa, "remove_self_healing_daemon",
+                        lambda pf: removed.append(pf))
+
+    policy_file = tmp_path / "com.brave.Browser.plist"
+    policy_file.write_bytes(plistlib.dumps({
+        pwa.POLICY_KEY: [{"url": "https://a/"}],
+        "BraveShieldsDisabledForUrls": ["[*.]example.com"],
+    }))
+    pwa.sudo_write_policy(policy_file, "", [], managed_keys=_BOTH_KEYS)
+
+    assert removed == []
+    assert len(installed) == 1
+    assert plistlib.loads(installed[0]) == {
+        pwa.POLICY_KEY: [],
+        "BraveShieldsDisabledForUrls": ["[*.]example.com"],
+    }
+
+
+def test_shields_write_merges_into_the_pwa_plist_and_reseeds_the_daemon(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    _force_darwin(monkeypatch)
+    monkeypatch.setattr(pwa.subprocess, "run", _Recorder())
+    installed: list = []
+    monkeypatch.setattr(pwa, "install_self_healing_daemon",
+                        lambda pf, content: installed.append(content))
+    monkeypatch.setattr(pwa, "remove_self_healing_daemon", lambda pf: None)
+
+    policy_file = tmp_path / "com.brave.Browser.plist"
+    policy_file.write_bytes(plistlib.dumps({
+        pwa.POLICY_KEY: [{"url": "https://a/"}],
+        "SomeMdmKey": True,
+    }))
+    pwa.sudo_write_policy(
+        policy_file, "", ["[*.]example.com"],
+        policy_key="BraveShieldsDisabledForUrls", managed_keys=_BOTH_KEYS,
+    )
+
+    assert plistlib.loads(installed[0]) == {
+        pwa.POLICY_KEY: [{"url": "https://a/"}],
+        "SomeMdmKey": True,
+        "BraveShieldsDisabledForUrls": ["[*.]example.com"],
+    }
+
+
+def test_all_managed_keys_empty_removes_daemon_despite_foreign_keys(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    _force_darwin(monkeypatch)
+    monkeypatch.setattr(pwa.subprocess, "run", _Recorder())
+    installed: list = []
+    removed: list = []
+    monkeypatch.setattr(pwa, "install_self_healing_daemon",
+                        lambda pf, content: installed.append(pf))
+    monkeypatch.setattr(pwa, "remove_self_healing_daemon",
+                        lambda pf: removed.append(pf))
+
+    policy_file = tmp_path / "com.brave.Browser.plist"
+    policy_file.write_bytes(plistlib.dumps({
+        pwa.POLICY_KEY: [], "SomeMdmKey": True,
+    }))
+    pwa.sudo_write_policy(
+        policy_file, "", [],
+        policy_key="BraveShieldsDisabledForUrls", managed_keys=_BOTH_KEYS,
+    )
+
+    assert installed == []
+    assert removed == [policy_file]
+
+
 def test_darwin_write_unpins_before_writing_and_repins_after(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:

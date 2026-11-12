@@ -56,7 +56,7 @@ in
     };
 
     skip = lib.mkOption {
-      type = lib.types.listOf (lib.types.enum [ "shortcuts" "settings" "pwa" ]);
+      type = lib.types.listOf (lib.types.enum [ "shortcuts" "settings" "pwa" "shields" ]);
       default = [ "pwa" ];
       description = ''
         Namespaces the CLI must not touch. Defaults to [ "pwa" ] because

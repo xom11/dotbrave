@@ -2,7 +2,7 @@
 
 Usage:
     dotbrave export -o brave.toml    # read current customizations as TOML
-    dotbrave apply brave.toml        # write [shortcuts] + [settings] + [pwa]
+    dotbrave apply brave.toml        # write [shortcuts] + [settings] + [pwa] + [shields]
     dotbrave apply --undo            # revert the last apply
 
 Profile options (--channel, -r/--profile-root, -p/--profile) may be given
@@ -28,11 +28,12 @@ Two actions:
   export   read your current customizations as a TOML config
   apply    write a TOML config back to Brave (or `--undo` the last apply)
 
-Supported TOML tables: [shortcuts] [settings] [pwa]
+Supported TOML tables: [shortcuts] [settings] [pwa] [shields]
 
 `[shortcuts]` manages keyboard shortcuts, `[settings]` writes unprotected
-Preferences keys, and `[pwa]` manages force-installed web apps through
-browser policy. Live apply is attempted when Brave is running; plain
+Preferences keys, `[pwa]` manages force-installed web apps through
+browser policy, and `[shields]` turns Brave Shields off for listed sites
+through the same policy storage. Live apply is attempted when Brave is running; plain
 `apply` manages a local endpoint and normal-close fallback automatically.""",
         epilog="""\
 Typical workflow:

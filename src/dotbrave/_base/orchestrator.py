@@ -407,8 +407,8 @@ def cmd_apply(
             )
             return
         sys.exit(
-            "error: config has no [shortcuts], [settings] or [pwa] table "
-            "-- nothing to apply"
+            "error: config has no [shortcuts], [settings], [pwa] or "
+            "[shields] table -- nothing to apply"
         )
 
     non_empty = [p for p in plans if not p.empty]
@@ -450,11 +450,14 @@ def cmd_apply(
 
     needs_escalation = any(p.requires_escalation for p in plans)
     if needs_escalation and not _already_privileged():
+        escalating = ", ".join(
+            f"[{p.namespace}]" for p in plans if p.requires_escalation
+        )
         if sys.platform == "win32":
             import ctypes
             if not ctypes.windll.shell32.IsUserAnAdmin():
                 sys.exit(
-                    "error: [pwa] requires administrator privileges to write "
+                    f"error: {escalating} requires administrator privileges to write "
                     "to the Windows Registry.\n"
                     "Re-run this command from an elevated (Administrator) "
                     "command prompt or PowerShell."
@@ -468,9 +471,9 @@ def cmd_apply(
                     subprocess.run(["sudo", "-v"], check=True)
             except (subprocess.CalledProcessError, FileNotFoundError) as e:
                 sys.exit(
-                    "error: [pwa] requires sudo to write the managed-policy "
+                    f"error: {escalating} requires sudo to write the managed-policy "
                     f"file but auth failed: {e}\n"
-                    "(if sudo isn't installed, [pwa] isn't supported on this "
+                    f"(if sudo isn't installed, {escalating} isn't supported on this "
                     "platform; if running non-interactively, run `sudo -v` "
                     "from a terminal first to cache credentials)"
                 )
@@ -973,6 +976,8 @@ _EXPORT_HEADER_NOTES = (
     "#                  --snapshot`.",
     "#   [pwa]       -- URLs currently force-installed via the managed-policy",
     "#                  file / Windows registry.",
+    "#   [shields]   -- sites with Brave Shields forced off by managed policy",
+    "#                  (present only when that policy is non-empty).",
     "#",
     "# To capture ANY setting you change in the browser UI: run `dotbrave",
     "# export --snapshot`, change settings, then re-run `dotbrave export`.",
@@ -1115,13 +1120,13 @@ Safety:
   Any apply that changes Preferences takes one timestamped backup, live or
   offline; an offline write is also verified by reloading it.
   [settings] keys tracked by Chromium MAC integrity are refused.
-  A changed [pwa] table writes managed policy and may require sudo or
-  Administrator privileges.
+  A changed [pwa] or [shields] table writes managed policy and may require
+  sudo or Administrator privileges.
 
 Undo:
   `apply --undo` restores the most recent timestamped Preferences backup
   (taken next to Preferences by any apply that changes it) and clears
-  dotbrave's shortcut/settings sidecars. [pwa] policy and the
+  dotbrave's shortcut/settings sidecars. [pwa]/[shields] policy and the
   `export --snapshot` baseline are left untouched.
 
 Execution:
@@ -1176,7 +1181,7 @@ Examples:
     a.add_argument(
         "--skip",
         action="append",
-        choices=["shortcuts", "settings", "pwa"],
+        choices=["shortcuts", "settings", "pwa", "shields"],
         default=[],
         metavar="NAMESPACE",
         help="do not build a plan for this TOML table; repeatable. Use "
@@ -1189,8 +1194,9 @@ Examples:
     if cmd_export_fn is not None:
         export_scope = (
             "[shortcuts] changes versus Brave defaults, [settings] "
-            "well-known keys plus everything dotbrave manages, and [pwa] "
-            "force-installed URLs."
+            "well-known keys plus everything dotbrave manages, [pwa] "
+            "force-installed URLs, and [shields] (only when its policy is "
+            "non-empty)."
         )
         e = sub.add_parser(
             "export",
@@ -1258,8 +1264,8 @@ By default, the most recent timestamped backup is selected. A real restore
 also clears dotbrave shortcut/settings sidecars so the restored profile
 does not remain incorrectly marked as managed.
 
-[pwa] policy is not restored by this command because it is stored outside
-Preferences in managed policy storage.""",
+[pwa] and [shields] policy are not restored by this command because they
+are stored outside Preferences in managed policy storage.""",
             epilog="""\
 Examples:
   dotbrave restore --list

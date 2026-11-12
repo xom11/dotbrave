@@ -180,4 +180,4 @@ def test_apply_empty_config_errors(fake_profile_root: Path, tmp_path: Path) -> N
 
     r = _run_cli(fake_profile_root, "apply", str(cfg))
     assert r.returncode != 0
-    assert "no [shortcuts], [settings] or [pwa]" in (r.stdout + r.stderr)
+    assert "no [shortcuts], [settings], [pwa] or [shields]" in (r.stdout + r.stderr)

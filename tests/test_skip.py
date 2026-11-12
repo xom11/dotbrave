@@ -142,7 +142,7 @@ def test_skipping_every_present_table_is_not_an_error(
     assert "[pwa]" in out
     assert "skip" in out.lower()
     # Khong duoc doi lai thanh "config khong co bang nao".
-    assert "no [shortcuts], [settings] or [pwa] table" not in out
+    assert "no [shortcuts], [settings], [pwa] or [shields] table" not in out
 
 
 def test_config_with_no_known_table_still_errors(prefs_root, tmp_path):
@@ -154,7 +154,7 @@ def test_config_with_no_known_table_still_errors(prefs_root, tmp_path):
     with pytest.raises(SystemExit) as excinfo:
         _cmd_apply(_apply_args(prefs_root, cfg))
 
-    assert "no [shortcuts], [settings] or [pwa] table" in str(excinfo.value)
+    assert "no [shortcuts], [settings], [pwa] or [shields] table" in str(excinfo.value)
 
 
 def test_skipping_a_table_that_is_absent_still_errors(prefs_root, tmp_path):
@@ -166,7 +166,7 @@ def test_skipping_a_table_that_is_absent_still_errors(prefs_root, tmp_path):
     with pytest.raises(SystemExit) as excinfo:
         _cmd_apply(_apply_args(prefs_root, cfg, skip=["pwa", "settings"]))
 
-    assert "no [shortcuts], [settings] or [pwa] table" in str(excinfo.value)
+    assert "no [shortcuts], [settings], [pwa] or [shields] table" in str(excinfo.value)
 
 
 def test_cli_exits_zero_when_every_table_is_skipped(tmp_path):

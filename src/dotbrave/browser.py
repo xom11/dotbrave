@@ -6,7 +6,7 @@ Top-level CLI shape:
 
 Where <ACTION> is one of exactly two verbs:
 - ``export [-o FILE] [-a] [--snapshot [--clear]]`` -- read the current
-  ``[shortcuts]`` + ``[settings]`` + ``[pwa]`` customizations as TOML
+  ``[shortcuts]`` + ``[settings]`` + ``[pwa]`` + ``[shields]`` customizations as TOML
   (or capture/clear the settings baseline).
 - ``apply <file> | --undo`` -- write a TOML config back to Brave, or
   restore the most recent apply-time Preferences backup.
@@ -27,6 +27,7 @@ from dotbrave._base.orchestrator import (
 from dotbrave._base.utils import Plan
 from dotbrave import live as live_mod
 from dotbrave import pwa as pwa_mod
+from dotbrave import shields as shields_mod
 from dotbrave import settings as settings_mod
 from dotbrave import shortcuts as shortcuts_mod
 from dotbrave.utils import (  # noqa: F401
@@ -101,7 +102,7 @@ def _build_plans(
     prefs_path: Path, prefs: dict, doc: dict, *, skip: tuple[str, ...] = ()
 ) -> list[Plan]:
     plans: list[Plan] = []
-    for mod in (shortcuts_mod, settings_mod, pwa_mod):
+    for mod in (shortcuts_mod, settings_mod, pwa_mod, shields_mod):
         if mod.NAMESPACE in skip:
             continue
         if mod.NAMESPACE in doc:
@@ -251,6 +252,14 @@ def _export_pwa(args: argparse.Namespace, prefs_path: Path, prefs: dict) -> list
     return pwa_mod.build_dump_block()
 
 
+def _export_shields(
+    args: argparse.Namespace, prefs_path: Path, prefs: dict
+) -> list[str] | None:
+    if shields_mod.POLICY_FILE is None and sys.platform != "win32":
+        return None
+    return shields_mod.build_dump_block()
+
+
 def cmd_export(args: argparse.Namespace) -> None:
     if getattr(args, "snapshot", False) or getattr(args, "clear", False):
         if not getattr(args, "snapshot", False):
@@ -260,7 +269,7 @@ def cmd_export(args: argparse.Namespace) -> None:
     _base_cmd_export(
         args,
         browser_name="brave",
-        builders=[_export_shortcuts, _export_settings, _export_pwa],
+        builders=[_export_shortcuts, _export_settings, _export_pwa, _export_shields],
     )
 
 
@@ -317,7 +326,7 @@ def register(parser: argparse.ArgumentParser) -> None:
     register_actions(
         parser,
         display_name="Brave",
-        namespaces=("shortcuts", "settings", "pwa"),
+        namespaces=("shortcuts", "settings", "pwa", "shields"),
         cmd_apply_fn=cmd_apply,
         cmd_export_fn=cmd_export,
         export_has_shortcuts=True,
