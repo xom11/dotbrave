@@ -173,6 +173,25 @@ _SESSION_ENV_KEYS = (
     "DBUS_SESSION_BUS_ADDRESS",
     "XDG_SESSION_TYPE",
     "XDG_CURRENT_DESKTOP",
+    "XDG_SESSION_DESKTOP",
+    "NIXOS_OZONE_WL",
+)
+
+#: The subset that decides which display a relaunch lands on, and how.
+#: Moved as one set from the browser's session: Chromium's
+#: `--ozone-platform-hint=auto` picks Wayland over a reachable X11 only
+#: when XDG_SESSION_TYPE is "wayland", so a borrowed WAYLAND_DISPLAY next
+#: to the shell's own `XDG_SESSION_TYPE=tty` came back on XWayland.
+#: WAYLAND_SOCKET is an inherited fd number: never copied, only cleared.
+_DISPLAY_IDENTITY_KEYS = (
+    "WAYLAND_DISPLAY",
+    "WAYLAND_SOCKET",
+    "DISPLAY",
+    "XAUTHORITY",
+    "XDG_SESSION_TYPE",
+    "XDG_CURRENT_DESKTOP",
+    "XDG_SESSION_DESKTOP",
+    "NIXOS_OZONE_WL",
 )
 
 
@@ -570,21 +589,35 @@ class BrowserProcess:
     def _launch_env(self) -> dict[str, str] | None:
         """Environment for a Linux relaunch; ``None`` inherits ours as-is.
 
-        Fills in only what this shell lacks, from the session the browser
-        being closed was started in: run from SSH or a sandboxed shell,
-        dotbrave has no ``$WAYLAND_DISPLAY``/``$DISPLAY``, while that
-        browser demonstrably had a working one.  Values this shell does
-        have are kept -- they are what the user asked for by running it
-        here.
+        A relaunch restores *that* browser, so it goes back to the display
+        it was on: the display-identity set comes whole from the session
+        it was started in, whatever this shell says.  From a terminal in
+        the same session the values are identical and nothing changes;
+        from SSH (a forwarded ``$DISPLAY``) or an agent's shell
+        (``XDG_SESSION_TYPE=tty``, no display) the shell's values are
+        exactly the wrong ones.  The rest of the environment stays ours.
+
+        A missing or non-graphical XDG_SESSION_TYPE is inferred from the
+        display rather than copied: a browser an older dotbrave relaunched
+        from such a shell carries ``tty`` in its own session, and copying
+        it would put every later relaunch on XWayland too.
         """
         if _is_macos() or _is_windows() or not self._session_env:
             return None
-        missing = {
-            k: v for k, v in self._session_env.items() if not os.environ.get(k)
-        }
-        if not missing:
-            return None
-        return {**os.environ, **missing}
+        session = dict(self._session_env)
+        if session.get("XDG_SESSION_TYPE") not in ("wayland", "x11"):
+            if session.get("WAYLAND_DISPLAY"):
+                session["XDG_SESSION_TYPE"] = "wayland"
+            elif session.get("DISPLAY"):
+                session["XDG_SESSION_TYPE"] = "x11"
+        env = {k: v for k, v in os.environ.items() if k not in _DISPLAY_IDENTITY_KEYS}
+        for key in _DISPLAY_IDENTITY_KEYS:
+            if key != "WAYLAND_SOCKET" and session.get(key):
+                env[key] = session[key]
+        for key in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"):
+            if not env.get(key) and session.get(key):
+                env[key] = session[key]
+        return env
 
     def relaunch_blocker(self) -> str | None:
         """Why closing the browser now would leave it closed, or None.

@@ -308,9 +308,10 @@ with its original command line rather than leaving you without a browser
 — and when the config was already applied and verified by then, that
 relaunch failure is a warning on stderr, not a non-zero exit. On Linux, a
 run from a shell with no display (SSH, a service) relaunches Brave with
-the `$WAYLAND_DISPLAY`/`$DISPLAY` of the session it was started in (read
-from the process that launched it, since Brave blanks its own
-environment); when none can be found, dotbrave leaves Brave running and
+the display settings of the session it was started in -- `$WAYLAND_DISPLAY`,
+`$DISPLAY` and the session type, so it comes back on Wayland rather than
+XWayland -- read from the process that launched it, since Brave blanks
+its own environment; when none can be found, dotbrave leaves Brave running and
 exits with an error instead of closing a browser it could not bring
 back. A reopen waits for the failed relaunch to exit first, and is
 checked a few seconds later: one that did not survive is reported, not

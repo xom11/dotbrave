@@ -402,13 +402,96 @@ def test_relaunch_borrows_the_display_of_the_browser_it_closes(monkeypatch):
     assert env["XDG_RUNTIME_DIR"] == "/run/user/from-shell"
 
 
-def test_relaunch_keeps_this_shells_env_when_it_has_a_display(monkeypatch):
-    """Shell có display sẵn: không đụng vào môi trường của relaunch."""
-    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
-    proc = _linux_proc(monkeypatch, {"WAYLAND_DISPLAY": "wayland-1"})
+LABWC_SESSION = {
+    "WAYLAND_DISPLAY": "wayland-0",
+    "DISPLAY": ":0",
+    "XDG_SESSION_TYPE": "wayland",
+    "XDG_CURRENT_DESKTOP": "labwc:wlroots",
+    "NIXOS_OZONE_WL": "1",
+    "XDG_RUNTIME_DIR": "/run/user/1000",
+}
+
+
+def _chromium_picks(env: dict) -> str:
+    """`SetOzonePlatformForLinuxIfNeeded` (ui/linux/display_server_utils.cc)
+    với `--ozone-platform-hint=auto`: chỉ một bên kết nối được thì dùng bên
+    đó; cả hai thì Wayland chỉ khi XDG_SESSION_TYPE == "wayland"."""
+    use_wayland = env.get("XDG_SESSION_TYPE") == "wayland"
+    has_wayland = bool(env.get("WAYLAND_DISPLAY") or env.get("WAYLAND_SOCKET"))
+    has_x11 = bool(env.get("DISPLAY"))
+    if has_wayland != has_x11:
+        use_wayland = has_wayland
+    return "wayland" if use_wayland else "x11"
+
+
+def test_agent_shell_relaunch_lands_on_wayland_not_xwayland(monkeypatch):
+    """Đo trên x13 với 0.7.2: shell của agent có XDG_SESSION_TYPE=tty, không
+    display; 0.7.2 chỉ bù biến thiếu nên giữ `tty`, mượn cả WAYLAND_DISPLAY
+    lẫn DISPLAY -- Chromium chọn x11, Brave mờ trên XWayland."""
+    monkeypatch.setenv("XDG_SESSION_TYPE", "tty")
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("XDG_CURRENT_DESKTOP", raising=False)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/from-shell")
+    proc = _linux_proc(monkeypatch, dict(LABWC_SESSION))
     proc.find_main_cmdline()
 
-    assert proc._launch_env() is None
+    fill_only = {
+        **os.environ,
+        **{k: v for k, v in LABWC_SESSION.items() if not os.environ.get(k)},
+    }
+    assert _chromium_picks(fill_only) == "x11", "the 0.7.2 rule, as measured"
+
+    env = proc._launch_env()
+    assert _chromium_picks(env) == "wayland"
+    assert env["XDG_SESSION_TYPE"] == "wayland"
+    assert env["XDG_CURRENT_DESKTOP"] == "labwc:wlroots"
+    assert env["NIXOS_OZONE_WL"] == "1"
+    assert env["XDG_RUNTIME_DIR"] == "/run/user/from-shell"
+    assert env["PATH"] == os.environ["PATH"], "the rest stays ours"
+
+
+def test_forwarded_x_display_of_the_shell_is_dropped(monkeypatch):
+    """SSH -X: DISPLAY của shell là màn hình bên kia đường ống. Bộ biến
+    display đi nguyên từ phiên của Brave -- có thì đặt, không có thì bỏ."""
+    monkeypatch.setenv("DISPLAY", "localhost:10.0")
+    monkeypatch.setenv("WAYLAND_SOCKET", "3")
+    monkeypatch.setenv("XDG_SESSION_TYPE", "tty")
+    proc = _linux_proc(
+        monkeypatch, {"WAYLAND_DISPLAY": "wayland-0", "XDG_SESSION_TYPE": "wayland"}
+    )
+    proc.find_main_cmdline()
+
+    env = proc._launch_env()
+    assert "DISPLAY" not in env and "WAYLAND_SOCKET" not in env
+    assert env["WAYLAND_DISPLAY"] == "wayland-0"
+    assert _chromium_picks(env) == "wayland"
+
+
+def test_session_type_is_inferred_when_an_older_relaunch_poisoned_it(monkeypatch):
+    """Brave do 0.7.2 relaunch mang `tty` trong chính phiên của nó
+    (.brave-wrapped thừa kế từ shell). Chép lại thì lần sau cũng XWayland."""
+    monkeypatch.setenv("XDG_SESSION_TYPE", "tty")
+    poisoned = {**LABWC_SESSION, "XDG_SESSION_TYPE": "tty"}
+    proc = _linux_proc(monkeypatch, poisoned)
+    proc.find_main_cmdline()
+    assert proc._launch_env()["XDG_SESSION_TYPE"] == "wayland"
+
+    x11_only = {"DISPLAY": ":1"}
+    proc = _linux_proc(monkeypatch, x11_only)
+    proc.find_main_cmdline()
+    env = proc._launch_env()
+    assert env["XDG_SESSION_TYPE"] == "x11" and "WAYLAND_DISPLAY" not in env
+
+
+def test_same_session_terminal_changes_nothing(monkeypatch):
+    """Terminal trong chính phiên desktop: giá trị trùng nhau, không đổi gì."""
+    for key, value in LABWC_SESSION.items():
+        monkeypatch.setenv(key, value)
+    proc = _linux_proc(monkeypatch, dict(LABWC_SESSION))
+    proc.find_main_cmdline()
+
+    assert proc._launch_env() == dict(os.environ)
     assert proc.relaunch_blocker() is None
 
 

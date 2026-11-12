@@ -13,6 +13,7 @@ import os
 import socket
 import struct
 import sys
+import time
 from pathlib import Path
 import urllib.error
 import urllib.parse
@@ -380,6 +381,29 @@ def devtools_endpoint_alive(port: int) -> bool:
     return isinstance(targets, list)
 
 
+#: Probes for a port the browser is recorded as serving, and the pause
+#: between them.  Module-level so tests can drop the pause.
+_RECORDED_PORT_PROBES = 4
+_RECORDED_PORT_RETRY_S = 0.25
+
+
+def _recorded_endpoint_alive(port: int) -> bool:
+    """``devtools_endpoint_alive`` with retries, for a port the sidecar,
+    ``DevToolsActivePort`` or the running command line says is served.
+
+    This probe is all that stands between "use the endpoint" and "close
+    and relaunch the browser", a restart that steals window focus, so one
+    0.5s answer from a busy browser must not decide it.  A port nobody
+    listens on refuses at once: a stale record costs under a second.
+    """
+    for attempt in range(_RECORDED_PORT_PROBES):
+        if devtools_endpoint_alive(port):
+            return True
+        if attempt + 1 < _RECORDED_PORT_PROBES:
+            time.sleep(_RECORDED_PORT_RETRY_S)
+    return False
+
+
 def devtools_ws_only_alive(port: int) -> bool:
     """True when ``127.0.0.1:port`` answers ``GET /json/list`` with HTTP 404.
 
@@ -427,7 +451,7 @@ def _read_dotbrave_live_port(profile_root: Path, profile: str | None) -> int | N
         port = int(data["port"])
     except (KeyError, TypeError, ValueError):
         return None
-    return port if devtools_endpoint_alive(port) else None
+    return port if _recorded_endpoint_alive(port) else None
 
 
 def _read_devtools_active_port_entry(
@@ -520,7 +544,7 @@ def find_devtools_port(profile_root, profile: str | None = None) -> int | None:
     if entry is None:
         return None
     active_port, ws_path = entry
-    if devtools_endpoint_alive(active_port):
+    if _recorded_endpoint_alive(active_port):
         return active_port
     if (
         ws_path
@@ -551,7 +575,7 @@ def live_port_from_cmdline(
         return None
     if port is None:
         return None
-    return port if devtools_endpoint_alive(port) else None
+    return port if _recorded_endpoint_alive(port) else None
 
 
 def pick_unused_port() -> int:

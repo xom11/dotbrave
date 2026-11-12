@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -1772,3 +1774,106 @@ def test_apply_does_not_orphan_a_memory_only_key_on_the_pwa_branch(
     # adapter never saw.
     state = json.loads(_sidecar(prefs_path).read_text())
     assert state["managed_keys"] == []
+
+
+# ---------------------------------------------------------------------------
+# The shortcuts page's command list arrives asynchronously.
+# ---------------------------------------------------------------------------
+
+# brave-core's CommandsCache (browser/resources/settings/shortcuts_page/
+# utils/commandsCache.ts) as far as the script touches it: the cache starts
+# `{}` and is filled by the first mojo `changed` event, and
+# assignAccelerator dereferences `this.cache[id].accelerators`.
+_FAKE_COMMANDS_CACHE_JS = """
+class CommandsCache {
+  constructor() { this.cache = {}; this.connected = false; this.calls = []; }
+  notifyChanged(v) { this.cache = v; }
+  changed(event) {
+    const copy = { ...this.cache };
+    for (const id in event.addedOrUpdated) copy[id] = event.addedOrUpdated[id];
+    this.connected = true;
+    this.notifyChanged(copy);
+  }
+  assignAccelerator(commandId, accelerator) {
+    this.notifyChanged({ ...this.cache, [commandId]: { ...this.cache[commandId],
+      accelerators: [...this.cache[commandId].accelerators, accelerator] } });
+    this.calls.push(["assign", commandId, accelerator.codes]);
+  }
+  unassignAccelerator(commandId, accelerator) {
+    const command = { ...this.cache[commandId] };
+    command.accelerators = command.accelerators.filter(a => a.codes !== accelerator);
+    this.notifyChanged({ ...this.cache, [commandId]: command });
+    this.calls.push(["unassign", commandId, accelerator]);
+  }
+}
+"""
+
+requires_node = pytest.mark.skipif(
+    shutil.which("node") is None, reason="runs the generated script in node"
+)
+
+
+def _run_with_late_command_list(script: str, commands: dict, delay_ms: int) -> dict:
+    harness = (
+        _FAKE_COMMANDS_CACHE_JS
+        + "const fakeCache = new CommandsCache();"
+        + f"setTimeout(() => fakeCache.changed({{addedOrUpdated: {json.dumps(commands)}, removed: []}}), {delay_ms});"
+        + "("
+        + script.replace(
+            "import('/commands.bundle.js')", "Promise.resolve({commandsCache: fakeCache})"
+        )
+        + ").then(r => console.log(JSON.stringify({ok: r, calls: fakeCache.calls})),"
+        + " e => console.log(JSON.stringify({error: String(e)})));"
+    )
+    out = subprocess.run(
+        ["node", "-e", harness], capture_output=True, text=True, timeout=30
+    )
+    return json.loads(out.stdout.strip().splitlines()[-1])
+
+
+@requires_node
+def test_shortcut_script_waits_for_the_command_list(monkeypatch):
+    """Brave 1.98.60: run before the first `changed` event, the script threw
+    "Cannot read properties of undefined (reading 'accelerators')" and the
+    whole [shortcuts] table went offline -- one more Brave restart."""
+    back = str(shortcuts_mod.NAME_TO_ID["back"])
+    keys = ["Alt+KeyH", "Meta+BracketLeft", "Alt+ArrowLeft"]
+    before = {"brave": {"accelerators": {back: keys}, "default_accelerators": {}}}
+    target = {
+        "brave": {
+            "accelerators": {back: [*keys, "Shift+ArrowLeft"]},
+            "default_accelerators": {},
+        }
+    }
+    script, _ = live._shortcut_script(before, target, set())
+    commands = {
+        back: {"id": int(back), "accelerators": [{"codes": k, "keys": k} for k in keys]}
+    }
+
+    result = _run_with_late_command_list(script, commands, delay_ms=400)
+
+    assert result == {"ok": True, "calls": [["assign", int(back), "Shift+ArrowLeft"]]}
+
+
+@requires_node
+def test_shortcut_script_names_a_command_the_page_does_not_list():
+    back = str(shortcuts_mod.NAME_TO_ID["back"])
+    forward = str(shortcuts_mod.NAME_TO_ID["forward"])
+    before = {"brave": {"accelerators": {}, "default_accelerators": {}}}
+    target = {"brave": {"accelerators": {forward: ["Alt+KeyL"]}, "default_accelerators": {}}}
+    script, _ = live._shortcut_script(before, target, set())
+
+    result = _run_with_late_command_list(
+        script, {back: {"id": int(back), "accelerators": []}}, delay_ms=0
+    )
+
+    assert "error" in result and f"command {forward} is not in" in result["error"]
+
+
+@requires_node
+def test_shortcuts_preflight_waits_for_the_command_list():
+    result = _run_with_late_command_list(
+        live._shortcuts_preflight_script(), {"1": {"id": 1, "accelerators": []}}, 300
+    )
+
+    assert result["ok"] == []

@@ -291,10 +291,16 @@ Preserve these contracts unless a change explicitly redesigns them:
    Chromium started there exits in 0.16s ("Missing X server or
    $DISPLAY") -- the relaunch and the reopen both died while dotbrave
    printed `was reopened`. So `find_main_cmdline` also captures the
-   session variables, the relaunch fills in whichever this shell lacks
-   (never overriding one it has), and `relaunch_blocker`
-   (`close_blocker_fn`) refuses every close, before anything is written,
-   when no source has a display. **Not from the browser's own
+   session variables, the relaunch takes the display-identity set
+   (`_DISPLAY_IDENTITY_KEYS`) whole from that session, and
+   `relaunch_blocker` (`close_blocker_fn`) refuses every close, before
+   anything is written, when no source has a display. Whole, not "fill
+   what the shell lacks" (0.7.1/0.7.2): `--ozone-platform-hint=auto`
+   picks Wayland over a reachable X11 only when `XDG_SESSION_TYPE` is
+   `wayland`, so a borrowed `WAYLAND_DISPLAY` beside the agent shell's
+   own `XDG_SESSION_TYPE=tty` brought Brave back blurry on XWayland. A
+   non-graphical session type is inferred from the display, never copied:
+   a Brave relaunched that way carries `tty` in its own session. **Not from the browser's own
    `/proc/<pid>/environ`:** Chromium's setproctitle overwrites that
    memory, and on Brave 1.98 it reads back as 14 KB of NULs in the main
    process and every child. 0.7.1 read it, took `{}` for "headless", and
@@ -340,7 +346,15 @@ Preserve these contracts unless a change explicitly redesigns them:
    running command line. The third exists because Brave only writes
    `DevToolsActivePort` for a *dynamic* port (`=0`) — verified on macOS
    and Linux — so a browser started on a fixed port reads as having no
-   endpoint and gets closed for nothing.
+   endpoint and gets closed for nothing. A recorded port gets
+   `_RECORDED_PORT_PROBES` probes, not one: a single 0.5s miss from a
+   busy browser is all it takes to turn a live apply into a restart.
+
+   The shortcuts page fills `commandsCache` from an async mojo callback,
+   and brave-core's `assignAccelerator` dereferences
+   `this.cache[id].accelerators` -- a script run right after navigate threw
+   on Brave 1.98.60 and sent `[shortcuts]` offline, a second restart. Both
+   the preflight and the script wait for `connected` first.
 
    The work tab itself carries no profile guarantee: `PUT /json/new`
    creates it via upstream's `ChromeDevToolsManagerDelegate::CreateNewTarget`,

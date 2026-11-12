@@ -17,6 +17,21 @@ from dotbrave import shortcuts as shortcuts_mod
 
 _SETTINGS_URL = "chrome://settings/appearance"
 _SHORTCUTS_URL = "chrome://settings/system/shortcuts"
+# The shortcuts page fills `commandsCache` from an async mojo listener
+# callback, so right after navigate its cache can still be `{}` -- and
+# brave-core's assignAccelerator dereferences `this.cache[id].accelerators`.
+# Measured on Brave 1.98.60, intermittently: "TypeError: Cannot read
+# properties of undefined (reading 'accelerators')".  `connected` turns true
+# on the first `changed` event; a non-empty cache covers builds without it.
+_COMMANDS_READY_JS = (
+    "const commandsReady = async (c) => {"
+    "for (let i = 0; i < 100; i++) {"
+    "if (c.connected === true || Object.keys(c.cache || {}).length) return true;"
+    "await new Promise(r => setTimeout(r, 50));"
+    "}"
+    "return false;"
+    "};"
+)
 _NEWTAB_URL = "chrome://newtab/"
 _VERSION_URL = "chrome://version/"
 _NEWTAB_ACTIONS = {
@@ -499,12 +514,17 @@ def _shortcut_script(
     return (
         "(async () => {"
         "const m = await import('/commands.bundle.js');"
+        f"{_COMMANDS_READY_JS}"
+        "if (!(await commandsReady(m.commandsCache))) "
+        "throw new Error('the shortcuts page never loaded its command list');"
         f"const desiredByCommand = {desired_json};"
         "const commandCache = m.commandsCache.cache || {};"
         "for (const [cidText, desired] of Object.entries(desiredByCommand)) {"
         "const cid = Number(cidText);"
         "const command = commandCache[cidText] || commandCache[cid];"
-        "const current = (command?.accelerators || [])"
+        "if (!command) "
+        "throw new Error('command ' + cidText + ' is not in the command list');"
+        "const current = (command.accelerators || [])"
         ".map(a => a.codes || a.keys).filter(Boolean);"
         "for (const key of current) {"
         "if (!desired.includes(key)) "
@@ -641,6 +661,8 @@ def _shortcuts_preflight_script() -> str:
         "const c = m.commandsCache;"
         "if (!c || typeof c.assignAccelerator !== 'function' "
         "|| typeof c.unassignAccelerator !== 'function') return ['shortcuts'];"
+        f"{_COMMANDS_READY_JS}"
+        "if (!(await commandsReady(c))) return ['shortcuts'];"
         "return [];"
         "} catch (e) { return ['shortcuts']; }"
         "})()"

@@ -58,6 +58,30 @@ def test_live_port_from_cmdline_ignores_a_dead_port(monkeypatch):
     )
 
 
+def test_a_recorded_port_survives_one_slow_probe(monkeypatch, tmp_path):
+    """Một lần probe 0,5 giây là thứ duy nhất ngăn giữa "dùng endpoint" và
+    "đóng rồi mở lại Brave" (cướp focus). Port đã được ghi lại -- sidecar
+    hay cmdline -- phải được hỏi thêm vài lần trước khi bị coi là chết."""
+    answers = iter([False, False, True])
+    monkeypatch.setattr(cdp, "devtools_endpoint_alive", lambda port: next(answers))
+    cdp.remember_devtools_port(tmp_path, "Default", 8123)
+
+    assert cdp.find_devtools_port(tmp_path, "Default") == 8123
+
+
+def test_a_dead_recorded_port_is_given_up_after_the_retries(monkeypatch):
+    calls: list[int] = []
+    monkeypatch.setattr(
+        cdp, "devtools_endpoint_alive", lambda port: calls.append(port) or False
+    )
+
+    assert (
+        cdp.live_port_from_cmdline(lambda: [MAC_EXE, "--remote-debugging-port=8123"])
+        is None
+    )
+    assert calls == [8123] * cdp._RECORDED_PORT_PROBES
+
+
 def test_live_port_from_cmdline_skips_a_dynamic_port(monkeypatch):
     """`--remote-debugging-port=0` nghĩa là số thật nằm ở DevToolsActivePort."""
     monkeypatch.setattr(cdp, "devtools_endpoint_alive", lambda port: True)
