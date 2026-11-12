@@ -444,21 +444,35 @@ def test_only_a_headless_command_line_exempts_a_browser_without_display(
     assert proc.relaunch_blocker() is None
 
 
-@on_linux
 def test_session_env_comes_from_the_launcher_when_the_browser_is_blank(
     monkeypatch,
 ):
     """Brave đọc ra rỗng (setproctitle): lấy từ tiến trình cha gần nhất có
-    display."""
-    me, parent = str(os.getpid()), str(os.getppid())
-    envs = {me: {}, parent: {"WAYLAND_DISPLAY": "wayland-9"}}
+    display. Cây tiến trình giả hoàn toàn -- trong sandbox build của Nix,
+    cha của pytest là pid 1 và uid là nixbld."""
+    parents = {"300": "200", "200": "100", "100": "1"}
+    owners = {"300", "200"}
+    envs = {"300": {}, "200": {"WAYLAND_DISPLAY": "wayland-9"}, "100": {}}
+    monkeypatch.setattr(process_mod, "_parent_pid", parents.get)
+    monkeypatch.setattr(process_mod, "_owned_by_us", lambda pid: pid in owners)
     monkeypatch.setattr(
         process_mod, "_read_session_env", lambda pid: envs.get(pid, {})
     )
 
-    assert process_mod._find_session_env(me) == {"WAYLAND_DISPLAY": "wayland-9"}
-    envs[parent] = {"XDG_SESSION_TYPE": "wayland"}
-    assert process_mod._find_session_env(me) is None
+    assert process_mod._find_session_env("300") == {"WAYLAND_DISPLAY": "wayland-9"}
+
+    # Không ancestor nào có display, hoặc display nằm sau một tiến trình
+    # của user khác / sau pid 1: không đoán.
+    envs["200"] = {"XDG_SESSION_TYPE": "wayland"}
+    assert process_mod._find_session_env("300") is None
+    envs["100"] = {"WAYLAND_DISPLAY": "wayland-0"}
+    assert process_mod._find_session_env("300") is None, "100 is not ours"
+    owners.add("100")
+    assert process_mod._find_session_env("300") == {"WAYLAND_DISPLAY": "wayland-0"}
+    parents["100"] = "1"
+    envs["1"] = {"WAYLAND_DISPLAY": "wayland-1"}
+    envs["100"] = {}
+    assert process_mod._find_session_env("300") is None, "never past pid 1"
 
 
 @on_linux

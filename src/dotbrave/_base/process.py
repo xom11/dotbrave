@@ -207,6 +207,13 @@ def _parent_pid(pid: str) -> str | None:
     return fields[1] if len(fields) > 1 else None
 
 
+def _owned_by_us(pid: str) -> bool:
+    try:
+        return os.stat(f"/proc/{pid}").st_uid == os.getuid()
+    except OSError:
+        return False
+
+
 def _find_session_env(pid: str) -> dict[str, str] | None:
     """Session variables of the nearest process, from ``pid`` up, that has
     a display; ``None`` when no process of ours on the way up has one.
@@ -218,14 +225,8 @@ def _find_session_env(pid: str) -> dict[str, str] | None:
     environment Brave was started with -- nixpkgs' ``.brave-wrapped``
     stays alive as the parent, as does a terminal or an app launcher.
     """
-    uid = os.getuid()
     for _ in range(32):
-        if pid in ("", "0", "1"):
-            return None
-        try:
-            if os.stat(f"/proc/{pid}").st_uid != uid:
-                return None
-        except OSError:
+        if pid in ("", "0", "1") or not _owned_by_us(pid):
             return None
         env = _read_session_env(pid)
         if env and (env.get("WAYLAND_DISPLAY") or env.get("DISPLAY")):
