@@ -231,16 +231,28 @@ def _partial_note(applied: list[str], pending: list[Plan]) -> str:
     return f"{right} not applied"
 
 
-def _policy_pickup_note() -> str:
+def _policy_pickup_note(namespaces: tuple[str, ...] = ("pwa",)) -> str:
     """When a running browser sees a new policy -- measured, not assumed.
     Linux: launchers appeared or vanished 6-51s after the file changed.
     Windows: a new entry installed itself at t+580s. macOS: a running
-    browser never reloads it (invariant 4)."""
+    browser never reloads it (invariant 4).
+
+    Those timings are [pwa]'s. BraveShieldsDisabledForUrls is not
+    dynamically refreshable: a running Brave 1.98 on Linux re-read the
+    file and listed it on brave://policy as "Restart required", so a
+    pickup promise must not cover [shields]."""
     if sys.platform == "darwin":
         return "loaded at its next launch"
-    if sys.platform == "win32":
-        return "a running one picks it up in about ten minutes"
-    return "a running one picks it up within a minute"
+    if "pwa" in namespaces:
+        note = (
+            "a running one picks it up in about ten minutes"
+            if sys.platform == "win32"
+            else "a running one picks it up within a minute"
+        )
+        if "shields" in namespaces:
+            note += "; [shields] takes full effect after a Brave restart"
+        return note
+    return "[shields] takes full effect after a Brave restart"
 
 
 def _warn(message: str) -> None:
@@ -515,9 +527,10 @@ def cmd_apply(
             write_state_files(plans if not browser_bound else external)
             applied_external = [f"[{p.namespace}]" for p in external]
             names = ", ".join(applied_external)
+            note = _policy_pickup_note(tuple(p.namespace for p in external))
             print(
                 f"ok -- {names} applied without touching the "
-                f"running {display_name} ({_policy_pickup_note()})"
+                f"running {display_name} ({note})"
             )
             if not browser_bound:
                 # The whole story: nothing needs the browser.

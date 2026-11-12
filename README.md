@@ -213,9 +213,12 @@ dotbrave apply brave.toml              # live apply if Brave is running
   (messenger.com signing in through facebook.com). Pattern syntax is
   Brave's to judge: a bad one shows up as an error on `brave://policy`.
   Same storage and privileges as `[pwa]`: on macOS it is merged into the
-  same managed plist (and loaded at Brave's next launch), on Linux it is
-  its own `/etc/brave/policies/managed/dotbrave-shields.json`, on Windows
+  same managed plist, on Linux it is its own
+  `/etc/brave/policies/managed/dotbrave-shields.json`, on Windows
   `HKLM\Software\Policies\BraveSoftware\Brave\BraveShieldsDisabledForUrls`.
+  Unlike `[pwa]` it is not dynamically refreshable: a running Brave 1.98 on
+  Linux re-read the file within a minute but listed the policy on
+  `brave://policy` as *Restart required*. Restart Brave after changing it.
 - **Empty header** (e.g. `[settings]` with no entries) wipes everything
   dotbrave previously managed in that namespace. **Missing header** = skip
   the namespace entirely.

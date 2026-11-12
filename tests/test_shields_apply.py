@@ -232,3 +232,36 @@ def test_export_block_only_when_policy_non_empty(
     assert shields.build_dump_block() == [
         "[shields]", "disabled = [", '  "[*.]a.com",', "]",
     ]
+
+
+@pytest.mark.parametrize("plat", ["linux", "win32"])
+def test_pickup_note_never_promises_live_pickup_for_shields(monkeypatch, plat) -> None:
+    """Measured on Brave 1.98 / Linux: the running browser listed the new
+    BraveShieldsDisabledForUrls as "Restart required". The [pwa] timings
+    must not be printed as if they covered it."""
+    from dotbrave._base import orchestrator as orch
+
+    monkeypatch.setattr(orch.sys, "platform", plat)
+    assert "picks it up" in orch._policy_pickup_note(("pwa",))
+    assert "restart" not in orch._policy_pickup_note(("pwa",))
+    only = orch._policy_pickup_note(("shields",))
+    assert "picks it up" not in only and "restart" in only
+    both = orch._policy_pickup_note(("pwa", "shields"))
+    assert "picks it up" in both and "[shields] takes full effect after a Brave restart" in both
+
+
+def test_running_brave_apply_asks_for_the_shields_note(
+    profile_root: Path, policy: dict, tmp_path: Path, monkeypatch, capsys,
+) -> None:
+    from dotbrave._base import orchestrator as orch
+
+    asked: list = []
+    real = orch._policy_pickup_note
+    monkeypatch.setattr(
+        orch, "_policy_pickup_note", lambda ns=("pwa",): asked.append(ns) or real(ns)
+    )
+    monkeypatch.setattr(brave_pkg, "brave_running", lambda: True)
+    _apply(profile_root, _config(tmp_path, '[shields]\ndisabled = ["[*.]a.com"]\n'))
+
+    assert asked == [("shields",)]
+    assert "[shields] applied without touching the running Brave" in capsys.readouterr().out
