@@ -573,3 +573,79 @@ def test_darwin_write_notifies_running_browser_after_daemon_update(
     pwa.sudo_write_policy(policy_file, "", [])
 
     assert events == ["install", "notify", "remove", "notify"]
+
+
+def test_macos_daemon_current_detects_stale_heal_script(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    support = tmp_path / "support"
+    launchd = tmp_path / "launchd"
+    support.mkdir()
+    launchd.mkdir()
+    monkeypatch.setattr(pwa, "_MACOS_SUPPORT_DIR", support)
+    monkeypatch.setattr(pwa, "_MACOS_LAUNCHD_DIR", launchd)
+
+    policy_file = tmp_path / "com.brave.Browser.plist"
+    raw = plistlib.dumps({pwa.POLICY_KEY: [{"url": "https://a/"}]})
+    policy_file.write_bytes(raw)
+    source, heal = pwa.macos_support_paths(policy_file)
+    daemon = pwa.macos_daemon_path(policy_file)
+    source.write_bytes(raw)
+    daemon.write_bytes(
+        pwa.build_launchd_plist(
+            pwa.macos_daemon_label(policy_file), heal, pwa._MACOS_WATCH_DIR
+        )
+    )
+    heal.write_text("#!/bin/sh\n# stale 0.8.1 heal\n")
+    assert pwa.macos_daemon_current(policy_file) is False
+
+    heal.write_text(pwa.build_heal_script(source, policy_file))
+    assert pwa.macos_daemon_current(policy_file) is True
+
+
+def test_matching_policy_with_stale_macos_daemon_refreshes_and_notifies(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """When 0.8.1 already wrote the new URL into the plist without waking the
+    running browser, 0.8.2 sees a matching plist + stale heal.sh, refreshes
+    the daemon, and calls notify_darwin_policy_changed without rewriting the
+    policy twice."""
+    _force_darwin(monkeypatch)
+    policy_file = tmp_path / "com.brave.Browser.plist"
+    entries = [pwa.entry_for("https://calendar.google.com/", "Google Calendar")]
+    raw = plistlib.dumps({pwa.POLICY_KEY: entries})
+    policy_file.write_bytes(raw)
+
+    refreshed: list[Path] = []
+    heal = pwa.LauncherHeal(
+        current=lambda: False,
+        present=lambda: True,
+        install=lambda: refreshed.append(policy_file),
+        remove=lambda: None,
+        label="self-healing daemon (launchd org.dotbrave.com.brave.Browser.pwa)",
+        needs_escalation=True,
+        skip_when_policy_dirty=True,
+    )
+    prefs_dir = tmp_path / "Default"
+    prefs_dir.mkdir()
+    prefs_path = prefs_dir / "Preferences"
+    prefs_path.write_text("{}")
+
+    writes: list = []
+    plan = pwa.plan_apply(
+        pwa.PwaConfig("brave", "", str(policy_file), ""),
+        policy_file,
+        writes.append,
+        lambda: {"https://calendar.google.com/": entries[0]},
+        prefs_path,
+        {},
+        {"urls": [{"url": "https://calendar.google.com/", "name": "Google Calendar"}]},
+        heal,
+        None,
+    )
+    assert not plan.empty
+    assert plan.requires_escalation is True
+    assert any("self-healing daemon" in line for line in plan.diff_lines)
+    plan.external_apply_fn()
+    assert writes == []
+    assert refreshed == [policy_file]

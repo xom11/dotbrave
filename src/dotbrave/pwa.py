@@ -108,14 +108,37 @@ _BUNDLE_CHANNEL = {
 
 
 def _launcher_heal() -> _base.LauncherHeal | None:
-    if not sys.platform.startswith("linux"):
-        return None
-    return _base.LauncherHeal(
-        current=lambda: _base.linux_heal_current(_base.linux_heal_paths()),
-        present=lambda: _base.linux_heal_present(_base.linux_heal_paths()),
-        install=lambda: _base.install_linux_launcher_heal(_base.linux_heal_paths()),
-        remove=lambda: _base.remove_linux_launcher_heal(_base.linux_heal_paths()),
-    )
+    if sys.platform.startswith("linux"):
+        return _base.LauncherHeal(
+            current=lambda: _base.linux_heal_current(_base.linux_heal_paths()),
+            present=lambda: _base.linux_heal_present(_base.linux_heal_paths()),
+            install=lambda: _base.install_linux_launcher_heal(_base.linux_heal_paths()),
+            remove=lambda: _base.remove_linux_launcher_heal(_base.linux_heal_paths()),
+        )
+    if sys.platform == "darwin" and POLICY_FILE is not None:
+        pf = POLICY_FILE
+
+        def _remove_darwin() -> None:
+            _base.remove_self_healing_daemon(pf)
+            _base.notify_darwin_policy_changed(pf)
+
+        return _base.LauncherHeal(
+            current=lambda: _base.macos_daemon_current(pf),
+            present=lambda: (
+                _base.macos_daemon_present(pf)
+                and not any(
+                    _read_existing_payload().get(k)
+                    for k in MANAGED_POLICY_KEYS
+                    if k != POLICY_KEY
+                )
+            ),
+            install=lambda: _base.refresh_macos_daemon(pf),
+            remove=_remove_darwin,
+            label=f"self-healing daemon (launchd {_base.macos_daemon_label(pf)})",
+            needs_escalation=True,
+            skip_when_policy_dirty=True,
+        )
+    return None
 
 
 def _launcher_cleanup(

@@ -244,6 +244,44 @@ def remove_self_healing_daemon(policy_file: Path) -> None:
         subprocess.run(["sudo", "rm", "-f", str(p)], check=False)
 
 
+def macos_daemon_current(policy_file: Path) -> bool:
+    """True when the installed source plist, heal script, and LaunchDaemon
+    plist all match what this version of dotbrave would write."""
+    source_plist, heal_script = macos_support_paths(policy_file)
+    daemon_path = macos_daemon_path(policy_file)
+    label = macos_daemon_label(policy_file)
+    try:
+        if not policy_file.is_file():
+            return False
+        if source_plist.read_bytes() != policy_file.read_bytes():
+            return False
+        if heal_script.read_text(encoding="utf-8") != build_heal_script(
+            source_plist, policy_file
+        ):
+            return False
+        if daemon_path.read_bytes() != build_launchd_plist(
+            label, heal_script, _MACOS_WATCH_DIR
+        ):
+            return False
+    except OSError:
+        return False
+    return True
+
+
+def macos_daemon_present(policy_file: Path) -> bool:
+    source_plist, heal_script = macos_support_paths(policy_file)
+    daemon_path = macos_daemon_path(policy_file)
+    return any(p.exists() for p in (daemon_path, heal_script, source_plist))
+
+
+def refresh_macos_daemon(policy_file: Path) -> None:
+    """Upgrade a stale macOS self-healing daemon in place and wake a running
+    browser so any policy entries written by an older dotbrave take effect."""
+    content = policy_file.read_bytes()
+    install_self_healing_daemon(policy_file, content)
+    notify_darwin_policy_changed(policy_file)
+
+
 # How long the transient per-user plist stays on disk so Chromium's kqueue
 # watcher opens a descriptor on it before the unlink fires NOTE_DELETE.
 # Zeroed in tests/conftest.py so unit tests do not sleep.
@@ -644,13 +682,16 @@ def remove_linux_launcher_heal(paths: LinuxHealPaths) -> None:
 
 @dataclass(frozen=True)
 class LauncherHeal:
-    """The Linux launcher heal as ``plan_apply`` sees it, injected by the
+    """Platform heal/daemon check as ``plan_apply`` sees it, injected by the
     browser wrapper so tests can fake it."""
 
     current: Callable[[], bool]
     present: Callable[[], bool]
     install: Callable[[], None]
     remove: Callable[[], None]
+    label: str = f"launcher heal (systemd --user {_LINUX_HEAL_UNIT}.path)"
+    needs_escalation: bool = False
+    skip_when_policy_dirty: bool = False
 
 
 @dataclass(frozen=True)
@@ -1421,13 +1462,18 @@ def plan_apply(
     removed_entries = {u: current[u] for u in set(current) - set(target_urls)}
 
     heal_action = None
-    if launcher_heal is not None:
+    heal_escalates = False
+    if launcher_heal is not None and not (
+        policy_dirty and launcher_heal.skip_when_policy_dirty
+    ):
         if target_urls and not launcher_heal.current():
             heal_action = launcher_heal.install
-            diff.append(f"  + launcher heal (systemd --user {_LINUX_HEAL_UNIT}.path)")
+            heal_escalates = launcher_heal.needs_escalation
+            diff.append(f"  + {launcher_heal.label}")
         elif not target_urls and launcher_heal.present():
             heal_action = launcher_heal.remove
-            diff.append(f"  - launcher heal (systemd --user {_LINUX_HEAL_UNIT}.path)")
+            heal_escalates = launcher_heal.needs_escalation
+            diff.append(f"  - {launcher_heal.label}")
 
     orphan_lines = (
         launcher_cleanup.orphan_diff() if launcher_cleanup is not None else []
@@ -1474,7 +1520,7 @@ def plan_apply(
         apply_fn=apply_fn,
         verify_fn=verify_fn,
         external_apply_fn=external_apply_fn,
-        needs_escalation=policy_dirty,
+        needs_escalation=policy_dirty or heal_escalates,
     )
 
 
