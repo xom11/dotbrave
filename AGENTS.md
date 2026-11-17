@@ -203,13 +203,28 @@ Preserve these contracts unless a change explicitly redesigns them:
    LaunchDaemon (`org.dotbrave.<bundle>.pwa`) installed during the same
    privileged write; an empty `[pwa]` table removes the daemon and its
    support files. Keep `build_heal_script`/`build_launchd_plist` pure and
-   `install_self_healing_daemon`/`remove_self_healing_daemon` patchable.
+   `install_self_healing_daemon`/`remove_self_healing_daemon`/`notify_darwin_policy_changed`
+   patchable.
+   Live pickup on macOS requires two things beyond writing the plist:
+   `sudo killall cfprefsd` does not bump `cfprefsd`'s shared-memory
+   generation counter (so Brave's in-process `CFPrefsManagedSource` kept
+   returning its startup cache), and Chromium's `PolicyLoaderMac` watches
+   `/Library/Managed Preferences/<getlogin()>/<bundle>.plist` (`root` for
+   `launchd` GUI launches, `$USER` for terminal launches) via kqueue rather
+   than the machine-level plist. `notify_darwin_policy_changed` (and
+   `data/heal.sh`) therefore flushes the domain via CoreFoundation's
+   `_CFPreferencesManagementStatusChangedForDomains` +
+   `_CFPreferencesFlushCachesForIdentifier`, then transiently creates and
+   unlinks an empty binary plist at those per-login paths (0.15s) to fire
+   `NOTE_DELETE` and skip `AsyncPolicyLoader`'s 5s settle interval without
+   leaving files behind (measured on Brave 1.99: install in ~2.0s,
+   uninstall in ~0.5s; pre-existing MDM per-user plists are only touched).
    Two contracts defend the policy file against macOS itself. Some boots
    run a `ManagedClient` reconcile that unlinks the orphan plist from
    `/Library/Managed Preferences` (observed ~28s in; not every boot, and
    not on every machine), and a browser auto-started as a login item that
-   reads the empty policy first will uninstall every managed PWA and never
-   reload the policy while running. So: `ThrottleInterval` stays pinned to
+   reads the empty policy first will uninstall every managed PWA before a
+   later heal can restore it. So: `ThrottleInterval` stays pinned to
    1 -- launchd's 10s default loses that race -- with `StartInterval` as
    the dropped-notification safety net; and the policy file carries `schg`,
    which makes the reconcile's `unlink` fail outright. `schg` also blocks
@@ -380,8 +395,8 @@ Preserve these contracts unless a change explicitly redesigns them:
    `[pwa]` never touches the
    running browser and is never gated on what else is dirty: the policy
    is written first and directly (no endpoint bootstrap), and a running
-   Brave picks it up by itself on Linux and Windows (macOS: next launch;
-   `_policy_pickup_note`). Gating it on "the diff contains nothing but
+   Brave picks it up by itself on macOS, Linux, and Windows
+   (`_policy_pickup_note`). Gating it on "the diff contains nothing but
    `[pwa]`" made one dirty `[shortcuts]` drop the policy on every
    `--unattended` run, and permanently -- `[shortcuts]` is only cleaned
    by an apply with Brave closed, which `--unattended` never performs.

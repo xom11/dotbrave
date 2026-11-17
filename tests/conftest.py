@@ -34,8 +34,10 @@ def _desktop_session(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(orchestrator, "_REOPEN_GRACE_S", 0.0)
     monkeypatch.setattr(orchestrator, "_PREVIOUS_EXIT_TIMEOUT_S", 0.0)
     from dotbrave._base import cdp
+    from dotbrave._base import pwa as base_pwa
 
     monkeypatch.setattr(cdp, "_RECORDED_PORT_RETRY_S", 0.0)
+    monkeypatch.setattr(base_pwa, "_DARWIN_WATCHER_POKE_S", 0.0)
 
 
 @pytest.fixture

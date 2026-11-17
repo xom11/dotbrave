@@ -233,22 +233,22 @@ def _partial_note(applied: list[str], pending: list[Plan]) -> str:
 
 def _policy_pickup_note(namespaces: tuple[str, ...] = ("pwa",)) -> str:
     """When a running browser sees a new policy -- measured, not assumed.
-    Linux: launchers appeared or vanished 6-51s after the file changed.
-    Windows: a new entry installed itself at t+580s. macOS: a running
-    browser never reloads it (invariant 4).
+    macOS: .app shims appeared in ~2s and vanished in ~0.5s after flushing
+    cfprefsd's domain generation counter and poking PolicyLoaderMac's kqueue
+    watch path. Linux: launchers appeared or vanished 6-51s after the file
+    changed. Windows: a new entry installed itself at t+580s.
 
     Those timings are [pwa]'s. BraveShieldsDisabledForUrls is not
     dynamically refreshable: a running Brave 1.98 on Linux re-read the
     file and listed it on brave://policy as "Restart required", so a
     pickup promise must not cover [shields]."""
-    if sys.platform == "darwin":
-        return "loaded at its next launch"
     if "pwa" in namespaces:
-        note = (
-            "a running one picks it up in about ten minutes"
-            if sys.platform == "win32"
-            else "a running one picks it up within a minute"
-        )
+        if sys.platform == "darwin":
+            note = "a running one picks it up within a few seconds"
+        elif sys.platform == "win32":
+            note = "a running one picks it up in about ten minutes"
+        else:
+            note = "a running one picks it up within a minute"
         if "shields" in namespaces:
             note += "; [shields] takes full effect after a Brave restart"
         return note

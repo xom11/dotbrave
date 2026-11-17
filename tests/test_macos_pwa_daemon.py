@@ -468,3 +468,108 @@ def test_built_script_has_no_runtime_dependency_on_the_package() -> None:
 def test_heal_script_creates_its_log_directory() -> None:
     """LOG có thể nằm trong thư mục Nix chưa tạo."""
     assert 'mkdir -p "$(dirname "$LOG")"' in pwa.heal_script_source().read_text()
+
+
+def test_heal_script_flushes_cfprefs_domain_and_pokes_kqueue_watchers() -> None:
+    """`killall cfprefsd` alone does not bump cfprefsd's shared-memory
+    generation counter or fire PolicyLoaderMac's per-login kqueue watch."""
+    text = pwa.heal_script_source().read_text()
+    assert "_CFPreferencesManagementStatusChangedForDomains" in text
+    assert "_CFPreferencesFlushCachesForIdentifier" in text
+    assert 'plutil -create binary1 "$ufile"' in text
+    assert '/bin/rm -f "$f"' in text
+
+
+def test_darwin_watcher_logins_dedupes_and_filters_unsafe_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SUDO_USER", "alice")
+    monkeypatch.setenv("USER", "alice")
+    logins = pwa._darwin_watcher_logins()
+    assert logins[0] == "root"
+    assert logins.count("alice") == 1
+
+    monkeypatch.setenv("SUDO_USER", "../escape")
+    monkeypatch.setenv("USER", "..")
+    filtered = pwa._darwin_watcher_logins()
+    assert "../escape" not in filtered
+    assert ".." not in filtered
+
+
+def test_notify_darwin_policy_changed_flushes_cfprefs_and_transiently_pokes_watchers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    rec = _Recorder()
+    flushed: list[str] = []
+    monkeypatch.setattr(pwa.subprocess, "run", rec)
+    monkeypatch.setattr(pwa, "_darwin_flush_cfprefs", flushed.append)
+    monkeypatch.setattr(pwa, "_darwin_watcher_logins", lambda: ["root", "alice"])
+
+    policy_file = tmp_path / "com.brave.Browser.plist"
+    pwa.notify_darwin_policy_changed(policy_file)
+
+    assert flushed == ["com.brave.Browser"]
+    flat = [" ".join(c) for c in rec.calls]
+    for login in ("root", "alice"):
+        udir = tmp_path / login
+        ufile = udir / "com.brave.Browser.plist"
+        mkdir_idx = flat.index(f"sudo mkdir -p -m 0755 {udir}")
+        tee_idx = flat.index(f"sudo tee {ufile}")
+        chmod_idx = flat.index(f"sudo chmod 0644 {ufile}")
+        rm_idx = flat.index(f"sudo rm -f {ufile}")
+        rmdir_idx = flat.index(f"sudo rmdir {udir}")
+        assert mkdir_idx < tee_idx < chmod_idx < rm_idx < rmdir_idx
+
+
+def test_notify_darwin_policy_changed_preserves_existing_mdm_user_plist(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """An MDM profile may legitimately place a per-user managed plist under
+    ``/Library/Managed Preferences/<user>/``.  Touch it in place to wake
+    Chromium's watcher; never overwrite or unlink it."""
+    rec = _Recorder()
+    monkeypatch.setattr(pwa.subprocess, "run", rec)
+    monkeypatch.setattr(pwa, "_darwin_flush_cfprefs", lambda _b: None)
+    monkeypatch.setattr(pwa, "_darwin_watcher_logins", lambda: ["root", "alice"])
+
+    existing_dir = tmp_path / "alice"
+    existing_dir.mkdir()
+    existing_plist = existing_dir / "com.brave.Browser.plist"
+    mdm_bytes = plistlib.dumps({"HomepageLocation": "https://corp.example/"})
+    existing_plist.write_bytes(mdm_bytes)
+
+    policy_file = tmp_path / "com.brave.Browser.plist"
+    pwa.notify_darwin_policy_changed(policy_file)
+
+    flat = [" ".join(c) for c in rec.calls]
+    assert f"sudo touch {existing_plist}" in flat
+    assert f"sudo tee {existing_plist}" not in flat
+    assert f"sudo rm -f {existing_plist}" not in flat
+    assert f"sudo rmdir {existing_dir}" not in flat
+    assert existing_plist.read_bytes() == mdm_bytes
+
+
+def test_darwin_write_notifies_running_browser_after_daemon_update(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Notification creates and removes subdirectories in WatchPaths, so the
+    daemon must already be seeded (non-empty) or booted out (empty) before
+    the watcher poke runs."""
+    _force_darwin(monkeypatch)
+    monkeypatch.setattr(pwa.subprocess, "run", _Recorder())
+    events: list[str] = []
+    monkeypatch.setattr(
+        pwa, "install_self_healing_daemon", lambda pf, c: events.append("install")
+    )
+    monkeypatch.setattr(
+        pwa, "remove_self_healing_daemon", lambda pf: events.append("remove")
+    )
+    monkeypatch.setattr(
+        pwa, "notify_darwin_policy_changed", lambda pf: events.append("notify")
+    )
+
+    policy_file = tmp_path / "com.brave.Browser.plist"
+    pwa.sudo_write_policy(policy_file, "", [{"url": "https://a/"}])
+    pwa.sudo_write_policy(policy_file, "", [])
+
+    assert events == ["install", "notify", "remove", "notify"]

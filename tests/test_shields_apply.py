@@ -234,7 +234,7 @@ def test_export_block_only_when_policy_non_empty(
     ]
 
 
-@pytest.mark.parametrize("plat", ["linux", "win32"])
+@pytest.mark.parametrize("plat", ["linux", "darwin", "win32"])
 def test_pickup_note_never_promises_live_pickup_for_shields(monkeypatch, plat) -> None:
     """Measured on Brave 1.98 / Linux: the running browser listed the new
     BraveShieldsDisabledForUrls as "Restart required". The [pwa] timings

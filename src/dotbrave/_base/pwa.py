@@ -18,6 +18,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 import urllib.parse
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -241,6 +242,187 @@ def remove_self_healing_daemon(policy_file: Path) -> None:
     for p in (daemon_path, heal_script, source_plist,
               macos_heal_log(policy_file)):
         subprocess.run(["sudo", "rm", "-f", str(p)], check=False)
+
+
+# How long the transient per-user plist stays on disk so Chromium's kqueue
+# watcher opens a descriptor on it before the unlink fires NOTE_DELETE.
+# Zeroed in tests/conftest.py so unit tests do not sleep.
+_DARWIN_WATCHER_POKE_S = 0.15
+_EMPTY_BINARY_PLIST = plistlib.dumps({}, fmt=plistlib.FMT_BINARY)
+
+
+def _darwin_flush_cfprefs(bundle_id: str) -> None:
+    """Bump ``cfprefsd``'s shared-memory generation counter for ``bundle_id``.
+
+    ``sudo killall cfprefsd`` restarts the daemon without advancing its
+    shared-memory generation counter, so a running browser's in-process
+    ``CFPrefsManagedSource`` keeps returning the startup-cached plist even
+    after ``CFPreferencesAppSynchronize``.  ``ManagedClient`` invalidates
+    that cache via ``_CFPreferencesManagementStatusChangedForDomains`` and
+    ``_CFPreferencesFlushCachesForIdentifier``; calling them directly makes
+    the next ``CFPreferencesAppSynchronize`` inside Brave read the new file.
+    Best-effort so simulated darwin tests on Linux/Windows do not fail.
+    """
+    try:
+        import ctypes
+        import ctypes.util
+
+        lib_path = ctypes.util.find_library("CoreFoundation")
+        if not lib_path:
+            return
+        cf = ctypes.CDLL(lib_path)
+        cf.CFStringCreateWithCString.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_char_p,
+            ctypes.c_uint32,
+        ]
+        cf.CFStringCreateWithCString.restype = ctypes.c_void_p
+        cf.CFArrayCreate.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_long,
+            ctypes.c_void_p,
+        ]
+        cf.CFArrayCreate.restype = ctypes.c_void_p
+        cf.CFRelease.argtypes = [ctypes.c_void_p]
+        cf.CFRelease.restype = None
+        cf._CFPreferencesFlushCachesForIdentifier.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        cf._CFPreferencesFlushCachesForIdentifier.restype = None
+        cf._CFPreferencesManagementStatusChangedForDomains.argtypes = [
+            ctypes.c_void_p,
+        ]
+        cf._CFPreferencesManagementStatusChangedForDomains.restype = None
+
+        dom = cf.CFStringCreateWithCString(
+            None, bundle_id.encode("utf-8"), 0x08000100
+        )
+        if not dom:
+            return
+        try:
+            any_user = ctypes.c_void_p.in_dll(cf, "kCFPreferencesAnyUser")
+            cur_user = ctypes.c_void_p.in_dll(cf, "kCFPreferencesCurrentUser")
+            arr = (ctypes.c_void_p * 1)(dom)
+            cf_arr = cf.CFArrayCreate(None, arr, 1, None)
+            if cf_arr:
+                try:
+                    cf._CFPreferencesManagementStatusChangedForDomains(cf_arr)
+                finally:
+                    cf.CFRelease(cf_arr)
+            cf._CFPreferencesFlushCachesForIdentifier(dom, any_user)
+            cf._CFPreferencesFlushCachesForIdentifier(dom, cur_user)
+        finally:
+            cf.CFRelease(dom)
+    except Exception:  # noqa: BLE001 - best-effort; never abort a policy write
+        return
+
+
+def _darwin_watcher_logins() -> list[str]:
+    """Login names Chromium's ``PolicyLoaderMac::GetManagedPolicyPath`` may watch.
+
+    ``PolicyLoaderMac`` resolves ``/Library/Managed Preferences/<getlogin()>/<bundle>.plist``.
+    On macOS, GUI apps launched by ``launchd`` (Dock, Spotlight, Login Items)
+    report ``getlogin() == "root"``, while a browser started from a terminal
+    login session reports the user's own account name.
+    """
+    candidates: list[str | None] = [
+        "root",
+        os.environ.get("SUDO_USER"),
+        os.environ.get("USER"),
+    ]
+    try:
+        import pwd
+
+        getuid = getattr(os, "getuid", None)
+        if getuid is not None:
+            candidates.append(pwd.getpwuid(getuid()).pw_name)
+        console_uid = Path("/dev/console").stat().st_uid
+        if console_uid >= 501:
+            candidates.append(pwd.getpwuid(console_uid).pw_name)
+    except (ImportError, KeyError, OSError):
+        pass
+
+    out: list[str] = []
+    for name in candidates:
+        if (
+            isinstance(name, str)
+            and name
+            and "/" not in name
+            and "\\" not in name
+            and name not in {".", ".."}
+            and name not in out
+        ):
+            out.append(name)
+    return out
+
+
+def notify_darwin_policy_changed(policy_file: Path) -> None:
+    """Wake a running macOS browser so it reloads ``policy_file`` live.
+
+    After flushing ``cfprefsd``'s generation counter, transiently creates an
+    empty binary plist at ``<policy_dir>/<login>/<bundle>.plist`` so
+    ``FilePathWatcherKQueue`` opens a descriptor on the watched target, then
+    unlinks it ``_DARWIN_WATCHER_POKE_S`` later to fire ``NOTE_DELETE`` ->
+    ``AsyncPolicyLoader::Reload(false)``.  With the transient file already
+    gone when ``IsSafeToReload`` reads ``LastModificationTime()``, the null
+    mtime skips Chromium's 5-second ``kSettleInterval`` (measured on Brave
+    1.99: install in ~2.0s, uninstall in ~0.5s) and leaves ``policy_file``'s
+    directory clean.  Any pre-existing MDM per-user plist is touched in place
+    and never deleted.  Patchable in tests.
+    """
+    _darwin_flush_cfprefs(macos_bundle_id(policy_file))
+    managed_dir = policy_file.parent
+    plist_name = policy_file.name
+    created_files: list[Path] = []
+    created_dirs: list[Path] = []
+    for login in _darwin_watcher_logins():
+        user_dir = managed_dir / login
+        target = user_dir / plist_name
+        if target.exists():
+            subprocess.run(
+                ["sudo", "touch", str(target)],
+                check=False,
+                stderr=subprocess.DEVNULL,
+            )
+            continue
+        if not user_dir.exists():
+            created_dirs.append(user_dir)
+        subprocess.run(
+            ["sudo", "mkdir", "-p", "-m", "0755", str(user_dir)],
+            check=False,
+            stderr=subprocess.DEVNULL,
+        )
+        res = subprocess.run(
+            ["sudo", "tee", str(target)],
+            input=_EMPTY_BINARY_PLIST,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if res.returncode == 0:
+            subprocess.run(
+                ["sudo", "chmod", "0644", str(target)],
+                check=False,
+                stderr=subprocess.DEVNULL,
+            )
+            created_files.append(target)
+    if created_files:
+        if _DARWIN_WATCHER_POKE_S > 0:
+            time.sleep(_DARWIN_WATCHER_POKE_S)
+        for target in created_files:
+            subprocess.run(
+                ["sudo", "rm", "-f", str(target)],
+                check=False,
+                stderr=subprocess.DEVNULL,
+            )
+    for user_dir in created_dirs:
+        subprocess.run(
+            ["sudo", "rmdir", str(user_dir)],
+            check=False,
+            stderr=subprocess.DEVNULL,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1198,15 +1380,10 @@ def sudo_write_policy(
     if sys.platform == "darwin":
         if keep:
             _darwin_set_immutable(policy_file)
-        subprocess.run(
-            ["sudo", "killall", "cfprefsd"],
-            check=False,
-            stderr=subprocess.DEVNULL,
-        )
-        if keep:
             install_self_healing_daemon(policy_file, content)
         else:
             remove_self_healing_daemon(policy_file)
+        notify_darwin_policy_changed(policy_file)
 
 
 def plan_apply(
