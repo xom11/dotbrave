@@ -34,23 +34,57 @@ _COMMANDS_READY_JS = (
 )
 _NEWTAB_URL = "chrome://newtab/"
 _VERSION_URL = "chrome://version/"
-_NEWTAB_ACTIONS = {
-    "ntp.shortcust_visible": ("topSites", "setShowTopSites"),
-    "brave.brave_search.show-ntp-search": ("search", "setShowSearchBox"),
-    "brave.brave_search.show-ntp-chat": ("search", "setShowChatInput"),
+_NEWTAB_ACTIONS: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = {
+    "ntp.shortcust_visible": ("topSites", ("setShowTopSites",), ("showTopSites",)),
+    "brave.brave_search.show-ntp-search": (
+        "search",
+        ("setShowSearchBox",),
+        ("showSearchBox",),
+    ),
+    "brave.brave_search.show-ntp-chat": (
+        "search",
+        ("setShowChatInput",),
+        ("showChatInput",),
+    ),
     "brave.new_tab_page.show_background_image": (
         "background",
-        "setBackgroundsEnabled",
+        ("setBackgroundsEnabled",),
+        ("backgroundsEnabled",),
     ),
+    # Brave's refreshed NTP renamed `setSponsoredImagesEnabled` /
+    # `sponsoredImagesEnabled` to `setNewTabTakeoversEnabled` /
+    # `newTabTakeoversEnabled` (`background_store.ts`); probe both so older
+    # and current Brave releases both apply live.
     "brave.new_tab_page.show_branded_background_image": (
         "background",
-        "setSponsoredImagesEnabled",
+        ("setNewTabTakeoversEnabled", "setSponsoredImagesEnabled"),
+        ("newTabTakeoversEnabled", "sponsoredImagesEnabled"),
     ),
-    "brave.new_tab_page.show_clock": ("newTab", "setShowClock"),
-    "brave.new_tab_page.show_stats": ("newTab", "setShowShieldsStats"),
-    "brave.new_tab_page.show_rewards": ("rewards", "setShowRewardsWidget"),
-    "brave.new_tab_page.show_brave_vpn": ("vpn", "setShowVpnWidget"),
-    "brave.new_tab_page.show_together": ("newTab", "setShowTalkWidget"),
+    "brave.new_tab_page.show_clock": (
+        "newTab",
+        ("setShowClock",),
+        ("showClock",),
+    ),
+    "brave.new_tab_page.show_stats": (
+        "newTab",
+        ("setShowShieldsStats",),
+        ("showShieldsStats",),
+    ),
+    "brave.new_tab_page.show_rewards": (
+        "rewards",
+        ("setShowRewardsWidget",),
+        ("showRewardsWidget",),
+    ),
+    "brave.new_tab_page.show_brave_vpn": (
+        "vpn",
+        ("setShowVpnWidget",),
+        ("showVpnWidget",),
+    ),
+    "brave.new_tab_page.show_together": (
+        "newTab",
+        ("setShowTalkWidget",),
+        ("showTalkWidget",),
+    ),
 }
 
 
@@ -571,40 +605,60 @@ def _settings_script(changes: list[tuple[str, Any]]) -> str | None:
 
 def _route_settings(
     changes: list[tuple[str, Any]],
-) -> tuple[list[tuple[str, str, str, Any]], list[tuple[str, Any]]]:
-    newtab: list[tuple[str, str, str, Any]] = []
+) -> tuple[
+    list[tuple[str, str, tuple[str, ...], tuple[str, ...], Any]],
+    list[tuple[str, Any]],
+]:
+    newtab: list[tuple[str, str, tuple[str, ...], tuple[str, ...], Any]] = []
     ordinary: list[tuple[str, Any]] = []
     for key, value in changes:
         route = _NEWTAB_ACTIONS.get(key)
         if route is None:
             ordinary.append((key, value))
             continue
-        store, action = route
-        newtab.append((key, store, action, value))
+        store, actions, props = route
+        newtab.append((key, store, actions, props, value))
     return newtab, ordinary
 
 
-def _newtab_preflight_script(changes: list[tuple[str, str, str, Any]]) -> str | None:
+def _newtab_preflight_script(
+    changes: list[tuple[str, str, tuple[str, ...], tuple[str, ...], Any]],
+) -> str | None:
     if not changes:
         return None
     routes = [
-        {"key": key, "store": store, "action": action}
-        for key, store, action, _value in changes
+        {"key": key, "store": store, "actions": list(actions), "props": list(props)}
+        for key, store, actions, props, _value in changes
     ]
     routes_json = json.dumps(routes, separators=(",", ":"))
+    # Each NTP store starts with `initialized: false` and dummy boolean fields
+    # until its Mojo `loadData()` resolves (`browser_new_tab_store.ts`), so wait
+    # for hydration before trusting the state's boolean as the prior value.  If
+    # the store has actions but stays unhydrated past the poll budget, still
+    # report `supported: true` (omitting `value`) so the live write proceeds
+    # without recording a pre-hydration placeholder.
     return (
         "(async () => {"
         f"const routes = {routes_json};"
-        "const missing = () => routes.filter(({store, action}) => "
-        "typeof window._ntp?.[store]?.getState?.()?.actions?.[action] "
-        "!== 'function').map(({key}) => key);"
-        "let unsupported = missing();"
+        "const probe = () => routes.map(({key, store, actions, props}) => {"
+        "const st = window._ntp?.[store]?.getState?.();"
+        "const hasAction = Boolean(st?.actions && actions.some("
+        "a => typeof st.actions[a] === 'function'));"
+        "if (!hasAction) return {key, supported: false, hydrated: false};"
+        "const hydrated = st.initialized !== false;"
+        "const prop = hydrated ? props.find(p => typeof st[p] === 'boolean') : undefined;"
+        "return prop !== undefined "
+        "? {key, supported: true, hydrated: true, value: st[prop]} "
+        ": {key, supported: true, hydrated};"
+        "});"
+        "let results = probe();"
         f"for (let attempt = 0; attempt < {_NTP_POLL_ATTEMPTS} "
-        "&& unsupported.length; attempt++) {"
+        "&& results.some(r => !r.supported || !r.hydrated); attempt++) {"
         f"await new Promise(r => setTimeout(r, {_POLL_INTERVAL_MS}));"
-        "unsupported = missing();"
+        "results = probe();"
         "}"
-        "return unsupported;"
+        "return results.map(({key, supported, value}) => "
+        "value !== undefined ? {key, supported, value} : {key, supported});"
         "})()"
     )
 
@@ -669,7 +723,19 @@ def _shortcuts_preflight_script() -> str:
     )
 
 
-def _newtab_script(changes: list[tuple[str, str, str, Any]]) -> str | None:
+def _newtab_call_js(store: str, actions: tuple[str, ...], value: Any) -> str:
+    val_json = json.dumps(value)
+    if len(actions) == 1:
+        return f"window._ntp.{store}.getState().actions.{actions[0]}({val_json});"
+    chain = " ?? ".join(
+        f"window._ntp.{store}.getState().actions.{act}" for act in actions
+    )
+    return f"({chain})({val_json});"
+
+
+def _newtab_script(
+    changes: list[tuple[str, str, tuple[str, ...], tuple[str, ...], Any]],
+) -> str | None:
     if not changes:
         return None
     # readyState only reflects resource loading, not SPA store hydration --
@@ -678,20 +744,21 @@ def _newtab_script(changes: list[tuple[str, str, str, Any]]) -> str | None:
     # navigation, rather than trusting the earlier preflight's readiness
     # (that ran against a *different* navigate to the same URL).
     routes = [
-        {"key": key, "store": store, "action": action}
-        for key, store, action, _value in changes
+        {"key": key, "store": store, "actions": list(actions)}
+        for key, store, actions, _props, _value in changes
     ]
     routes_json = json.dumps(routes, separators=(",", ":"))
     calls = "".join(
-        f"window._ntp.{store}.getState().actions.{action}({json.dumps(value)});"
-        for _key, store, action, value in changes
+        _newtab_call_js(store, actions, value)
+        for _key, store, actions, _props, value in changes
     )
     return (
         "(async () => {"
         f"const routes = {routes_json};"
-        "const missing = () => routes.filter(({store, action}) => "
-        "typeof window._ntp?.[store]?.getState?.()?.actions?.[action] "
-        "!== 'function').map(({key}) => key);"
+        "const missing = () => routes.filter(({store, actions}) => {"
+        "const acts = window._ntp?.[store]?.getState?.()?.actions;"
+        "return !acts || !actions.some(a => typeof acts[a] === 'function');"
+        "}).map(({key}) => key);"
         "let unready = missing();"
         f"for (let attempt = 0; attempt < {_NTP_POLL_ATTEMPTS} "
         "&& unready.length; attempt++) {"
@@ -753,14 +820,14 @@ def _read_preflight_result(
 def _preflight_settings(
     client: CdpClient,
     target: dict,
-    newtab_changes: list[tuple[str, str, str, Any]],
+    newtab_changes: list[tuple[str, str, tuple[str, ...], tuple[str, ...], Any]],
     ordinary_changes: list[tuple[str, Any]],
 ) -> tuple[list[str], dict[str, Any]]:
-    """Return the unsupported keys, and the values the probe read.
+    """Return the unsupported keys, and the values the probes read.
 
-    The values come from the settings probe only: the New Tab route
-    drives store actions, not ``settingsPrivate``, so it has no pref
-    value to report.
+    Both the New Tab store probe (once hydrated) and the ``settingsPrivate``
+    probe report each key's current live value ahead of any mutation, so a
+    later removal of either kind can restore the prior value live.
     """
     unsupported: list[str] = []
     values: dict[str, Any] = {}
@@ -769,7 +836,7 @@ def _preflight_settings(
         client.navigate(target, _NEWTAB_URL)
         _await_page(client, target)
         _read_preflight_result(
-            client.evaluate(target, newtab_script), unsupported, {},
+            client.evaluate(target, newtab_script), unsupported, values,
         )
 
     settings_script = _settings_preflight_script(ordinary_changes)
@@ -859,14 +926,12 @@ def apply_live(
         if not any(leaf.startswith(f"{key}.") for leaf in disk_removals)
     }
     removals = sorted(set(disk_removals) | plan_removals)
-    newtab_changes, ordinary_changes = _route_settings(changes)
     # Resolve removals against the sidecar's recorded prior values *before*
-    # the preflight runs, and fold the resolved writes into the ordinary
-    # settings changes so the preflight probes them too -- a prior value
-    # for a key settingsPrivate does not recognise is still unusable, and
-    # only the preflight can tell us that.
+    # routing and preflighting so a resolved removal goes through the exact
+    # same route (New Tab store action vs ``settingsPrivate``) and support
+    # probe as a normal write.
     removal_writes, unresolved_removals = _resolve_removals(prefs_path, removals)
-    ordinary_changes = ordinary_changes + removal_writes
+    newtab_changes, ordinary_changes = _route_settings(changes + removal_writes)
     shortcut_script, unresolved_shortcuts = _shortcut_script(
         prefs,
         target_prefs,
@@ -1002,11 +1067,15 @@ def apply_live(
         # the `--unattended` refusal either.  The learned values are
         # discarded in that case; `plan_apply` recomputes `prior_values`
         # from disk on the next run, as before.
+        live_writes = [
+            (key, write_value)
+            for key, _store, _actions, _props, write_value in live_newtab
+        ] + list(live_ordinary)
         _enrich_prior_values(
             plans,
             {
                 key: (learned_values[key], write_value)
-                for key, write_value in live_ordinary
+                for key, write_value in live_writes
                 if key in learned_values
             },
             managed_before,

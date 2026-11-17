@@ -607,3 +607,73 @@ def wait_for_devtools_endpoint(
         f"127.0.0.1:{port} within {timeout:.0f}s"
         + (f"\nlast error: {last_error}" if last_error else "")
     )
+
+
+_POLICY_URL = "chrome://policy"
+_RELOAD_POLICIES_JS = (
+    "(async () => {"
+    "for (let i = 0; i < 20; i++) {"
+    "if (typeof chrome !== 'undefined' && typeof chrome.send === 'function') {"
+    "chrome.send('reloadPolicies');"
+    "return true;"
+    "}"
+    "await new Promise(r => setTimeout(r, 50));"
+    "}"
+    "return false;"
+    "})()"
+)
+
+
+def discover_browser_ws_path(port: int) -> str | None:
+    """Read the ``/devtools/browser/<id>`` WebSocket path from ``/json/version``.
+
+    Opening a work tab through ``Target.createTarget`` with ``background: True``
+    on the Browser WebSocket never shifts focus away from the user's active tab
+    or window, unlike ``PUT /json/new`` on an HTTP-only client.
+    """
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/json/version", timeout=0.5
+        ) as resp:
+            info = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(info, dict):
+        return None
+    ws_url = info.get("webSocketDebuggerUrl")
+    if not isinstance(ws_url, str) or not ws_url:
+        return None
+    path = urllib.parse.urlparse(ws_url).path
+    return path if path.startswith("/devtools/browser/") else None
+
+
+def reload_policies_via_cdp(port: int, profile_root: Path) -> bool:
+    """Best-effort live policy refresh through an already-open HTTP CDP port.
+
+    Used on Windows (~10 min poll interval) and Linux (~6-51s settle) when the
+    running browser happens to expose an HTTP DevTools endpoint.  WS-only
+    ``brave://inspect/#remote-debugging`` ports are skipped on purpose so a
+    policy apply never triggers an interactive approval prompt.
+    """
+    root = Path(profile_root)
+    if devtools_port_is_ws_only(root, port):
+        return False
+    ws_path = read_devtools_ws_path(root, port) or discover_browser_ws_path(port)
+    client = CdpClient(port, ws_path=ws_path)
+    target: dict | None = None
+    try:
+        if ws_path:
+            client._ensure_browser_ws()
+        target = client.create_page(_POLICY_URL)
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if client.evaluate(target, "document.readyState === 'complete'") is True:
+                break
+            time.sleep(0.05)
+        return client.evaluate(target, _RELOAD_POLICIES_JS) is True
+    except (CdpError, RuntimeError, OSError):
+        return False
+    finally:
+        if target is not None:
+            client.close_page(target)
+        client.close()

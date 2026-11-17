@@ -1877,3 +1877,96 @@ def test_shortcuts_preflight_waits_for_the_command_list():
     )
 
     assert result["ok"] == []
+
+
+def test_newtab_preflight_learns_prior_value_and_makes_later_removal_apply_live(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """First-run management of a New Tab key learns its current boolean from
+    ``window._ntp[store].getState()`` before mutating, and a later removal
+    routes the write-back through ``_route_settings`` -> ``_newtab_script``
+    rather than ``settingsPrivate`` so dropping an NTP key costs zero restart."""
+    clock_key = "brave.new_tab_page.show_clock"
+    prefs_path = tmp_path / "Default" / "Preferences"
+    prefs_path.parent.mkdir()
+    prefs: dict = {"brave": {"new_tab_page": {}}}
+    prefs_path.write_text(json.dumps(prefs))
+
+    plan = settings_mod.plan_apply(prefs_path, prefs, {clock_key: False})
+    first = FakeCdpClient(9333, evaluation_results=[[_pref_entry(clock_key, True)]])
+    monkeypatch.setattr(live, "CdpClient", lambda port: first)
+    live.apply_live(9333, prefs_path, prefs, [plan])
+
+    state = json.loads(_sidecar(prefs_path).read_text())
+    assert state["managed_keys"] == [clock_key]
+    assert state["prior_values"][clock_key] == {"present": True, "value": True}
+
+    # Drop `show_clock` before Brave even flushes it to disk: must restore
+    # `true` through `setShowClock(true)` on `chrome://newtab/` with no restart.
+    plan2 = settings_mod.plan_apply(prefs_path, prefs, {})
+    second = FakeCdpClient(9333, evaluation_results=[[_pref_entry(clock_key, False)]])
+    monkeypatch.setattr(live, "CdpClient", lambda port: second)
+    live.apply_live(9333, prefs_path, prefs, [plan2])
+
+    assert "chrome://newtab/" in second.navigations
+    assert any("setShowClock(true)" in e for e in second.evaluations)
+    assert not any("setPref(" in e for e in second.evaluations)
+    state2 = json.loads(_sidecar(prefs_path).read_text())
+    assert state2["managed_keys"] == []
+
+
+@requires_node
+def test_newtab_scripts_wait_for_hydration_and_support_renamed_takeovers_action():
+    """`default*Store()` in brave-core starts with `initialized: false` and
+    dummy booleans until Mojo `loadData()` resolves, and Brave renamed
+    `setSponsoredImagesEnabled` -> `setNewTabTakeoversEnabled`."""
+    clock = "brave.new_tab_page.show_clock"
+    branded = "brave.new_tab_page.show_branded_background_image"
+    newtab_changes, ordinary = live._route_settings(
+        [(clock, False), (branded, False)]
+    )
+    assert ordinary == []
+    pre_script = live._newtab_preflight_script(newtab_changes)
+    mut_script = live._newtab_script(newtab_changes)
+    assert pre_script is not None and mut_script is not None
+
+    harness = f"""
+    const calls = [];
+    const clockState = {{
+      initialized: false,
+      showClock: false,
+      actions: {{ setShowClock(v) {{ calls.push(['clock', v]); }} }},
+    }};
+    const bgState = {{
+      initialized: false,
+      newTabTakeoversEnabled: false,
+      actions: {{ setNewTabTakeoversEnabled(v) {{ calls.push(['takeover', v]); }} }},
+    }};
+    globalThis.window = {{
+      _ntp: {{
+        newTab: {{ getState: () => clockState }},
+        background: {{ getState: () => bgState }},
+      }},
+    }};
+    setTimeout(() => {{
+      clockState.showClock = true;
+      clockState.initialized = true;
+      bgState.newTabTakeoversEnabled = true;
+      bgState.initialized = true;
+    }}, 120);
+    (async () => {{
+      const pre = await {pre_script};
+      const mut = await {mut_script};
+      console.log(JSON.stringify({{ pre, mut, calls }}));
+    }})();
+    """
+    out = subprocess.run(
+        ["node", "-e", harness], capture_output=True, text=True, timeout=30, check=True
+    )
+    parsed = json.loads(out.stdout.strip().splitlines()[-1])
+    assert parsed["pre"] == [
+        {"key": clock, "supported": True, "value": True},
+        {"key": branded, "supported": True, "value": True},
+    ]
+    assert parsed["mut"] is True
+    assert parsed["calls"] == [["clock", False], ["takeover", False]]

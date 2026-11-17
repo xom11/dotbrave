@@ -119,14 +119,14 @@ Preserve these contracts unless a change explicitly redesigns them:
    a deleted or unparseable settings sidecar, can now learn dotbrave's
    own value as the prior. Condition 4 (`getPref`'s answer must differ
    from the value being written) still covers the common shape of both.
-   That default-learning trick only covers keys the
-   settings preflight actually calls `getPref` for. The ten keys in
-   `_NEWTAB_ACTIONS` (`live.py`, e.g. `show_clock`, `show_stats`,
-   `show_background_image`) go through the New Tab store instead of
-   `settingsPrivate`, so there is no `getPref` value to learn from --
-   they keep the `{"present": false}` marker permanently, however they
-   are first managed, and removing one always costs a close, an
-   offline write and a relaunch.
+   Both the `settingsPrivate` preflight (`getPref`) and the New Tab store
+   preflight (`_NEWTAB_ACTIONS` in `live.py`, e.g. `show_clock`,
+   `show_stats`, `show_background_image`, probing `window._ntp[store].getState()`
+   once `initialized !== false`) learn that prior value before mutating,
+   and `_route_settings` routes resolved removals alongside normal writes
+   so dropping an NTP key restores its prior boolean through its NTP store
+   action (`setNewTabTakeoversEnabled` / `setSponsoredImagesEnabled` for
+   `show_branded_background_image`) without closing Brave.
    Which keys count as removed comes from the settings sidecar, never
    from the on-disk diff alone. A live apply writes into Brave's
    in-memory `PrefService` and Brave commits that on its own timer, so a
@@ -392,11 +392,14 @@ Preserve these contracts unless a change explicitly redesigns them:
    The check fails closed on purpose: the alternative is a silent write
    into the wrong profile that still reports `applied and verified`.
 
-   `[pwa]` never touches the
-   running browser and is never gated on what else is dirty: the policy
-   is written first and directly (no endpoint bootstrap), and a running
-   Brave picks it up by itself on macOS, Linux, and Windows
-   (`_policy_pickup_note`). Gating it on "the diff contains nothing but
+   `[pwa]` never bootstraps an endpoint and is never gated on what else is
+   dirty: the policy is written first and directly, and a running Brave
+   picks it up by itself on macOS (~2s), Linux (<1m), and Windows (~10m;
+   `_policy_pickup_note`) -- or within a few seconds on Linux/Windows too
+   when an HTTP CDP endpoint is already open (`reload_policies_via_cdp`
+   triggers `chrome.send('reloadPolicies')` in a background tab; WS-only
+   `brave://inspect` ports are skipped so it never prompts). Gating it on
+   "the diff contains nothing but
    `[pwa]`" made one dirty `[shortcuts]` drop the policy on every
    `--unattended` run, and permanently -- `[shortcuts]` is only cleaned
    by an apply with Brave closed, which `--unattended` never performs.

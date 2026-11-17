@@ -343,10 +343,12 @@ exits with an error instead of closing a browser it could not bring
 back. A reopen waits for the failed relaunch to exit first, and is
 checked a few seconds later: one that did not survive is reported, not
 claimed. A config
-whose only diff is `[pwa]` skips the endpoint entirely — the managed
+whose only diff is `[pwa]` skips endpoint bootstrap entirely — the managed
 policy is written while Brave keeps running, and a running Brave picks it
-up by itself on macOS (within a few seconds), Linux (within a minute), and
-Windows (about ten minutes). The endpoint binds to `127.0.0.1`
+up by itself on macOS (within a few seconds), Linux (within a minute, or
+within a few seconds when a live HTTP endpoint is already open), and
+Windows (about ten minutes, or within a few seconds with a live HTTP
+endpoint). The endpoint binds to `127.0.0.1`
 only, and there is no force-kill switch.
 
 `[shortcuts]` and `[settings]` track managed entries in sidecar files

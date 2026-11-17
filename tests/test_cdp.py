@@ -406,3 +406,209 @@ def test_unattended_skips_ws_only_devtools_port(
         )
         assert live_called == []
         assert srv.commands == []
+
+
+class _MockHttpAndWsDevToolsServer(_MockWsOnlyDevToolsServer):
+    """HTTP + Browser WS server mimicking ``--remote-debugging-port``."""
+
+    def _handle_conn(self, conn) -> None:
+        import struct
+
+        conn.settimeout(2.0)
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = conn.recv(4096)
+            if not chunk:
+                return
+            buf += chunk
+        header_text = buf.decode("iso-8859-1", "replace")
+        lines = header_text.split("\r\n")
+        parts = lines[0].split(" ")
+        path = parts[1] if len(parts) > 1 else "/"
+        headers: dict[str, str] = {}
+        for line in lines[1:]:
+            if ":" in line:
+                k, v = line.split(":", 1)
+                headers[k.strip().lower()] = v.strip()
+
+        if headers.get("upgrade", "").lower() != "websocket":
+            self.http_paths.append(path)
+            if path == "/json/list":
+                body = json.dumps([{"type": "page", "id": "t1"}]).encode("utf-8")
+            elif path == "/json/version":
+                body = json.dumps(
+                    {"webSocketDebuggerUrl": f"ws://127.0.0.1:{self.port}{self.ws_path}"}
+                ).encode("utf-8")
+            else:
+                conn.sendall(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                return
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode("ascii")
+                + body
+            )
+            return
+        # Delegate WebSocket handshake/frames by replaying against base logic:
+        import base64
+        import hashlib
+
+        key = headers["sec-websocket-key"]
+        accept = base64.b64encode(
+            hashlib.sha1(
+                (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")
+            ).digest()
+        ).decode("ascii")
+        conn.sendall(
+            (
+                "HTTP/1.1 101 Switching Protocols\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+            ).encode("ascii")
+        )
+
+        def send_ws_json(obj: dict) -> None:
+            raw = json.dumps(obj, separators=(",", ":")).encode("utf-8")
+            hdr = bytearray([0x81])
+            n = len(raw)
+            if n < 126:
+                hdr.append(n)
+            elif n <= 0xFFFF:
+                hdr.append(126)
+                hdr.extend(struct.pack("!H", n))
+            else:
+                hdr.append(127)
+                hdr.extend(struct.pack("!Q", n))
+            conn.sendall(bytes(hdr) + raw)
+
+        def read_exact(n: int) -> bytes | None:
+            out = bytearray()
+            while len(out) < n:
+                ch = conn.recv(n - len(out))
+                if not ch:
+                    return None
+                out.extend(ch)
+            return bytes(out)
+
+        while not self._stop.is_set():
+            first = read_exact(2)
+            if first is None or (first[0] & 0x0F) == 0x8:
+                return
+            length = first[1] & 0x7F
+            masked = bool(first[1] & 0x80)
+            if length == 126:
+                ext = read_exact(2)
+                if ext is None:
+                    return
+                length = struct.unpack("!H", ext)[0]
+            mask = read_exact(4) if masked else b""
+            if mask is None:
+                return
+            payload = read_exact(length)
+            if payload is None:
+                return
+            if masked:
+                payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+            msg = json.loads(payload.decode("utf-8"))
+            self.commands.append(msg)
+            req_id = msg["id"]
+            method = msg["method"]
+            if method == "Target.createTarget":
+                send_ws_json({"id": req_id, "result": {"targetId": "policy-tab"}})
+            elif method == "Target.attachToTarget":
+                send_ws_json({"id": req_id, "result": {"sessionId": "sess-pol"}})
+            elif method == "Target.closeTarget":
+                send_ws_json({"id": req_id, "result": {"success": True}})
+            elif method == "Runtime.evaluate":
+                send_ws_json(
+                    {
+                        "id": req_id,
+                        "sessionId": msg.get("sessionId"),
+                        "result": {"result": {"type": "boolean", "value": True}},
+                    }
+                )
+
+
+def test_reload_policies_via_cdp_uses_background_tab_and_skips_ws_only(
+    tmp_path: Path,
+) -> None:
+    profile_dir = tmp_path / "Default"
+    profile_dir.mkdir()
+
+    # 1) WS-only brave://inspect endpoint must NOT be opened for policy reload.
+    with _MockWsOnlyDevToolsServer(profile_dir) as ws_srv:
+        (tmp_path / "DevToolsActivePort").write_text(
+            f"{ws_srv.port}\n{ws_srv.ws_path}\n", encoding="utf-8"
+        )
+        assert cdp.reload_policies_via_cdp(ws_srv.port, tmp_path) is False
+        assert ws_srv.commands == []
+    (tmp_path / "DevToolsActivePort").unlink()
+
+    # 2) Fixed-port HTTP endpoint discovers /devtools/browser/<uuid> via
+    # /json/version, opens chrome://policy in background, calls reloadPolicies,
+    # and closes the tab cleanly.
+    with _MockHttpAndWsDevToolsServer(profile_dir) as http_srv:
+        assert cdp.reload_policies_via_cdp(http_srv.port, tmp_path) is True
+        create_cmd = next(
+            c for c in http_srv.commands if c["method"] == "Target.createTarget"
+        )
+        assert create_cmd["params"] == {"url": "chrome://policy", "background": True}
+        assert any(
+            c["method"] == "Runtime.evaluate"
+            and "reloadPolicies" in c["params"]["expression"]
+            for c in http_srv.commands
+        )
+        assert any(c["method"] == "Target.closeTarget" for c in http_srv.commands)
+        assert not any(p.startswith("/json/new") for p in http_srv.http_paths)
+
+
+def test_orchestrator_pwa_apply_uses_live_cdp_reload_on_windows(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    import argparse
+    from dotbrave._base import orchestrator as orch
+
+    profile_dir = tmp_path / "Default"
+    profile_dir.mkdir()
+    (profile_dir / "Preferences").write_text("{}")
+    cfg = tmp_path / "brave.toml"
+    cfg.write_text('[pwa]\nurls = ["https://example.com"]\n')
+
+    monkeypatch.setattr(orch.sys, "platform", "win32")
+    monkeypatch.setattr(orch, "_already_privileged", lambda: True)
+
+    with _MockHttpAndWsDevToolsServer(profile_dir) as srv:
+        orch.cmd_apply(
+            argparse.Namespace(
+                profile_root=tmp_path,
+                profile="Default",
+                config=str(cfg),
+                dry_run=False,
+                unattended=False,
+            ),
+            display_name="Brave",
+            running_fn=lambda: True,
+            find_cmdline_fn=lambda: ["brave.exe", f"--remote-debugging-port={srv.port}"],
+            restart_fn=lambda c: c,
+            build_plans_fn=lambda p, prefs, doc, **kw: [
+                orch.Plan(
+                    namespace="pwa",
+                    diff_lines=["  + https://example.com"],
+                    apply_fn=lambda _p: None,
+                    verify_fn=lambda _p: None,
+                    external_apply_fn=lambda: None,
+                )
+            ],
+            live_apply_fn=lambda *a, **k: None,
+            graceful_close_fn=lambda: None,
+            launch_live_fn=lambda *a, **k: [],
+        )
+        out = capsys.readouterr().out
+        assert "picks it up within a few seconds" in out
+        assert any(
+            c["method"] == "Runtime.evaluate"
+            and "reloadPolicies" in c["params"]["expression"]
+            for c in srv.commands
+        )

@@ -33,6 +33,7 @@ from dotbrave._base.cdp import (
     find_devtools_port,
     live_port_from_cmdline,
     pick_unused_port,
+    reload_policies_via_cdp,
     remember_devtools_port,
     wait_for_devtools_endpoint,
 )
@@ -253,6 +254,23 @@ def _policy_pickup_note(namespaces: tuple[str, ...] = ("pwa",)) -> str:
             note += "; [shields] takes full effect after a Brave restart"
         return note
     return "[shields] takes full effect after a Brave restart"
+
+
+def _reload_external_policy_live(
+    profile_root: Path,
+    profile: str | None,
+    find_cmdline_fn: Callable[[], list[str] | None] | None,
+) -> bool:
+    """Trigger an immediate ``chrome://policy`` reload when an HTTP CDP
+    endpoint is already open on Linux/Windows; never bootstrap or prompt."""
+    port = find_devtools_port(profile_root, profile)
+    if port is not None and devtools_port_is_ws_only(profile_root, port):
+        port = None
+    if port is None:
+        port = live_port_from_cmdline(find_cmdline_fn)
+    if port is None:
+        return False
+    return reload_policies_via_cdp(int(port), Path(profile_root))
 
 
 def _warn(message: str) -> None:
@@ -527,7 +545,20 @@ def cmd_apply(
             write_state_files(plans if not browser_bound else external)
             applied_external = [f"[{p.namespace}]" for p in external]
             names = ", ".join(applied_external)
-            note = _policy_pickup_note(tuple(p.namespace for p in external))
+            ext_namespaces = tuple(p.namespace for p in external)
+            reloaded_live = (
+                sys.platform != "darwin"
+                and "pwa" in ext_namespaces
+                and _reload_external_policy_live(
+                    args.profile_root, args.profile, find_cmdline_fn
+                )
+            )
+            if reloaded_live:
+                note = "a running one picks it up within a few seconds"
+                if "shields" in ext_namespaces:
+                    note += "; [shields] takes full effect after a Brave restart"
+            else:
+                note = _policy_pickup_note(ext_namespaces)
             print(
                 f"ok -- {names} applied without touching the "
                 f"running {display_name} ({note})"
