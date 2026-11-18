@@ -105,6 +105,11 @@ _BUNDLE_CHANNEL = {
     "com.brave.Browser.beta": "beta",
     "com.brave.Browser.nightly": "nightly",
 }
+_WINDOWS_CHANNEL_SHORTCUTS = {
+    "stable": ("Brave Apps", "bravesoftware/brave-browser/application/"),
+    "beta": ("Brave Beta Apps", "bravesoftware/brave-browser-beta/application/"),
+    "nightly": ("Brave Nightly Apps", "bravesoftware/brave-browser-nightly/application/"),
+}
 
 
 def _launcher_heal() -> _base.LauncherHeal | None:
@@ -193,6 +198,42 @@ def _launcher_cleanup(
                 shim_dir,
                 bundle_id,
                 profile_root,
+                removed,
+                target,
+                prefs,
+                clean_foreign=True,
+            ),
+        )
+    if sys.platform == "win32":
+        from dotbrave.browser import CHANNELS, _default_profile_root
+
+        profile_root = prefs_path.parent.parent
+        matched_channel: str | None = None
+        for ch in CHANNELS:
+            d = _default_profile_root(ch)
+            if (
+                d is not None
+                and _base._path_within(profile_root, d)
+                and _base._path_within(d, profile_root)
+            ):
+                matched_channel = ch
+                break
+        if matched_channel is None:
+            return None
+        apps_folder, app_marker = _WINDOWS_CHANNEL_SHORTCUTS[matched_channel]
+        shortcut_dirs = _base.windows_shortcut_dirs(apps_folder)
+        return _base.LauncherCleanup(
+            orphan_diff=lambda: [
+                f"  - {p.parent.name}/{p.name} (foreign profile shortcut)"
+                for p in _base.scan_windows_foreign_shortcuts(
+                    shortcut_dirs, app_marker, profile_root
+                )
+            ],
+            clean=lambda removed, target: _base.cleanup_windows_shortcuts(
+                shortcut_dirs,
+                app_marker,
+                profile_root,
+                prefs_path.parent.name,
                 removed,
                 target,
                 prefs,

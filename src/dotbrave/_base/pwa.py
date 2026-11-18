@@ -16,13 +16,14 @@ import plistlib
 import re
 import shlex
 import shutil
+import struct
 import subprocess
 import sys
 import time
 import urllib.parse
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 if sys.platform == "win32":
@@ -721,6 +722,11 @@ _LSREGISTER = Path(
 )
 _APP_ID_RE = re.compile(r"--app-id=([a-p]{32})\b")
 _PROFILE_DIR_RE = re.compile(r'--profile-directory=(?:"([^"]+)"|(\S+))')
+_USER_DATA_DIR_RE = re.compile(r'--user-data-dir=(?:"([^"]+)"|(\S+))')
+_LNK_HEADER_SIZE = 0x4C
+_LNK_CLSID = bytes.fromhex("0114020000000000c000000000000046")
+_WIN_SANITIZE_RE = re.compile(r'[<>:"/\\|?*]')
+_WIN_DUP_SUFFIX_RE = re.compile(r"\s+\(\d+\)$")
 
 
 def current_platform_name(plat: str | None = None) -> str | None:
@@ -1067,6 +1073,335 @@ def cleanup_linux_removed_launchers(
         removed_paths.append(app_file)
 
     return removed_paths
+
+
+@dataclass(frozen=True)
+class WindowsShortcutInfo:
+    """Parsed fields from a Chromium PWA ``.lnk`` shortcut (MS-SHLLINK)."""
+
+    path: Path
+    target_path: str
+    arguments: str
+    icon_location: str | None
+    app_id: str
+    profile_dir: str | None
+    user_data_dir: str | None
+
+
+def _read_windows_lnk_info(lnk_path: Path) -> WindowsShortcutInfo | None:
+    """Parse a Windows ``.lnk`` binary file without COM or PowerShell so
+    Unicode names work reliably and unit tests run on every OS."""
+    try:
+        data = lnk_path.read_bytes()
+    except OSError:
+        return None
+    if len(data) < _LNK_HEADER_SIZE:
+        return None
+    hdr_size = struct.unpack_from("<I", data, 0)[0]
+    if hdr_size != _LNK_HEADER_SIZE or data[4:20] != _LNK_CLSID:
+        return None
+
+    flags = struct.unpack_from("<I", data, 0x14)[0]
+    pos = _LNK_HEADER_SIZE
+
+    if flags & 0x01:  # HasLinkTargetIDList
+        if pos + 2 > len(data):
+            return None
+        id_sz = struct.unpack_from("<H", data, pos)[0]
+        pos += 2 + id_sz
+        if pos > len(data):
+            return None
+
+    target_path: str | None = None
+    if flags & 0x02:  # HasLinkInfo
+        if pos + 0x1C > len(data):
+            return None
+        li_sz, li_hdr_sz, li_flags, _vol_off, base_off, _net_off, _sfx_off = (
+            struct.unpack_from("<7I", data, pos)
+        )
+        if li_sz < 0x1C or pos + li_sz > len(data):
+            return None
+        if li_flags & 0x01:  # VolumeIDAndLocalBasePath
+            if li_hdr_sz >= 0x24 and pos + 0x20 <= len(data):
+                ubase_off = struct.unpack_from("<I", data, pos + 0x1C)[0]
+                if 0 < ubase_off < li_sz:
+                    end = pos + ubase_off
+                    while end + 1 < pos + li_sz and data[end : end + 2] != b"\x00\x00":
+                        end += 2
+                    target_path = data[pos + ubase_off : end].decode(
+                        "utf-16le", errors="replace"
+                    )
+            if not target_path and 0 < base_off < li_sz:
+                end = data.find(b"\x00", pos + base_off, pos + li_sz)
+                if end < 0:
+                    end = pos + li_sz
+                target_path = data[pos + base_off : end].decode(
+                    "latin1", errors="replace"
+                )
+        pos += li_sz
+
+    is_unicode = bool(flags & 0x80)
+
+    def _read_str() -> str | None:
+        nonlocal pos
+        if pos + 2 > len(data):
+            return None
+        cnt = struct.unpack_from("<H", data, pos)[0]
+        pos += 2
+        byte_len = cnt * 2 if is_unicode else cnt
+        if pos + byte_len > len(data):
+            return None
+        raw = data[pos : pos + byte_len]
+        pos += byte_len
+        return (
+            raw.decode("utf-16le", errors="replace")
+            if is_unicode
+            else raw.decode("latin1", errors="replace")
+        )
+
+    if flags & 0x04 and _read_str() is None:  # HasName
+        return None
+    rel = _read_str() if (flags & 0x08) else None
+    wdir = _read_str() if (flags & 0x10) else None
+    args = _read_str() if (flags & 0x20) else None
+    icon = _read_str() if (flags & 0x40) else None
+
+    if not args:
+        return None
+    m_id = _APP_ID_RE.search(args)
+    if not m_id:
+        return None
+
+    m_prof = _PROFILE_DIR_RE.search(args)
+    prof_dir = (m_prof.group(1) or m_prof.group(2)) if m_prof else None
+    m_udd = _USER_DATA_DIR_RE.search(args)
+    udd = (m_udd.group(1) or m_udd.group(2)) if m_udd else None
+
+    resolved_target = target_path or wdir or rel or ""
+    return WindowsShortcutInfo(
+        path=lnk_path,
+        target_path=resolved_target,
+        arguments=args,
+        icon_location=icon,
+        app_id=m_id.group(1),
+        profile_dir=prof_dir,
+        user_data_dir=udd,
+    )
+
+
+def _windows_lnk_matches_app_marker(
+    info: WindowsShortcutInfo, app_marker: str
+) -> bool:
+    norm = info.target_path.replace("\\", "/").lower()
+    if not norm.endswith("/"):
+        # Accept either chrome_proxy.exe/brave.exe full path or Application dir
+        pass
+    return app_marker.lower() in norm
+
+
+def _windows_udd_within_root(udd: str, profile_root: Path) -> bool:
+    root_str = str(profile_root)
+    if re.match(r"^[A-Za-z]:[\\/]", udd) and re.match(r"^[A-Za-z]:[\\/]", root_str):
+        if sys.platform == "win32":
+            try:
+                if Path(udd).exists() and profile_root.exists():
+                    return _path_within(Path(udd), profile_root)
+            except OSError:
+                pass
+        try:
+            return PureWindowsPath(udd).is_relative_to(PureWindowsPath(root_str))
+        except ValueError:
+            return False
+    return _path_within(Path(udd), profile_root)
+
+
+def _windows_known_folder(guid_str: str) -> Path | None:
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _GUID(ctypes.Structure):
+            _fields_ = [
+                ("Data1", wintypes.DWORD),
+                ("Data2", wintypes.WORD),
+                ("Data3", wintypes.WORD),
+                ("Data4", ctypes.c_ubyte * 8),
+            ]
+
+        guid = _GUID()
+        if ctypes.windll.ole32.CLSIDFromString(ctypes.c_wchar_p(guid_str), ctypes.byref(guid)) != 0:
+            return None
+        out_ptr = ctypes.c_wchar_p()
+        hr = ctypes.windll.shell32.SHGetKnownFolderPath(
+            ctypes.byref(guid), 0, 0, ctypes.byref(out_ptr)
+        )
+        if hr != 0 or not out_ptr.value:
+            return None
+        try:
+            return Path(out_ptr.value)
+        finally:
+            ctypes.windll.ole32.CoTaskMemFree(out_ptr)
+    except Exception:
+        return None
+
+
+def windows_shortcut_dirs(
+    apps_folder_name: str,
+    *,
+    env: Mapping[str, str] | None = None,
+    home: Path | None = None,
+) -> list[Path]:
+    """Return Start Menu ``<Browser> Apps`` and ``Desktop`` shortcut dirs."""
+    use_native = env is None and home is None and sys.platform == "win32"
+    e = os.environ if env is None else env
+    h = Path.home() if home is None else home
+
+    programs_dir = (
+        _windows_known_folder("{A77F5D77-2E2B-44C3-A6A2-ABA601054A51}")
+        if use_native
+        else None
+    )
+    if programs_dir is None:
+        appdata = e.get("APPDATA")
+        if appdata:
+            programs_dir = Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+
+    desktop_dir = (
+        _windows_known_folder("{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}")
+        if use_native
+        else None
+    )
+    if desktop_dir is None:
+        desktop_dir = h / "Desktop"
+
+    out: list[Path] = []
+    if programs_dir is not None:
+        out.append(programs_dir / apps_folder_name)
+    if desktop_dir is not None and desktop_dir not in out:
+        out.append(desktop_dir)
+    return out
+
+
+def _windows_sanitize_label(label: str) -> str:
+    return _WIN_SANITIZE_RE.sub(" ", label).rstrip(". ")
+
+
+def scan_windows_foreign_shortcuts(
+    shortcut_dirs: list[Path], app_marker: str, profile_root: Path
+) -> list[Path]:
+    """Find PWA ``.lnk`` shortcuts created by throwaway ``--user-data-dir``
+    launches outside ``profile_root``."""
+    found: list[Path] = []
+    for d in shortcut_dirs:
+        if not d.is_dir():
+            continue
+        for lnk in sorted(d.glob("*.lnk")):
+            info = _read_windows_lnk_info(lnk)
+            if info is None or not _windows_lnk_matches_app_marker(info, app_marker):
+                continue
+            if info.user_data_dir and not _windows_udd_within_root(
+                info.user_data_dir, profile_root
+            ):
+                found.append(lnk)
+    return found
+
+
+def _notify_windows_shell_refresh() -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        # SHCNE_ASSOCCHANGED = 0x08000000, SHCNF_IDLIST = 0x0000
+        ctypes.windll.shell32.SHChangeNotify(0x08000000, 0x0000, None, None)
+    except Exception:
+        pass
+
+
+def cleanup_windows_shortcuts(
+    shortcut_dirs: list[Path],
+    app_marker: str,
+    profile_root: Path,
+    profile_name: str,
+    removed_entries: dict[str, dict],
+    target_entries: dict[str, str | None],
+    prefs: dict,
+    *,
+    clean_foreign: bool = False,
+) -> list[Path]:
+    """Remove foreign-profile PWA ``.lnk`` shortcuts and shortcuts for URLs
+    removed from ``[pwa]`` across Start Menu and Desktop."""
+    to_remove: list[Path] = []
+    seen_paths: set[Path] = set()
+
+    if clean_foreign:
+        for foreign in scan_windows_foreign_shortcuts(
+            shortcut_dirs, app_marker, profile_root
+        ):
+            seen_paths.add(foreign)
+            to_remove.append(foreign)
+
+    if removed_entries:
+        rem_ids = removed_app_ids(set(removed_entries), list(target_entries), prefs)
+        kept_ids = candidate_app_ids(set(target_entries), prefs)
+        kept_canon = {canonical_pwa_url(u) for u in target_entries}
+        kept_origins = {pwa_origin(u) for u in kept_canon if pwa_origin(u)}
+        kept_names = {n for n in target_entries.values() if n}
+        rem_names = {
+            e["fallback_app_name"]
+            for e in removed_entries.values()
+            if isinstance(e.get("fallback_app_name"), str) and e["fallback_app_name"]
+        } - kept_names
+
+        rem_labels: set[str] = set()
+        for n in rem_names:
+            rem_labels.add(n)
+            rem_labels.add(_windows_sanitize_label(n))
+        for u in removed_entries:
+            canon = canonical_pwa_url(u)
+            orig = pwa_origin(canon)
+            if canon not in kept_canon:
+                for raw in (u, canon, canon.rstrip("/")):
+                    rem_labels.add(raw)
+                    rem_labels.add(_windows_sanitize_label(raw))
+            if orig and orig not in kept_origins:
+                host = urllib.parse.urlsplit(canon).hostname
+                if host:
+                    rem_labels.add(host)
+
+        for d in shortcut_dirs:
+            if not d.is_dir():
+                continue
+            for lnk in sorted(d.glob("*.lnk")):
+                if lnk in seen_paths:
+                    continue
+                info = _read_windows_lnk_info(lnk)
+                if info is None or not _windows_lnk_matches_app_marker(info, app_marker):
+                    continue
+                if info.user_data_dir and not _windows_udd_within_root(
+                    info.user_data_dir, profile_root
+                ):
+                    continue
+                if info.profile_dir is not None and info.profile_dir != profile_name:
+                    continue
+
+                matched = info.app_id in rem_ids
+                if not matched and info.app_id not in kept_ids:
+                    base_stem = _WIN_DUP_SUFFIX_RE.sub("", lnk.stem)
+                    matched = base_stem in rem_labels or any(
+                        base_stem.startswith(f"{n} - ") for n in rem_names
+                    )
+                if matched:
+                    seen_paths.add(lnk)
+                    to_remove.append(lnk)
+
+    for lnk in to_remove:
+        lnk.unlink(missing_ok=True)
+    if to_remove:
+        _notify_windows_shell_refresh()
+    return to_remove
 
 
 @dataclass

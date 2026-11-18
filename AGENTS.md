@@ -256,6 +256,11 @@ Preserve these contracts unless a change explicitly redesigns them:
    real app it never saw good, so it strips the flag instead. Keep the
    builders pure and `install_linux_launcher_heal`/`remove_linux_launcher_heal`
    patchable; `tests/conftest.py` disables the heal for every other test.
+   On Windows `LauncherCleanup` parses binary MS-SHLLINK `.lnk` files in Start
+   Menu (`Brave Apps`) and `Desktop` directly (stdlib `struct`, UTF-16LE safe
+   unlike `WScript.Shell` ANSI COM) to prune foreign `--user-data-dir` PWA
+   shortcuts and removed `[pwa]` entries without needing elevation when the
+   registry policy already matches.
 5. Plain `apply` manages live apply. Endpoints bind to `127.0.0.1` and
    remain internal; no public endpoint or force-kill switch is exposed.
    The live/offline split is per key, not per run: everything

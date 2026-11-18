@@ -1023,3 +1023,197 @@ def test_linux_launcher_cleanup_removes_desktop_icons_and_heal_snapshot(
         other_prof_icon,
     ):
         assert alive.exists()
+
+
+def _write_windows_lnk(
+    directory: Path,
+    stem: str,
+    *,
+    target_path: str,
+    arguments: str,
+    icon_location: str = "",
+) -> Path:
+    import struct
+
+    directory.mkdir(parents=True, exist_ok=True)
+    lnk_path = directory / f"{stem}.lnk"
+
+    # LinkFlags: HasLinkTargetIDList(0x01) | HasLinkInfo(0x02) |
+    #            HasArguments(0x20) | IsUnicode(0x80) [+ HasIconLocation(0x40)]
+    flags = 0x01 | 0x02 | 0x20 | 0x80 | (0x40 if icon_location else 0)
+    header = bytearray(0x4C)
+    struct.pack_into("<I", header, 0, 0x4C)
+    header[4:20] = bytes.fromhex("0114020000000000c000000000000046")
+    struct.pack_into("<I", header, 0x14, flags)
+
+    id_list = struct.pack("<HH", 2, 0)
+
+    ansi_bytes = target_path.encode("latin1", errors="replace") + b"\x00"
+    uni_bytes = target_path.encode("utf-16le") + b"\x00\x00"
+    vol_bytes = struct.pack("<IIII", 0x10, 3, 0, 0x10)
+    li_hdr_sz = 0x24
+    vol_off = li_hdr_sz
+    base_off = vol_off + len(vol_bytes)
+    sfx_off = base_off + len(ansi_bytes)
+    ubase_off = sfx_off + 1
+    usfx_off = ubase_off + len(uni_bytes)
+    li_total = usfx_off + 2
+    link_info = (
+        struct.pack(
+            "<9I",
+            li_total,
+            li_hdr_sz,
+            0x01,
+            vol_off,
+            base_off,
+            0,
+            sfx_off,
+            ubase_off,
+            usfx_off,
+        )
+        + vol_bytes
+        + ansi_bytes
+        + b"\x00"
+        + uni_bytes
+        + b"\x00\x00"
+    )
+
+    def _u16_str(s: str) -> bytes:
+        raw = s.encode("utf-16le")
+        return struct.pack("<H", len(s)) + raw
+
+    payload = bytes(header) + id_list + link_info + _u16_str(arguments)
+    if icon_location:
+        payload += _u16_str(icon_location)
+    lnk_path.write_bytes(payload)
+    return lnk_path
+
+
+def test_windows_shortcut_cleanup_removes_foreign_and_uninstalled_lnks(
+    tmp_path: Path,
+) -> None:
+    from dotbrave._base import pwa as base
+
+    start_menu_apps = tmp_path / "Brave Apps"
+    desktop = tmp_path / "Desktop"
+    real_root = Path(r"C:\Users\kln\AppData\Local\BraveSoftware\Brave-Browser\User Data")
+    trunc_foreign = r"C:\Users\kln\AppData\Local\BraveSoftware\Brave-Browser\User"
+    proxy = r"C:\Users\kln\AppData\Local\BraveSoftware\Brave-Browser\Application\chrome_proxy.exe"
+    beta_proxy = r"C:\Users\kln\AppData\Local\BraveSoftware\Brave-Browser-Beta\Application\chrome_proxy.exe"
+    chrome_proxy = r"C:\Program Files\Google\Chrome\Application\chrome_proxy.exe"
+
+    kept_id = base.crx_app_id("https://calendar.google.com/calendar/r")
+    rem_id = base.crx_app_id("https://chat.example/?utm_source=pwa_install")
+    bg_id = base.crx_app_id("https://mail.example/webapp")
+
+    kept_unicode_lnk = _write_windows_lnk(
+        start_menu_apps,
+        "Lịch Google",
+        target_path=proxy,
+        arguments=f' --user-data-dir="{real_root}" --profile-directory=Default --app-id={kept_id}',
+    )
+    browser_lnk = _write_windows_lnk(
+        desktop,
+        "Brave",
+        target_path=r"C:\Users\kln\AppData\Local\BraveSoftware\Brave-Browser\Application\brave.exe",
+        arguments="--source-shortcut-location=desktop",
+    )
+    foreign_menu_lnk = _write_windows_lnk(
+        start_menu_apps,
+        "https   keep.google.com",
+        target_path=proxy,
+        arguments=f' --user-data-dir="{trunc_foreign}" --profile-directory=Default --app-id=hcfcmgpnmpinpidjdgejehjchlbglpde',
+    )
+    foreign_desk_lnk = _write_windows_lnk(
+        desktop,
+        "YouTube",
+        target_path=proxy,
+        arguments=f' --user-data-dir="{trunc_foreign}" --profile-directory=Default --app-id=agimnkijcaahngcdmfeangaknmldooml',
+    )
+    removed_manifest_lnk = _write_windows_lnk(
+        start_menu_apps,
+        "ChatApp",
+        target_path=proxy,
+        arguments=f" --profile-directory=Default --app-id={rem_id}",
+    )
+    removed_url_stem_lnk = _write_windows_lnk(
+        desktop,
+        "https   mail.example (1)",
+        target_path=proxy,
+        arguments=f" --profile-directory=Default --app-id={bg_id}",
+    )
+    other_prof_lnk = _write_windows_lnk(
+        start_menu_apps,
+        "ChatApp Other",
+        target_path=proxy,
+        arguments=f' --profile-directory="Profile 1" --app-id={rem_id}',
+    )
+    beta_foreign_lnk = _write_windows_lnk(
+        desktop,
+        "BetaApp",
+        target_path=beta_proxy,
+        arguments=f' --user-data-dir="{trunc_foreign}" --profile-directory=Default --app-id={rem_id}',
+    )
+    chrome_lnk = _write_windows_lnk(
+        desktop,
+        "ChromeApp",
+        target_path=chrome_proxy,
+        arguments=f' --user-data-dir="{trunc_foreign}" --profile-directory=Default --app-id={rem_id}',
+    )
+
+    prefs = {
+        "profile": {
+            "content_settings": {
+                "exceptions": {
+                    "app_banner": {
+                        "https://calendar.google.com:443,*": {
+                            "setting": {
+                                "https://calendar.google.com/calendar/r": 1.0
+                            }
+                        },
+                        "https://chat.example:443,*": {
+                            "setting": {
+                                "https://chat.example/?utm_source=pwa_install": 1.0
+                            }
+                        },
+                    }
+                }
+            }
+        }
+    }
+
+    marker = "bravesoftware/brave-browser/application/"
+    dirs = [start_menu_apps, desktop]
+    foreign_only = base.scan_windows_foreign_shortcuts(dirs, marker, real_root)
+    assert set(foreign_only) == {foreign_menu_lnk, foreign_desk_lnk}
+
+    deleted = base.cleanup_windows_shortcuts(
+        dirs,
+        marker,
+        real_root,
+        "Default",
+        {
+            "https://chat.example/": {"url": "https://chat.example/"},
+            "https://mail.example/": {"url": "https://mail.example/"},
+        },
+        {"https://calendar.google.com/": "Google Calendar"},
+        prefs,
+        clean_foreign=True,
+    )
+
+    assert set(deleted) == {
+        foreign_menu_lnk,
+        foreign_desk_lnk,
+        removed_manifest_lnk,
+        removed_url_stem_lnk,
+    }
+    for gone in deleted:
+        assert not gone.exists()
+    for alive in (
+        kept_unicode_lnk,
+        browser_lnk,
+        other_prof_lnk,
+        beta_foreign_lnk,
+        chrome_lnk,
+    ):
+        assert alive.exists()
