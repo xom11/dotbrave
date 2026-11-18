@@ -77,3 +77,10 @@ focus_location    = ["Control+KeyL"]
 # urls = [
 #   "https://squoosh.app/",
 # ]
+
+# [extensions] — unpacked local extension directories + command shortcuts.
+#
+# [extensions]
+# unpacked = [
+#   { path = "../my-extension", shortcuts = { _execute_action = "Control+KeyB" } },
+# ]

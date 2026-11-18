@@ -993,6 +993,41 @@ class BrowserProcess:
             cmdline.append(url)
         return cmdline
 
+    def headless_launch_cmdline(
+        self,
+        profile_root: Path,
+        profile: str,
+        port: int,
+    ) -> list[str]:
+        """Command line for a short-lived ``--headless=new`` browser run against
+        a closed profile (used when ``[extensions]`` installs/uninstalls an
+        unpacked extension offline so Chromium writes ``Secure Preferences``
+        with its own MAC).
+
+        Unlike :meth:`live_launch_cmdline` on macOS, this refuses ``open -a``
+        when no app binary is found: ``subprocess.Popen`` needs the real
+        browser process so the caller can wait for ``Browser.close`` to flush
+        preferences and exit."""
+        extra = [
+            "--headless=new",
+            "--no-first-run",
+            "--no-default-browser-check",
+        ]
+        if _is_macos():
+            exe = self._macos_exe(None)
+            if exe is None:
+                raise FileNotFoundError(f"{self.macos_app_name}.app")
+            return [
+                exe,
+                f"--user-data-dir={profile_root}",
+                f"--profile-directory={profile}",
+                "--remote-debugging-address=127.0.0.1",
+                f"--remote-debugging-port={port}",
+                *extra,
+            ]
+        base = self.live_launch_cmdline(profile_root, profile, port)
+        return [*base, *extra]
+
     def launch_live(
         self,
         profile_root: Path,

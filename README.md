@@ -4,9 +4,9 @@
 [![PyPI](https://img.shields.io/pypi/v/dotbrave.svg)](https://pypi.org/project/dotbrave/)
 [![Python](https://img.shields.io/pypi/pyversions/dotbrave.svg)](https://pypi.org/project/dotbrave/)
 
-Manage Brave as a dotfile. Keep keyboard shortcuts, UI tweaks, and
-force-installed web apps in a single TOML, apply with one command, sync
-across machines — no Brave Sync required.
+Manage Brave as a dotfile. Keep keyboard shortcuts, UI tweaks,
+force-installed web apps, and local unpacked extensions in a single TOML,
+apply with one command, sync across machines — no Brave Sync required.
 
 > **Status: alpha.** Works on Linux, macOS, and Windows against Brave
 > stable, beta, and nightly. Extracted from the multi-browser
@@ -135,8 +135,8 @@ module has no on-disable hook to hang it on.)
 
 ## Build your own config
 
-A single TOML carries `[shortcuts]`, `[settings]`, `[pwa]` and `[shields]`. One `apply`
-writes all three in a single backup + write cycle.
+A single TOML carries `[shortcuts]`, `[settings]`, `[pwa]`, `[shields]`, and `[extensions]`. One `apply`
+writes them in a single backup + write cycle.
 
 ```toml
 # brave.toml
@@ -175,6 +175,13 @@ urls = [
 # and every subdomain.
 disabled = [
   "[*.]messenger.com",
+]
+
+[extensions]
+# Local unpacked extension directories + optional command shortcuts.
+# Paths may be absolute, ~/..., or relative to this TOML file.
+unpacked = [
+  { path = "../tabjump", shortcuts = { _execute_action = "Control+KeyB" } },
 ]
 ```
 
@@ -219,6 +226,18 @@ dotbrave apply brave.toml              # live apply if Brave is running
   Unlike `[pwa]` it is not dynamically refreshable: a running Brave 1.98 on
   Linux re-read the file within a minute but listed the policy on
   `brave://policy` as *Restart required*. Restart Brave after changing it.
+- **Unpacked extensions**: `[extensions] unpacked` loads local extension
+  directories directly in place (turning on Developer Mode automatically)
+  and assigns optional command shortcuts (`shortcuts = { _execute_action = "Control+KeyB" }`),
+  bypassing Chromium's `CommandService::CanAutoAssign` static default-accelerator
+  check on Windows and Linux. Paths may be absolute, `~/...`, or relative to
+  the TOML file. Needs no `sudo` or Administrator privileges: when Brave is
+  running it applies live in a background tab, and when Brave is closed a
+  short-lived `--headless=new` run commits `Secure Preferences` with Brave's
+  own MAC. Editing files inside an unpacked directory and re-running
+  `dotbrave apply` reloads the extension's `manifest.json` and MV3 service
+  worker live without opening `brave://extensions`. Removing an entry from
+  `unpacked` uninstalls it on the next apply.
 - **Empty header** (e.g. `[settings]` with no entries) wipes everything
   dotbrave previously managed in that namespace. **Missing header** = skip
   the namespace entirely.

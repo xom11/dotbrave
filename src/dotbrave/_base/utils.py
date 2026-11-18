@@ -38,6 +38,8 @@ class Plan:
     state_path: Path | None = None
     state_payload: dict[str, Any] | None = None
     external_apply_fn: Callable[[], None] | None = None
+    offline_browser_apply_fn: Callable[[], None] | None = None
+    live_data: Any = None
     warnings: list[str] = field(default_factory=list)
     needs_escalation: bool | None = None
 

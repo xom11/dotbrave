@@ -12,6 +12,7 @@ from dotbrave._base import live_apply as _live
 from dotbrave._base import settings as _base_settings
 from dotbrave._base.utils import Plan
 from dotbrave.command_ids import ID_TO_NAME
+from dotbrave import extensions as extensions_mod
 from dotbrave import shortcuts as shortcuts_mod
 
 
@@ -237,6 +238,7 @@ def _is_shortcut_path(parts: tuple[str, ...]) -> bool:
     return parts[:2] in {
         shortcuts_mod.ACCELERATORS_KEY_PATH,
         shortcuts_mod.DEFAULT_ACCELERATORS_KEY_PATH,
+        ("extensions", "commands"),
     }
 
 
@@ -937,8 +939,11 @@ def apply_live(
         target_prefs,
         _shortcut_removals(plans, managed_before_ids),
     )
+    extensions_plans = [
+        p for p in plans if p.namespace == extensions_mod.NAMESPACE and not p.empty
+    ]
     if (removals or unresolved_shortcuts) and not (
-        newtab_changes or ordinary_changes or shortcut_script
+        newtab_changes or ordinary_changes or shortcut_script or extensions_plans
     ):
         # A diff that is nothing but removals -- none of which had a prior
         # value (or, for [shortcuts], a recorded default) to restore -- has
@@ -966,6 +971,11 @@ def apply_live(
         shortcuts_unsupported: list[str] = []
         if shortcut_script is not None:
             shortcuts_unsupported = _preflight_shortcuts(client, target)
+        extensions_unsupported: list[str] = []
+        for ext_plan in extensions_plans:
+            extensions_unsupported.extend(
+                extensions_mod.preflight_live(client, target, ext_plan)
+            )
 
         # The split is per key, not per run.  One key settingsPrivate does
         # not know used to send everything offline -- every key that would
@@ -984,7 +994,10 @@ def apply_live(
         # `blocked` filters settings changes by key, where a `shortcuts.*`
         # entry has no business being.
         remainder = sorted(
-            blocked | set(shortcuts_unsupported) | set(unresolved_shortcuts)
+            blocked
+            | set(shortcuts_unsupported)
+            | set(unresolved_shortcuts)
+            | set(extensions_unsupported)
         )
 
         if remainder and unattended:
@@ -1001,13 +1014,15 @@ def apply_live(
             raise _live.LiveApplyUnsupported("Brave", remainder)
 
         has_pref_changes = any(
-            not plan.empty and plan.namespace in {"settings", "shortcuts"}
+            not plan.empty
+            and plan.namespace in {"settings", "shortcuts", "extensions"}
             for plan in plans
         )
         will_mutate = bool(
             live_newtab
             or live_ordinary
             or (shortcut_script is not None and not shortcuts_unsupported)
+            or (extensions_plans and not extensions_unsupported)
         )
         # Back up BEFORE the live half lands, whether or not a remainder
         # follows it.  A split run's offline path is told (via
@@ -1051,6 +1066,17 @@ def apply_live(
             client.navigate(target, _SHORTCUTS_URL)
             _await_page(client, target)
             client.evaluate(target, shortcut_script)
+
+        if extensions_plans and not extensions_unsupported:
+            for ext_plan in extensions_plans:
+                extensions_mod.apply_via_cdp(client, target, ext_plan)
+            if remainder:
+                _live.write_state_files(extensions_plans)
+                for ext_plan in extensions_plans:
+                    ext_plan.apply_fn = lambda _prefs: None
+                    ext_plan.verify_fn = lambda _prefs: None
+                    ext_plan.offline_browser_apply_fn = None
+                    ext_plan.state_path = None
 
         if remainder:
             # State files stay unwritten: the offline apply that handles

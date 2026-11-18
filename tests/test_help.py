@@ -35,7 +35,7 @@ def _help(*args: str) -> str:
 
 def test_root_help_explains_capabilities_and_workflow() -> None:
     out = _help()
-    assert "Brave" in out and "[shortcuts] [settings] [pwa]" in out
+    assert "Brave" in out and "[shortcuts] [settings] [pwa] [shields] [extensions]" in out
     assert "--channel" in out
     assert "Typical workflow" in out
     assert "apply --dry-run" in out

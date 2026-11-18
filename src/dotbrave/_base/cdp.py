@@ -178,6 +178,8 @@ class CdpClient:
         if self._browser_ws is not None:
             return self._browser_ws
         if not self._ws_path:
+            self._ws_path = discover_browser_ws_path(self.port)
+        if not self._ws_path:
             raise CdpError(
                 f"no browser websocket path for {self.host}:{self.port}"
             )
@@ -187,6 +189,15 @@ class CdpClient:
             f"ws://{self.host}:{self.port}{self._ws_path}", timeout=15.0
         )
         return self._browser_ws
+
+    def browser_command(
+        self,
+        method: str,
+        params: dict | None = None,
+    ) -> dict:
+        """Send a Browser-target CDP command (e.g. ``Extensions.loadUnpacked``
+        or ``Browser.close``) over the ``/devtools/browser/<id>`` WebSocket."""
+        return self._browser_command(method, params)
 
     def _browser_command(
         self,

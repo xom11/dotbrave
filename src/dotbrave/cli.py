@@ -28,12 +28,13 @@ Two actions:
   export   read your current customizations as a TOML config
   apply    write a TOML config back to Brave (or `--undo` the last apply)
 
-Supported TOML tables: [shortcuts] [settings] [pwa] [shields]
+Supported TOML tables: [shortcuts] [settings] [pwa] [shields] [extensions]
 
 `[shortcuts]` manages keyboard shortcuts, `[settings]` writes unprotected
 Preferences keys, `[pwa]` manages force-installed web apps through
-browser policy, and `[shields]` turns Brave Shields off for listed sites
-through the same policy storage. Live apply is attempted when Brave is running; plain
+browser policy, `[shields]` turns Brave Shields off for listed sites
+through the same policy storage, and `[extensions]` loads local unpacked
+extension directories and binds their shortcuts. Live apply is attempted when Brave is running; plain
 `apply` manages a local endpoint and normal-close fallback automatically.""",
         epilog="""\
 Typical workflow:

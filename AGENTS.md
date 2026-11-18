@@ -7,7 +7,7 @@ focused on implementation constraints.
 ## Project
 
 `dotbrave` manages Brave browser customizations from TOML files: managed
-tables `[shortcuts]`, `[settings]`, `[pwa]`, `[shields]`, applied live when possible with
+tables `[shortcuts]`, `[settings]`, `[pwa]`, `[shields]`, `[extensions]`, applied live when possible with
 an automatic offline fallback, on Linux/macOS/Windows across the stable,
 beta, and nightly channels. It is a Python 3.11+ stdlib-only CLI package,
 extracted from the multi-browser `xom11/dotbrowser` project. The CLI is
@@ -44,7 +44,7 @@ pytest tests/test_platform.py tests/test_macos_pwa_daemon.py
   `browser.register(parser)`.
 - `src/dotbrave/browser.py`: channel/profile-root resolution, plan
   assembly, `cmd_*` handlers, registration.
-- `src/dotbrave/shortcuts.py`, `settings.py`, `pwa.py`, `shields.py`: namespace wrappers
+- `src/dotbrave/shortcuts.py`, `settings.py`, `pwa.py`, `shields.py`, `extensions.py`: namespace wrappers
   (module-level state kept patchable for tests).
 - `src/dotbrave/live.py`: Brave live-apply routes (settingsPrivate, New
   Tab actions, CommandsService).

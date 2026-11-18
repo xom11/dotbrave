@@ -16,15 +16,18 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from functools import partial
 from pathlib import Path
 
 from dotbrave._base.orchestrator import (
+    _looks_like_url,
     cmd_apply as _base_cmd_apply,
     cmd_export as _base_cmd_export,
     cmd_restore as _base_cmd_restore,
     register_actions,
 )
 from dotbrave._base.utils import Plan
+from dotbrave import extensions as extensions_mod
 from dotbrave import live as live_mod
 from dotbrave import pwa as pwa_mod
 from dotbrave import shields as shields_mod
@@ -99,7 +102,13 @@ DEFAULT_PROFILE_ROOT = _default_profile_root()
 # ---------------------------------------------------------------------------
 
 def _build_plans(
-    prefs_path: Path, prefs: dict, doc: dict, *, skip: tuple[str, ...] = ()
+    prefs_path: Path,
+    prefs: dict,
+    doc: dict,
+    *,
+    skip: tuple[str, ...] = (),
+    config_dir: Path | None = None,
+    headless_runner=None,
 ) -> list[Plan]:
     plans: list[Plan] = []
     for mod in (shortcuts_mod, settings_mod, pwa_mod, shields_mod):
@@ -107,6 +116,19 @@ def _build_plans(
             continue
         if mod.NAMESPACE in doc:
             plans.append(mod.plan_apply(prefs_path, prefs, doc[mod.NAMESPACE]))
+    if (
+        extensions_mod.NAMESPACE not in skip
+        and extensions_mod.NAMESPACE in doc
+    ):
+        plans.append(
+            extensions_mod.plan_apply(
+                prefs_path,
+                prefs,
+                doc[extensions_mod.NAMESPACE],
+                config_dir=config_dir,
+                headless_runner=headless_runner,
+            )
+        )
     return plans
 
 
@@ -198,6 +220,11 @@ def cmd_apply(args: argparse.Namespace) -> None:
     if not getattr(args, "config", None):
         sys.exit("error: CONFIG is required (or pass --undo)")
 
+    config_dir = (
+        None
+        if _looks_like_url(args.config)
+        else Path(args.config).expanduser().resolve().parent
+    )
     channel = getattr(args, "channel", "stable")
     if channel == "stable":
         BROWSER_PROCESS.scope_to_profile(
@@ -209,7 +236,7 @@ def cmd_apply(args: argparse.Namespace) -> None:
             running_fn=brave_running,
             find_cmdline_fn=find_main_brave_cmdline,
             restart_fn=restart_brave,
-            build_plans_fn=_build_plans,
+            build_plans_fn=partial(_build_plans, config_dir=config_dir),
             live_apply_fn=live_mod.apply_live,
             graceful_close_fn=BROWSER_PROCESS.close_and_wait,
             launch_live_fn=BROWSER_PROCESS.launch_live,
@@ -226,7 +253,13 @@ def cmd_apply(args: argparse.Namespace) -> None:
         running_fn=proc.running,
         find_cmdline_fn=proc.find_main_cmdline,
         restart_fn=proc.restart,
-        build_plans_fn=_build_plans,
+        build_plans_fn=partial(
+            _build_plans,
+            config_dir=config_dir,
+            headless_runner=lambda r, p, pl: extensions_mod.apply_headless(
+                r, p, pl, proc=proc
+            ),
+        ),
         live_apply_fn=live_mod.apply_live,
         graceful_close_fn=proc.close_and_wait,
         launch_live_fn=proc.launch_live,
@@ -260,6 +293,12 @@ def _export_shields(
     return shields_mod.build_dump_block()
 
 
+def _export_extensions(
+    args: argparse.Namespace, prefs_path: Path, prefs: dict
+) -> list[str] | None:
+    return extensions_mod.build_dump_block(prefs_path, prefs)
+
+
 def cmd_export(args: argparse.Namespace) -> None:
     if getattr(args, "snapshot", False) or getattr(args, "clear", False):
         if not getattr(args, "snapshot", False):
@@ -269,7 +308,13 @@ def cmd_export(args: argparse.Namespace) -> None:
     _base_cmd_export(
         args,
         browser_name="brave",
-        builders=[_export_shortcuts, _export_settings, _export_pwa, _export_shields],
+        builders=[
+            _export_shortcuts,
+            _export_settings,
+            _export_pwa,
+            _export_shields,
+            _export_extensions,
+        ],
     )
 
 
@@ -326,7 +371,7 @@ def register(parser: argparse.ArgumentParser) -> None:
     register_actions(
         parser,
         display_name="Brave",
-        namespaces=("shortcuts", "settings", "pwa", "shields"),
+        namespaces=("shortcuts", "settings", "pwa", "shields", "extensions"),
         cmd_apply_fn=cmd_apply,
         cmd_export_fn=cmd_export,
         export_has_shortcuts=True,

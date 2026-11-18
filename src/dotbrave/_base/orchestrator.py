@@ -437,8 +437,8 @@ def cmd_apply(
             )
             return
         sys.exit(
-            "error: config has no [shortcuts], [settings], [pwa] or "
-            "[shields] table -- nothing to apply"
+            "error: config has no [shortcuts], [settings], [pwa], "
+            "[shields] or [extensions] table -- nothing to apply"
         )
 
     non_empty = [p for p in plans if not p.empty]
@@ -808,15 +808,19 @@ def cmd_apply(
 
     write_atomic(prefs_path, prefs)
 
+    reloaded = load_prefs(prefs_path)
+    for plan in plans:
+        plan.verify_fn(reloaded)
+
+    for plan in plans:
+        if plan.offline_browser_apply_fn is not None and not plan.empty:
+            plan.offline_browser_apply_fn()
+
     for plan in plans:
         if plan.state_path is not None:
             plan.state_path.write_text(
                 json.dumps(plan.state_payload, indent=2), encoding="utf-8",
             )
-
-    reloaded = load_prefs(prefs_path)
-    for plan in plans:
-        plan.verify_fn(reloaded)
     print("ok -- applied and verified")
 
     if relaunch_live_port is not None and launch_live_fn is not None:
@@ -875,6 +879,7 @@ def cmd_apply(
 _RESTORE_SIDECAR_NAMES = (
     "Preferences.dotbrave.shortcuts.json",
     "Preferences.dotbrave.settings.json",
+    "Preferences.dotbrave.extensions.json",
 )
 
 
@@ -1022,6 +1027,8 @@ _EXPORT_HEADER_NOTES = (
     "#                  file / Windows registry.",
     "#   [shields]   -- sites with Brave Shields forced off by managed policy",
     "#                  (present only when that policy is non-empty).",
+    "#   [extensions]-- unpacked extension directories and their shortcuts",
+    "#                  (present only when the profile has unpacked extensions).",
     "#",
     "# To capture ANY setting you change in the browser UI: run `dotbrave",
     "# export --snapshot`, change settings, then re-run `dotbrave export`.",
@@ -1225,7 +1232,7 @@ Examples:
     a.add_argument(
         "--skip",
         action="append",
-        choices=["shortcuts", "settings", "pwa", "shields"],
+        choices=["shortcuts", "settings", "pwa", "shields", "extensions"],
         default=[],
         metavar="NAMESPACE",
         help="do not build a plan for this TOML table; repeatable. Use "
