@@ -492,24 +492,36 @@ def state_file(prefs_path: Path) -> Path:
     return prefs_path.with_name(prefs_path.name + ".dotbrave.extensions.json")
 
 
-def _read_sidecar(prefs_path: Path) -> tuple[dict[str, dict[str, Any]], float | None]:
+def _read_sidecar(
+    prefs_path: Path,
+) -> tuple[dict[str, dict[str, Any]], set[str], float | None]:
     sf = state_file(prefs_path)
     if not sf.exists():
-        return {}, None
+        return {}, set(), None
     try:
         mtime = sf.stat().st_mtime
         data = json.loads(sf.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return {}, None
+        return {}, set(), None
     if not isinstance(data, dict):
-        return {}, mtime
+        return {}, set(), mtime
     managed = data.get("managed", {})
+    raw_uninstalled = data.get("uninstalled_ids", [])
+    uninstalled = (
+        {x for x in raw_uninstalled if isinstance(x, str)}
+        if isinstance(raw_uninstalled, list)
+        else set()
+    )
     if not isinstance(managed, dict):
-        return {}, mtime
-    return {
-        k: v for k, v in managed.items()
-        if isinstance(k, str) and isinstance(v, dict)
-    }, mtime
+        return {}, uninstalled, mtime
+    return (
+        {
+            k: v for k, v in managed.items()
+            if isinstance(k, str) and isinstance(v, dict)
+        },
+        uninstalled,
+        mtime,
+    )
 
 
 def _load_secure_prefs(prefs_path: Path) -> tuple[dict, float]:
@@ -647,10 +659,10 @@ def plan_apply(
 
     disk_settings, disk_mtime = _disk_extension_settings(prefs_path, prefs)
     disk_commands = _disk_extension_commands(prefs)
-    managed_before, sidecar_mtime = _read_sidecar(prefs_path)
+    managed_before, uninstalled_before, sidecar_mtime = _read_sidecar(prefs_path)
     # Brave commits Preferences and Secure Preferences on a ~10s delayed timer.
     # While the sidecar is at least as new as both files on disk, trust what a
-    # live apply just wrote into Brave's memory rather than re-installing.
+    # live apply just wrote into Brave's memory rather than reading stale disk.
     in_commit_window = (
         sidecar_mtime is not None and sidecar_mtime >= disk_mtime
     )
@@ -666,7 +678,11 @@ def plan_apply(
         ext_id = entry.ext_id
         prev = managed_before.get(ext_id)
         rec = disk_settings.get(ext_id)
-        installed_on_disk = _is_healthy_unpacked_record(rec, entry.path, profile_dir)
+        just_uninstalled = in_commit_window and ext_id in uninstalled_before
+        installed_on_disk = (
+            not just_uninstalled
+            and _is_healthy_unpacked_record(rec, entry.path, profile_dir)
+        )
         installed_live = prev is not None and in_commit_window
         is_installed = installed_on_disk or installed_live
 
@@ -753,7 +769,11 @@ def plan_apply(
         diff.append(f"  - {rem_label} (uninstall)")
 
     ops = ExtensionPlanOps(entry_ops=entry_ops, uninstall_ids=uninstall_ids)
-    state_payload = {
+    carried_uninstalled = sorted(
+        (set(uninstall_ids) | (uninstalled_before if in_commit_window else set()))
+        - set(target_by_id)
+    )
+    state_payload: dict[str, Any] = {
         "managed": {
             e.ext_id: {
                 "path": str(e.path),
@@ -767,7 +787,12 @@ def plan_apply(
                 ),
             }
             for e in entries
-        }
+        },
+        **(
+            {"uninstalled_ids": carried_uninstalled}
+            if carried_uninstalled
+            else {}
+        ),
     }
 
     def apply_fn(target_prefs: dict) -> None:
@@ -876,9 +901,24 @@ def apply_via_cdp(client: CdpClient, target: dict, plan: Plan) -> None:
             "})()",
         )
 
+    live_ids_raw = client.evaluate(
+        target,
+        "(async () => ("
+        "await chrome.developerPrivate.getExtensionsInfo()"
+        ").map(e => e.id))()",
+    )
+    live_ids = (
+        {x for x in live_ids_raw if isinstance(x, str)}
+        if isinstance(live_ids_raw, list)
+        else None
+    )
+
     for op in ops.entry_ops:
         ext_id = op.entry.ext_id
-        if op.needs_install:
+        should_install = op.needs_install or (
+            live_ids is not None and ext_id not in live_ids
+        )
+        if should_install:
             params: dict[str, Any] = {"path": str(op.entry.path)}
             if op.entry.incognito is not None:
                 params["enableInIncognito"] = op.entry.incognito

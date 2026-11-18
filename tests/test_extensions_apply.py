@@ -100,6 +100,8 @@ class _FakeExtCdpClient:
             return True
         if "readyState" in expression:
             return True
+        if ").map(e => e.id)" in expression:
+            return sorted(self.installed_ids)
         if "exts.some(e => e.id ===" in expression:
             return any(f'"{eid}"' in expression for eid in self.installed_ids)
         return True
@@ -294,10 +296,43 @@ def test_live_apply_installs_reloads_and_binds_shortcut(
     )
 
     # Emptying [extensions] uninstalls the previously managed unpacked extension.
+    # Seed stale Secure Preferences on disk (simulating Brave's 10s delayed flush)
+    # and verify an immediate re-apply still plans a fresh install (+), not reload (~).
+    old_mtime = time.time() - 5.0
+    sp_path = profile_root / "Default" / "Secure Preferences"
+    sp_path.write_text(
+        json.dumps(
+            {
+                "extensions": {
+                    "settings": {
+                        ext_id: {
+                            "location": 4,
+                            "path": str(ext_dir.resolve()),
+                            "creation_flags": 38,
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.utime(sp_path, (old_mtime, old_mtime))
+
     cfg.write_text("[extensions]\nunpacked = []\n", encoding="utf-8")
     fake_cdp.browser_calls.clear()
     brave_pkg.cmd_apply(args)
     assert ("Extensions.uninstall", {"id": ext_id}) in fake_cdp.browser_calls
+
+    cfg.write_text(
+        '[extensions]\n'
+        'unpacked = [\n'
+        '  { path = "../tabjump", shortcuts = { _execute_action = "Control+KeyB" } },\n'
+        ']\n',
+        encoding="utf-8",
+    )
+    fake_cdp.browser_calls.clear()
+    brave_pkg.cmd_apply(args)
+    assert ("Extensions.loadUnpacked", {"path": str(ext_dir.resolve())}) in fake_cdp.browser_calls
 
 
 # ---------------------------------------------------------------------------
