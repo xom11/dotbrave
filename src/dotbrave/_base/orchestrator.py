@@ -225,8 +225,8 @@ def _partial_note(applied: list[str], pending: list[Plan]) -> str:
     way, and the non-interactive runners that consume it (home-manager
     activation, Windows ``apply.ps1``) report the exit code alone.
     """
-    left = ", ".join(applied)
-    right = ", ".join(f"[{p.namespace}]" for p in pending)
+    left = ", ".join(dict.fromkeys(applied))
+    right = ", ".join(dict.fromkeys(f"[{p.namespace}]" for p in pending))
     if left:
         return f"{left} applied; {right} not applied"
     return f"{right} not applied"
@@ -239,11 +239,12 @@ def _policy_pickup_note(namespaces: tuple[str, ...] = ("pwa",)) -> str:
     watch path. Linux: launchers appeared or vanished 6-51s after the file
     changed. Windows: a new entry installed itself at t+580s.
 
-    Those timings are [pwa]'s. BraveShieldsDisabledForUrls is not
-    dynamically refreshable: a running Brave 1.98 on Linux re-read the
-    file and listed it on brave://policy as "Restart required", so a
-    pickup promise must not cover [shields]."""
-    if "pwa" in namespaces:
+    Those timings cover [pwa] and [extensions] webstore (both have
+    dynamic_refresh: true). BraveShieldsDisabledForUrls is not dynamically
+    refreshable: a running Brave 1.98 on Linux re-read the file and listed
+    it on brave://policy as "Restart required", so a pickup promise must
+    not cover [shields]."""
+    if "pwa" in namespaces or "extensions" in namespaces:
         if sys.platform == "darwin":
             note = "a running one picks it up within a few seconds"
         elif sys.platform == "win32":
@@ -450,8 +451,11 @@ def cmd_apply(
     for plan in plans:
         for warning in plan.warnings:
             print(warning)
+    last_ns: str | None = None
     for plan in non_empty:
-        print(f"{plan.namespace}:")
+        if plan.namespace != last_ns:
+            print(f"{plan.namespace}:")
+            last_ns = plan.namespace
         print("\n".join(plan.diff_lines))
 
     if args.dry_run:
@@ -468,7 +472,9 @@ def cmd_apply(
         and not _already_privileged()
         and any(_needs_root(p) for p in plans)
     ):
-        names = ", ".join(f"[{p.namespace}]" for p in plans if _needs_root(p))
+        names = ", ".join(
+            dict.fromkeys(f"[{p.namespace}]" for p in plans if _needs_root(p))
+        )
         _warn(
             f"unattended: skipping {names} -- it needs elevated privileges. "
             f"Run `dotbrave apply` from a terminal to apply it."
@@ -481,7 +487,9 @@ def cmd_apply(
     needs_escalation = any(p.requires_escalation for p in plans)
     if needs_escalation and not _already_privileged():
         escalating = ", ".join(
-            f"[{p.namespace}]" for p in plans if p.requires_escalation
+            dict.fromkeys(
+                f"[{p.namespace}]" for p in plans if p.requires_escalation
+            )
         )
         if sys.platform == "win32":
             import ctypes
@@ -543,12 +551,14 @@ def cmd_apply(
             # external ones, because writing a [shortcuts] sidecar here
             # would claim Preferences state that has not been written.
             write_state_files(plans if not browser_bound else external)
-            applied_external = [f"[{p.namespace}]" for p in external]
+            applied_external = list(
+                dict.fromkeys(f"[{p.namespace}]" for p in external)
+            )
             names = ", ".join(applied_external)
             ext_namespaces = tuple(p.namespace for p in external)
             reloaded_live = (
                 sys.platform != "darwin"
-                and "pwa" in ext_namespaces
+                and ("pwa" in ext_namespaces or "extensions" in ext_namespaces)
                 and _reload_external_policy_live(
                     args.profile_root, args.profile, find_cmdline_fn
                 )
@@ -668,14 +678,16 @@ def cmd_apply(
                 # the discrepancy it describes.
                 prefs = load_prefs(prefs_path)
                 rebuilt = {
-                    p.namespace: p
+                    (p.namespace, p.external_apply_fn is not None): p
                     for p in build_plans_fn(prefs_path, prefs, doc, skip=skip)
                 }
                 # Keep the run's shape: external plans applied above were
                 # deliberately dropped from `plans` and must not come back,
                 # or the policy would be written a second time.
                 plans = [
-                    rebuilt[p.namespace] for p in plans if p.namespace in rebuilt
+                    rebuilt[(p.namespace, p.external_apply_fn is not None)]
+                    for p in plans
+                    if (p.namespace, p.external_apply_fn is not None) in rebuilt
                 ]
                 non_empty = [p for p in plans if not p.empty]
             live_port = int(live_port)
@@ -1027,8 +1039,8 @@ _EXPORT_HEADER_NOTES = (
     "#                  file / Windows registry.",
     "#   [shields]   -- sites with Brave Shields forced off by managed policy",
     "#                  (present only when that policy is non-empty).",
-    "#   [extensions]-- unpacked extension directories and their shortcuts",
-    "#                  (present only when the profile has unpacked extensions).",
+    "#   [extensions]-- Chrome Web Store and unpacked extensions + shortcuts",
+    "#                  (present only when managed or unpacked extensions exist).",
     "#",
     "# To capture ANY setting you change in the browser UI: run `dotbrave",
     "# export --snapshot`, change settings, then re-run `dotbrave export`.",
@@ -1171,13 +1183,13 @@ Safety:
   Any apply that changes Preferences takes one timestamped backup, live or
   offline; an offline write is also verified by reloading it.
   [settings] keys tracked by Chromium MAC integrity are refused.
-  A changed [pwa] or [shields] table writes managed policy and may require
-  sudo or Administrator privileges.
+  A changed [pwa], [shields], or [extensions] webstore policy writes managed
+  policy and may require sudo or Administrator privileges.
 
 Undo:
   `apply --undo` restores the most recent timestamped Preferences backup
   (taken next to Preferences by any apply that changes it) and clears
-  dotbrave's shortcut/settings sidecars. [pwa]/[shields] policy and the
+  dotbrave's shortcut/settings/extensions sidecars. Managed policy and the
   `export --snapshot` baseline are left untouched.
 
 Execution:
@@ -1246,8 +1258,7 @@ Examples:
         export_scope = (
             "[shortcuts] changes versus Brave defaults, [settings] "
             "well-known keys plus everything dotbrave manages, [pwa] "
-            "force-installed URLs, and [shields] (only when its policy is "
-            "non-empty)."
+            "force-installed URLs, [shields], and [extensions] (when non-empty)."
         )
         e = sub.add_parser(
             "export",

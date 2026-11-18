@@ -1627,7 +1627,7 @@ def read_current_policy(
 def _policy_payload(
     policy_file: Path | None,
     windows_registry_key: str,
-    entries: list,
+    entries: list | dict,
     policy_key: str,
 ) -> dict:
     """macOS has one managed plist per bundle id, shared by every policy
@@ -1643,7 +1643,7 @@ def _policy_payload(
 def build_policy_payload(
     policy_file: Path | None,
     windows_registry_key: str,
-    entries: list,
+    entries: list | dict,
     policy_key: str = POLICY_KEY,
 ) -> bytes:
     return _serialize_payload(
@@ -1683,6 +1683,66 @@ def diff_summary(
     return lines
 
 
+def read_windows_registry_dict(
+    windows_registry_key: str, policy_key: str
+) -> dict:
+    """Read a dict-typed Chromium policy stored as a REG_SZ JSON string on
+    ``HKLM\\<windows_registry_key>`` (``components/policy/core/common/registry_dict.cc``)."""
+    try:
+        key = winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            windows_registry_key,
+            0,
+            winreg.KEY_READ,
+        )
+    except OSError:
+        return {}
+    try:
+        value, vtype = winreg.QueryValueEx(key, policy_key)
+    except OSError:
+        return {}
+    finally:
+        winreg.CloseKey(key)
+    if vtype != winreg.REG_SZ or not isinstance(value, str) or not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def write_windows_registry_dict(
+    windows_registry_key: str,
+    mapping: dict,
+    policy_key: str,
+) -> None:
+    """Write a dict-typed Chromium policy as a REG_SZ JSON value directly on
+    ``HKLM\\<windows_registry_key>``, or delete the value when ``mapping`` is empty."""
+    key = winreg.CreateKeyEx(
+        winreg.HKEY_LOCAL_MACHINE,
+        windows_registry_key,
+        0,
+        winreg.KEY_WRITE,
+    )
+    try:
+        if mapping:
+            winreg.SetValueEx(
+                key,
+                policy_key,
+                0,
+                winreg.REG_SZ,
+                json.dumps(mapping, sort_keys=True),
+            )
+        else:
+            try:
+                winreg.DeleteValue(key, policy_key)
+            except FileNotFoundError:
+                pass
+    finally:
+        winreg.CloseKey(key)
+
+
 def write_windows_registry(
     windows_registry_key: str,
     entries: list,
@@ -1719,20 +1779,23 @@ def write_windows_registry(
 def sudo_write_policy(
     policy_file: Path | None,
     windows_registry_key: str,
-    entries: list,
+    entries: list | dict,
     *,
     policy_key: str = POLICY_KEY,
     managed_keys: tuple[str, ...] = (POLICY_KEY,),
 ) -> None:
-    """Write one list policy via the platform-specific privileged path.
+    """Write one list or dict policy via the platform-specific privileged path.
 
     ``managed_keys`` names every key dotbrave writes into the shared macOS
     plist. The self-healing daemon restores the *whole* plist from its
     source copy, so it stays installed while any of them is non-empty --
     emptying ``[pwa]`` must not strip the pin and the daemon from a
-    ``[shields]`` list still living in the same file."""
+    ``[shields]`` or ``[extensions]`` policy still living in the same file."""
     if sys.platform == "win32":
-        write_windows_registry(windows_registry_key, entries, policy_key)
+        if isinstance(entries, dict):
+            write_windows_registry_dict(windows_registry_key, entries, policy_key)
+        else:
+            write_windows_registry(windows_registry_key, entries, policy_key)
         return
     payload = _policy_payload(policy_file, windows_registry_key, entries, policy_key)
     content = _serialize_payload(payload)

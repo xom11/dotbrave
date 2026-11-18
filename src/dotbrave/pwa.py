@@ -19,8 +19,12 @@ from dotbrave._base.utils import Plan, find_preferences
 NAMESPACE = _base.NAMESPACE
 POLICY_KEY = _base.POLICY_KEY
 # Every key dotbrave writes into the one macOS managed plist ([shields]
-# shares it); see ``_base.sudo_write_policy``.
-MANAGED_POLICY_KEYS = (POLICY_KEY, "BraveShieldsDisabledForUrls")
+# and [extensions] webstore share it); see ``_base.sudo_write_policy``.
+MANAGED_POLICY_KEYS = (
+    POLICY_KEY,
+    "BraveShieldsDisabledForUrls",
+    "ExtensionSettings",
+)
 
 _PWA_CONFIG = _base.PwaConfig(
     browser_name="brave",

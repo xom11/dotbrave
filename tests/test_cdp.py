@@ -612,3 +612,32 @@ def test_orchestrator_pwa_apply_uses_live_cdp_reload_on_windows(
             and "reloadPolicies" in c["params"]["expression"]
             for c in srv.commands
         )
+
+
+def test_create_page_prefers_background_browser_ws_over_http_json_new(
+    tmp_path: Path,
+) -> None:
+    """Plain ``CdpClient(port).create_page(...)`` (with no ``ws_path`` passed
+    upfront, as ``live.apply_live`` uses on a fixed ``--remote-debugging-port``)
+    must discover ``/devtools/browser/<id>`` via ``/json/version`` and open the
+    work tab with ``Target.createTarget(..., background=True)`` so it never
+    steals focus via ``PUT /json/new``."""
+    profile_dir = tmp_path / "Default"
+    profile_dir.mkdir()
+
+    with _MockHttpAndWsDevToolsServer(profile_dir) as srv:
+        client = cdp.CdpClient(srv.port)
+        try:
+            target = client.create_page("about:blank")
+            assert target["_via_browser_ws"] is True
+            create_cmd = next(
+                c for c in srv.commands if c["method"] == "Target.createTarget"
+            )
+            assert create_cmd["params"] == {
+                "url": "about:blank",
+                "background": True,
+            }
+            assert not any(p.startswith("/json/new") for p in srv.http_paths)
+            client.close_page(target)
+        finally:
+            client.close()

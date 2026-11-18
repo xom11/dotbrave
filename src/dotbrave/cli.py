@@ -33,9 +33,11 @@ Supported TOML tables: [shortcuts] [settings] [pwa] [shields] [extensions]
 `[shortcuts]` manages keyboard shortcuts, `[settings]` writes unprotected
 Preferences keys, `[pwa]` manages force-installed web apps through
 browser policy, `[shields]` turns Brave Shields off for listed sites
-through the same policy storage, and `[extensions]` loads local unpacked
-extension directories and binds their shortcuts. Live apply is attempted when Brave is running; plain
-`apply` manages a local endpoint and normal-close fallback automatically.""",
+through the same policy storage, and `[extensions]` installs Chrome Web
+Store extensions (`webstore`) and local unpacked extension directories
+(`unpacked`) and binds their shortcuts. Live apply is attempted when Brave
+is running; plain `apply` manages a local endpoint and normal-close
+fallback automatically.""",
         epilog="""\
 Typical workflow:
   dotbrave export -o brave.toml    # start from your current state

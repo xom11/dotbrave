@@ -78,9 +78,13 @@ focus_location    = ["Control+KeyL"]
 #   "https://squoosh.app/",
 # ]
 
-# [extensions] — unpacked local extension directories + command shortcuts.
+# [extensions] — Chrome Web Store (`webstore`, requires sudo/Admin) and
+# unpacked local extension directories (`unpacked`) + command shortcuts.
 #
 # [extensions]
+# webstore = [
+#   { id = "gfbliohnnapiefjpjlpjnehglfpaknnc", name = "Surfingkeys", file_access = true },
+# ]
 # unpacked = [
 #   { path = "../my-extension", shortcuts = { _execute_action = "Control+KeyB" } },
 # ]

@@ -5,7 +5,8 @@
 [![Python](https://img.shields.io/pypi/pyversions/dotbrave.svg)](https://pypi.org/project/dotbrave/)
 
 Manage Brave as a dotfile. Keep keyboard shortcuts, UI tweaks,
-force-installed web apps, and local unpacked extensions in a single TOML,
+force-installed web apps, and Chrome Web Store or local unpacked extensions
+in a single TOML,
 apply with one command, sync across machines — no Brave Sync required.
 
 > **Status: alpha.** Works on Linux, macOS, and Windows against Brave
@@ -178,8 +179,12 @@ disabled = [
 ]
 
 [extensions]
-# Local unpacked extension directories + optional command shortcuts.
-# Paths may be absolute, ~/..., or relative to this TOML file.
+# Chrome Web Store extensions via ExtensionSettings policy (sudo / Admin)
+# + local unpacked extension directories + optional command shortcuts.
+webstore = [
+  "nngceckbapebfimnlniiiahkandclblb",
+  { id = "gfbliohnnapiefjpjlpjnehglfpaknnc", name = "Surfingkeys", pin = "default", file_access = true },
+]
 unpacked = [
   { path = "../tabjump", shortcuts = { _execute_action = "Control+KeyB" } },
 ]
@@ -226,9 +231,25 @@ dotbrave apply brave.toml              # live apply if Brave is running
   Unlike `[pwa]` it is not dynamically refreshable: a running Brave 1.98 on
   Linux re-read the file within a minute but listed the policy on
   `brave://policy` as *Restart required*. Restart Brave after changing it.
+- **Chrome Web Store extensions**: `[extensions] webstore` writes Chromium's
+  `ExtensionSettings` managed policy (`installation_mode = "force_installed"`
+  by default or `mode = "normal"`, Chrome Web Store `update_url`, and optional
+  `pin = "force" | "default" | "unpinned" | bool`). Entries may be bare 32-char
+  extension IDs (`"a".."p"`) or `{ id, name, mode, pin, file_access, incognito, shortcuts, platforms }`
+  tables (`name` is a human-readable diff label only). Like `[pwa]`, policy
+  changes require `sudo` on Linux/macOS or Administrator on Windows (merged
+  into the shared macOS plist, `/etc/brave/policies/managed/dotbrave-extensions.json`
+  on Linux, and a `REG_SZ` JSON dict at
+  `HKLM\Software\Policies\BraveSoftware\Brave\ExtensionSettings` on Windows)
+  and refresh dynamically in a running Brave; optional `file_access`,
+  `incognito`, and `shortcuts` fields are applied via `chrome.developerPrivate`
+  once Brave installs the extension. Omitting `webstore` leaves existing
+  `ExtensionSettings` policy untouched; omitting `unpacked` leaves managed
+  unpacked extensions untouched; an empty `[extensions]` header resets both.
 - **Unpacked extensions**: `[extensions] unpacked` loads local extension
   directories directly in place (turning on Developer Mode automatically)
-  and assigns optional command shortcuts (`shortcuts = { _execute_action = "Control+KeyB" }`),
+  and assigns optional `incognito`, `file_access`, and command `shortcuts`
+  (`shortcuts = { _execute_action = "Control+KeyB" }`),
   bypassing Chromium's `CommandService::CanAutoAssign` static default-accelerator
   check on Windows and Linux. Paths may be absolute, `~/...`, or relative to
   the TOML file. Needs no `sudo` or Administrator privileges: when Brave is

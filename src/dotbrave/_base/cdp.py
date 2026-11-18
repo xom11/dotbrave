@@ -178,7 +178,7 @@ class CdpClient:
         if self._browser_ws is not None:
             return self._browser_ws
         if not self._ws_path:
-            self._ws_path = discover_browser_ws_path(self.port)
+            self._ws_path = discover_browser_ws_path(self.port, host=self.host)
         if not self._ws_path:
             raise CdpError(
                 f"no browser websocket path for {self.host}:{self.port}"
@@ -262,44 +262,54 @@ class CdpClient:
 
         Live apply drives privileged UI pages in a dedicated tab so no
         user tab gets navigated away; callers close it when done.
+        Prefer Browser-level ``Target.createTarget(..., background=True)``
+        so opening the work tab never steals focus from the user's active
+        tab/window, falling back to ``PUT /json/new`` on HTTP-only endpoints.
         """
         if self._browser_ws is None:
-            path = f"/json/new?{urllib.parse.quote(url, safe=':/')}"
-            req = urllib.request.Request(
-                f"http://{self.host}:{self.port}{path}", method="PUT"
-            )
             try:
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    created = json.loads(resp.read().decode("utf-8"))
-                if not isinstance(created, dict):
-                    raise RuntimeError("unexpected /json/new response")
-                return created
-            except (urllib.error.URLError, TimeoutError, OSError,
-                    json.JSONDecodeError) as e:
-                if not self._ws_path:
-                    raise RuntimeError(f"could not open a DevTools work tab: {e}")
+                self._ensure_browser_ws()
+            except CdpError:
+                pass
 
-        # background=True keeps focus on the user's active window/tab.
-        res = self._browser_command(
-            "Target.createTarget", {"url": url, "background": True}
-        ).get("result", {})
-        tid = res.get("targetId")
-        if not isinstance(tid, str) or not tid:
-            raise RuntimeError("unexpected Target.createTarget response")
-        sess = self._browser_command(
-            "Target.attachToTarget", {"targetId": tid, "flatten": True}
-        ).get("result", {})
-        sid = sess.get("sessionId")
-        if not isinstance(sid, str) or not sid:
-            raise RuntimeError("Target.attachToTarget returned no sessionId")
-        return {
-            "id": tid,
-            "targetId": tid,
-            "type": "page",
-            "url": url,
-            "_session_id": sid,
-            "_via_browser_ws": True,
-        }
+        if self._browser_ws is not None:
+            try:
+                res = self._browser_command(
+                    "Target.createTarget", {"url": url, "background": True}
+                ).get("result", {})
+                tid = res.get("targetId")
+                if not isinstance(tid, str) or not tid:
+                    raise RuntimeError("unexpected Target.createTarget response")
+                sess = self._browser_command(
+                    "Target.attachToTarget", {"targetId": tid, "flatten": True}
+                ).get("result", {})
+                sid = sess.get("sessionId")
+                if not isinstance(sid, str) or not sid:
+                    raise RuntimeError("Target.attachToTarget returned no sessionId")
+                return {
+                    "id": tid,
+                    "targetId": tid,
+                    "type": "page",
+                    "url": url,
+                    "_session_id": sid,
+                    "_via_browser_ws": True,
+                }
+            except CdpError:
+                pass
+
+        path = f"/json/new?{urllib.parse.quote(url, safe=':/')}"
+        req = urllib.request.Request(
+            f"http://{self.host}:{self.port}{path}", method="PUT"
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                created = json.loads(resp.read().decode("utf-8"))
+            if not isinstance(created, dict):
+                raise RuntimeError("unexpected /json/new response")
+            return created
+        except (urllib.error.URLError, TimeoutError, OSError,
+                json.JSONDecodeError) as e:
+            raise RuntimeError(f"could not open a DevTools work tab: {e}")
 
     def close_page(self, target: dict) -> None:
         """Best-effort close of a tab opened via ``create_page``."""
@@ -635,7 +645,9 @@ _RELOAD_POLICIES_JS = (
 )
 
 
-def discover_browser_ws_path(port: int) -> str | None:
+def discover_browser_ws_path(
+    port: int, *, host: str = "127.0.0.1"
+) -> str | None:
     """Read the ``/devtools/browser/<id>`` WebSocket path from ``/json/version``.
 
     Opening a work tab through ``Target.createTarget`` with ``background: True``
@@ -644,7 +656,7 @@ def discover_browser_ws_path(port: int) -> str | None:
     """
     try:
         with urllib.request.urlopen(
-            f"http://127.0.0.1:{port}/json/version", timeout=0.5
+            f"http://{host}:{port}/json/version", timeout=0.5
         ) as resp:
             info = json.loads(resp.read().decode("utf-8"))
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):

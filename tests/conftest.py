@@ -33,11 +33,46 @@ def _desktop_session(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-test")
     monkeypatch.setattr(orchestrator, "_REOPEN_GRACE_S", 0.0)
     monkeypatch.setattr(orchestrator, "_PREVIOUS_EXIT_TIMEOUT_S", 0.0)
+    from dotbrave import extensions, shields
     from dotbrave._base import cdp
     from dotbrave._base import pwa as base_pwa
 
     monkeypatch.setattr(cdp, "_RECORDED_PORT_RETRY_S", 0.0)
     monkeypatch.setattr(base_pwa, "_DARWIN_WATCHER_POKE_S", 0.0)
+    monkeypatch.setattr(extensions, "_WEBSTORE_INSTALL_WAIT_S", 0.0)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_managed_policies(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Keep host OS managed policies out of in-process unit tests unless a
+    test redirects ``POLICY_FILE`` / ``_WINDOWS_POLICY_KEY`` explicitly."""
+    import sys
+    from dotbrave import extensions, shields
+
+    iso_dir = tmp_path / "_isolated_policy"
+    if sys.platform == "darwin":
+        shared = iso_dir / "com.brave.Browser.plist"
+        if shields.POLICY_FILE is not None:
+            monkeypatch.setattr(shields, "POLICY_FILE", shared)
+        if extensions.POLICY_FILE is not None:
+            monkeypatch.setattr(extensions, "POLICY_FILE", shared)
+    elif sys.platform == "win32":
+        iso_key = r"Software\Policies\DotbraveTestIsolated\Brave"
+        monkeypatch.setattr(shields, "_WINDOWS_POLICY_KEY", iso_key)
+        monkeypatch.setattr(extensions, "_WINDOWS_POLICY_KEY", iso_key)
+    else:
+        if shields.POLICY_FILE is not None:
+            monkeypatch.setattr(
+                shields, "POLICY_FILE", iso_dir / "dotbrave-shields.json"
+            )
+        if extensions.POLICY_FILE is not None:
+            monkeypatch.setattr(
+                extensions,
+                "POLICY_FILE",
+                iso_dir / "dotbrave-extensions.json",
+            )
 
 
 @pytest.fixture

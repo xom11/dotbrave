@@ -237,14 +237,33 @@ Preserve these contracts unless a change explicitly redesigns them:
    the reconcile is unverified -- the event is intermittent and resisted
    every attempt to trigger it on demand -- so the heal log is the
    instrument: a line in it means the pin failed that boot.
-   `[shields]` (`BraveShieldsDisabledForUrls`) is the same kind of
-   external policy and shares that macOS plist, so the daemon guards both:
+   `[shields]` (`BraveShieldsDisabledForUrls`) and `[extensions] webstore`
+   (`ExtensionSettings`) are the same kind of external policy and share that
+   macOS plist, so the daemon guards all three:
    `sudo_write_policy` keeps it while *any* key in `MANAGED_POLICY_KEYS` is
-   non-empty, and both writers seed its source with the merged plist. A
+   non-empty, and all writers seed its source with the merged plist. A
    new key written into that plist must join `MANAGED_POLICY_KEYS`, or
    emptying `[pwa]` boots the daemon out and unpins a file still holding
    it. On Linux each namespace owns a whole file in the policy dir
-   (`dotbrave-shields.json`), because the Linux payload is not merged.
+   (`dotbrave-shields.json`, `dotbrave-extensions.json`), because the Linux
+   payload is not merged. On Windows, list policies (`WebAppInstallForceList`,
+   `BraveShieldsDisabledForUrls`) use numbered `REG_SZ` values in a subkey,
+   whereas `ExtensionSettings` is a `type: dict` policy stored as a single
+   `REG_SZ` JSON value directly on `HKLM\Software\Policies\BraveSoftware\Brave`
+   (`read_windows_registry_dict` / `write_windows_registry_dict`).
+   `[extensions]` splits into up to two `Plan`s (`plan_apply_all`): an
+   external policy plan (emitted only when `webstore` is present or
+   `[extensions]` is empty) and an unprivileged browser-bound plan for
+   `unpacked` plus any `file_access`/`incognito`/`shortcuts` on `webstore`
+   entries, so an `unpacked`-only config never escalates and a `webstore`-only
+   config never uninstalls managed unpacked extensions. Downgrading a
+   `webstore` entry from `force` to `normal` makes Chromium uninstall the
+   forced copy (`userMayModify: false`) and reinstall a fresh normal copy
+   (`userMayModify: true`, permissions reset to `false`), and re-adding a
+   `webstore` entry within 10s of a policy removal sees stale `Secure Preferences`
+   on disk -- so `_build_browser_plan` forces permission/shortcut re-application
+   on both transitions and `apply_via_cdp` polls past `userMayModify: false`
+   on mode downgrades.
    On Linux the policy reaches every `--user-data-dir`, and a throwaway
    profile overwrites the real profile's launchers (same file names, its own
    data dir in `Exec`). A per-user systemd path unit runs

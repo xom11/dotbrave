@@ -120,8 +120,8 @@ def _build_plans(
         extensions_mod.NAMESPACE not in skip
         and extensions_mod.NAMESPACE in doc
     ):
-        plans.append(
-            extensions_mod.plan_apply(
+        plans.extend(
+            extensions_mod.plan_apply_all(
                 prefs_path,
                 prefs,
                 doc[extensions_mod.NAMESPACE],
