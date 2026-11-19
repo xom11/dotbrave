@@ -28,9 +28,19 @@ def _desktop_session(monkeypatch: pytest.MonkeyPatch) -> None:
     previous instance to exit and the pause between endpoint probes are
     skipped too: the process callbacks here are fakes that answer
     instantly."""
-    from dotbrave._base import orchestrator
+    from dotbrave._base import orchestrator, process
 
     monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-test")
+    monkeypatch.delenv("SSH_CONNECTION", raising=False)
+    monkeypatch.delenv("SSH_TTY", raising=False)
+    monkeypatch.setattr(process, "_macos_launchctl_managername", lambda: "Aqua")
+    monkeypatch.setattr(
+        process,
+        "_macos_security_session_attrs",
+        lambda: process._MACOS_SESSION_HAS_GRAPHIC_ACCESS,
+    )
+    monkeypatch.setattr(process, "_macos_default_keychain_unlocked", lambda: True)
+    monkeypatch.setattr(process, "_windows_session_ids", lambda: (1, 1))
     monkeypatch.setattr(orchestrator, "_REOPEN_GRACE_S", 0.0)
     monkeypatch.setattr(orchestrator, "_PREVIOUS_EXIT_TIMEOUT_S", 0.0)
     from dotbrave import extensions, shields

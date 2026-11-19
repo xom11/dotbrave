@@ -55,6 +55,26 @@ def _is_windows() -> bool:
     return sys.platform == "win32"
 
 
+def _windows_session_ids() -> tuple[int, int] | None:
+    """Return ``(current_session_id, active_console_session_id)`` on Windows,
+    or ``None`` when nobody is logged in at the console or lookup fails."""
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        console = kernel32.WTSGetActiveConsoleSessionId()
+        if console == 0xFFFFFFFF:  # nobody at the console
+            return None
+        sid = ctypes.c_ulong()
+        if not kernel32.ProcessIdToSessionId(
+            kernel32.GetCurrentProcessId(), ctypes.byref(sid)
+        ):
+            return None
+        return int(sid.value), int(console)
+    except (OSError, AttributeError):
+        return None
+
+
 def _windows_console_session_mismatch() -> bool:
     """True when this process runs outside the interactive desktop session.
 
@@ -67,21 +87,208 @@ def _windows_console_session_mismatch() -> bool:
     """
     if not _is_windows():
         return False
+    ids = _windows_session_ids()
+    return ids is not None and ids[0] != ids[1]
+
+
+# <Security/AuthSession.h> SessionAttributeBits
+_MACOS_SESSION_HAS_GRAPHIC_ACCESS = 0x0010
+_MACOS_SESSION_IS_REMOTE = 0x1000
+# <Security/SecKeychain.h> SecKeychainStatus
+_MACOS_KEYCHAIN_UNLOCKED = 0x0001
+_MACOS_KEYCHAIN_READABLE = 0x0002
+
+
+def _macos_launchctl_managername() -> str | None:
+    """The caller's launchd bootstrap session type (``'Aqua'``,
+    ``'Background'``, ...), or ``None`` when ``launchctl`` is unavailable."""
+    exe = "/bin/launchctl" if os.path.exists("/bin/launchctl") else "launchctl"
+    try:
+        out = subprocess.check_output(
+            [exe, "managername"], stderr=subprocess.DEVNULL
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError, OSError):
+        return None
+    name = out.decode("utf-8", "replace").strip()
+    return name or None
+
+
+def _macos_security_session_attrs() -> int | None:
+    """``SessionAttributeBits`` for ``callerSecuritySession`` via
+    ``Security.framework``, or ``None`` when unavailable."""
     try:
         import ctypes
 
-        kernel32 = ctypes.windll.kernel32
-        console = kernel32.WTSGetActiveConsoleSessionId()
-        if console == 0xFFFFFFFF:  # nobody at the console
-            return False
-        sid = ctypes.c_ulong()
-        if not kernel32.ProcessIdToSessionId(
-            kernel32.GetCurrentProcessId(), ctypes.byref(sid)
+        sec = ctypes.CDLL(
+            "/System/Library/Frameworks/Security.framework/Security"
+        )
+        sec.SessionGetInfo.argtypes = [
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        sec.SessionGetInfo.restype = ctypes.c_int32
+        sid = ctypes.c_uint32(0)
+        attrs = ctypes.c_uint32(0)
+        if (
+            sec.SessionGetInfo(
+                0xFFFFFFFF, ctypes.byref(sid), ctypes.byref(attrs)
+            )
+            != 0
         ):
-            return False
-        return sid.value != console
+            return None
+        return int(attrs.value)
     except (OSError, AttributeError):
-        return False
+        return None
+
+
+def _macos_default_keychain_unlocked() -> bool | None:
+    """Whether the user's default login Keychain is unlocked and readable
+    without user interaction.
+
+    Uses ``SecKeychainGetStatus`` with ``SecKeychainSetUserInteractionAllowed(0)``
+    so probing a locked keychain can never trigger a modal unlock dialog.
+    Measured on macOS 26.6: returns ``True`` (``status=0x7``) inside an
+    unlocked Aqua GUI session and ``False`` (``status=0x2``) over SSH even
+    while the same user is logged into the GUI console.
+    """
+    try:
+        import ctypes
+
+        sec = ctypes.CDLL(
+            "/System/Library/Frameworks/Security.framework/Security"
+        )
+        cf = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+        )
+        sec.SecKeychainGetUserInteractionAllowed.argtypes = [
+            ctypes.POINTER(ctypes.c_uint8)
+        ]
+        sec.SecKeychainGetUserInteractionAllowed.restype = ctypes.c_int32
+        sec.SecKeychainSetUserInteractionAllowed.argtypes = [ctypes.c_uint8]
+        sec.SecKeychainSetUserInteractionAllowed.restype = ctypes.c_int32
+        sec.SecKeychainCopyDefault.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+        sec.SecKeychainCopyDefault.restype = ctypes.c_int32
+        sec.SecKeychainGetStatus.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        sec.SecKeychainGetStatus.restype = ctypes.c_int32
+        cf.CFRelease.argtypes = [ctypes.c_void_p]
+
+        prev = ctypes.c_uint8(1)
+        had_prev = (
+            sec.SecKeychainGetUserInteractionAllowed(ctypes.byref(prev)) == 0
+        )
+        sec.SecKeychainSetUserInteractionAllowed(0)
+        kc = ctypes.c_void_p()
+        try:
+            if (
+                sec.SecKeychainCopyDefault(ctypes.byref(kc)) != 0
+                or not kc.value
+            ):
+                return False
+            status = ctypes.c_uint32(0)
+            if sec.SecKeychainGetStatus(kc, ctypes.byref(status)) != 0:
+                return False
+            mask = _MACOS_KEYCHAIN_UNLOCKED | _MACOS_KEYCHAIN_READABLE
+            return (status.value & mask) == mask
+        finally:
+            if kc.value:
+                cf.CFRelease(kc)
+            if had_prev:
+                sec.SecKeychainSetUserInteractionAllowed(prev.value)
+    except (OSError, AttributeError):
+        pass
+
+    exe = (
+        "/usr/bin/security"
+        if os.path.exists("/usr/bin/security")
+        else "security"
+    )
+    try:
+        res = subprocess.run(
+            [exe, "show-keychain-info"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except (FileNotFoundError, OSError):
+        return None
+    return res.returncode == 0
+
+
+def _macos_keychain_session_blocker(display_name: str) -> str | None:
+    """Why launching ``display_name`` on macOS now would lack Aqua / Keychain
+    access (permanently wiping OSCrypt ``v10`` cookies), or ``None``.
+
+    Measured on macOS 26.6 / Brave 158: exec'ing the bundle binary directly
+    (both ``--headless=new`` in ``extensions.apply_headless`` and live
+    endpoint bootstrap/relaunch in ``_spawn_detached``) inherits the caller's
+    launchd domain and XNU ``SecuritySessionId``.  Outside ``Aqua`` -- or when
+    the default login Keychain is locked in this security session --
+    ``OSCrypt`` fails to read ``"Brave Safe Storage"``
+    (``errSecInteractionNotAllowed``), and ``SQLitePersistentCookieStore``
+    deletes every undecryptable ``v10`` row in ``Cookies`` with
+    ``PRAGMA secure_delete = 1``.
+
+    Deliberately checks ``SSH_CONNECTION`` rather than ``SSH_TTY``: user
+    LaunchAgents running inside ``Aqua`` (e.g. ``orca-serve``) may set
+    ``SSH_TTY=1`` for OSC52 clipboard integration while holding full Aqua and
+    Keychain access.
+    """
+    if not _is_macos():
+        return None
+    if os.environ.get("SSH_CONNECTION"):
+        return (
+            f"this command is running over SSH ($SSH_CONNECTION is set), "
+            f"outside the macOS Aqua GUI security session. Launching "
+            f"{display_name} here cannot read 'Brave Safe Storage' from the "
+            f"login Keychain (errSecInteractionNotAllowed), which causes "
+            f"Chromium to treat every encrypted cookie as corrupt and wipe "
+            f"Cookies. Run `dotbrave apply` from a local terminal inside the "
+            f"macOS desktop session (or connect live to a {display_name} "
+            f"already started there with --remote-debugging-port)."
+        )
+    manager = _macos_launchctl_managername()
+    if manager is not None and manager != "Aqua":
+        return (
+            f"this process is in macOS launchd session {manager!r}, not "
+            f"'Aqua' (SSH, cron, or a background daemon?). Launching "
+            f"{display_name} outside the Aqua GUI security session cannot "
+            f"read 'Brave Safe Storage' from the login Keychain "
+            f"(errSecInteractionNotAllowed), which wipes encrypted profile "
+            f"cookies. Run `dotbrave apply` from a terminal inside the "
+            f"macOS desktop session."
+        )
+    attrs = _macos_security_session_attrs()
+    if attrs is not None and (
+        not (attrs & _MACOS_SESSION_HAS_GRAPHIC_ACCESS)
+        or bool(attrs & _MACOS_SESSION_IS_REMOTE)
+    ):
+        return (
+            f"this macOS security session lacks Aqua graphic/Keychain access "
+            f"(SessionGetInfo attrs={attrs:#x}). Launching {display_name} "
+            f"here cannot read 'Brave Safe Storage' from the login Keychain, "
+            f"which wipes encrypted profile cookies. Run `dotbrave apply` "
+            f"from a terminal inside the macOS desktop session."
+        )
+    if manager is None and attrs is None:
+        return (
+            f"cannot verify that this process is inside the macOS Aqua GUI "
+            f"security session (neither launchctl nor Security.framework "
+            f"responded); refusing to launch {display_name} rather than risk "
+            f"wiping Keychain-encrypted cookies."
+        )
+    if _macos_default_keychain_unlocked() is not True:
+        return (
+            f"the macOS default login Keychain is locked or inaccessible in "
+            f"this session. Launching {display_name} without 'Brave Safe "
+            f"Storage' Keychain access causes Chromium to wipe encrypted "
+            f"profile cookies. Unlock your login Keychain inside the macOS "
+            f"desktop session (`security unlock-keychain`) and retry."
+        )
+    return None
 
 
 def _run_in_console_session(command: str) -> str | None:
@@ -614,21 +821,27 @@ class BrowserProcess:
         for key in _DISPLAY_IDENTITY_KEYS:
             if key != "WAYLAND_SOCKET" and session.get(key):
                 env[key] = session[key]
-        for key in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"):
-            if not env.get(key) and session.get(key):
-                env[key] = session[key]
+        if not env.get("XDG_RUNTIME_DIR") and session.get("XDG_RUNTIME_DIR"):
+            env["XDG_RUNTIME_DIR"] = session["XDG_RUNTIME_DIR"]
+        if session.get("DBUS_SESSION_BUS_ADDRESS"):
+            env["DBUS_SESSION_BUS_ADDRESS"] = session["DBUS_SESSION_BUS_ADDRESS"]
         return env
 
     def relaunch_blocker(self) -> str | None:
-        """Why closing the browser now would leave it closed, or None.
+        """Why closing the browser now would leave it closed or corrupt its
+        profile, or None.
 
-        Call after :meth:`find_main_cmdline`.  Linux only: a relaunch with
-        neither ``$WAYLAND_DISPLAY`` nor ``$DISPLAY`` dies at startup, so
-        the browser dotbrave closed never comes back.  Only a browser
-        whose own command line says headless is exempt -- an empty
-        environment proves nothing (see :func:`_find_session_env`).
+        Call after :meth:`find_main_cmdline`.  On macOS, direct bundle-binary
+        launches inherit a non-Aqua / locked-Keychain session and wipe
+        Keychain-encrypted cookies.  On Linux, a relaunch with neither
+        ``$WAYLAND_DISPLAY`` nor ``$DISPLAY`` dies at startup, so the browser
+        dotbrave closed never comes back; only a browser whose own command
+        line says headless is exempt -- an empty environment proves nothing
+        (see :func:`_find_session_env`).
         """
-        if _is_macos() or _is_windows():
+        if _is_macos():
+            return _macos_keychain_session_blocker(self.display_name)
+        if _is_windows():
             return None
         env = self._launch_env() or os.environ
         if env.get("WAYLAND_DISPLAY") or env.get("DISPLAY"):
@@ -643,6 +856,62 @@ class BrowserProcess:
             f"terminal inside the desktop session, or close "
             f"{self.display_name} yourself and rerun to apply offline."
         )
+
+    def headless_blocker(self) -> str | None:
+        """Why launching ``--headless=new`` against the profile now would lack
+        OS cookie/credential encryption keys, or None.
+
+        Checks all three platforms:
+        - macOS: requires the ``Aqua`` GUI security session with an unlocked
+          default login Keychain so ``OSCrypt`` can read ``"Brave Safe
+          Storage"`` without wiping ``v10`` cookies.
+        - Windows: refuses cross-session launches (e.g. SSH Session 0), where
+          key-based SSH tokens can lack user DPAPI / App-Bound Encryption
+          access.
+        - Linux: requires either a desktop session captured from a running
+          browser (:meth:`_launch_env`) or a local graphical session in
+          ``os.environ`` so ``XDG_CURRENT_DESKTOP`` and
+          ``DBUS_SESSION_BUS_ADDRESS`` reach GNOME Keyring / KWallet for
+          ``v11`` cookies instead of falling back to ``BASIC_TEXT``.
+        """
+        if _is_macos():
+            return _macos_keychain_session_blocker(self.display_name)
+        if _is_windows():
+            if _windows_console_session_mismatch():
+                return (
+                    f"this command is running outside the interactive Windows "
+                    f"desktop session (e.g. over SSH in Session 0). Launching "
+                    f"headless {self.display_name} in Session 0 can lack user "
+                    f"DPAPI / App-Bound Encryption access and corrupt "
+                    f"encrypted profile cookies. Run `dotbrave apply` from a "
+                    f"terminal inside the desktop session (or while "
+                    f"{self.display_name} is open with a live endpoint)."
+                )
+            return None
+        launch_env = self._launch_env()
+        if launch_env is not None:
+            return None
+        if os.environ.get("SSH_CONNECTION"):
+            return (
+                f"this command is running over SSH ($SSH_CONNECTION is set) "
+                f"without a captured desktop session from a running "
+                f"{self.display_name}. Launching headless {self.display_name} "
+                f"outside the desktop session lacks XDG_CURRENT_DESKTOP / "
+                f"keyring access and can wipe v11-encrypted cookies. Run "
+                f"`dotbrave apply` from a terminal inside the desktop session."
+            )
+        if not (
+            os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY")
+        ):
+            return (
+                f"this shell has neither $WAYLAND_DISPLAY nor $DISPLAY (SSH, "
+                f"a service, or a bare TTY?). Launching headless "
+                f"{self.display_name} outside the desktop session lacks "
+                f"desktop keyring access and can wipe v11-encrypted cookies. "
+                f"Run `dotbrave apply` from a terminal inside the desktop "
+                f"session."
+            )
+        return None
 
     def kill_and_wait(self, timeout: float = 5.0) -> None:
         if _is_windows():
@@ -859,11 +1128,24 @@ class BrowserProcess:
         Cross-session on Windows (e.g. dotbrave over SSH) the launch is
         routed through the interactive-session trampoline so the browser
         appears on the user's desktop instead of an invisible session.
-        Linux's equivalent is :meth:`_launch_env`.
+        On macOS, direct bundle-binary launches are refused unless the
+        caller is inside an unlocked Aqua GUI security session.  Linux's
+        equivalent is :meth:`_launch_env`.
         """
         if _is_windows() and _windows_console_session_mismatch():
             if self._spawn_via_console_trampoline(cmdline):
                 return
+            sys.exit(
+                f"error: could not launch {self.display_name} in the "
+                "interactive Windows desktop session (Task Scheduler "
+                "trampoline was unavailable); refusing to launch in Session 0."
+            )
+        if _is_macos() and cmdline and cmdline[0] != "open":
+            blocked = _macos_keychain_session_blocker(self.display_name)
+            if blocked:
+                sys.exit(
+                    f"error: refusing to launch {self.display_name}: {blocked}"
+                )
         subprocess.Popen(
             cmdline,
             stdin=subprocess.DEVNULL,

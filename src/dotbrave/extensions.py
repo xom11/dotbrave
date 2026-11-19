@@ -2695,6 +2695,9 @@ def apply_headless(
     browser_proc = BROWSER_PROCESS if proc is None else proc
     prefs_path = profile_root / profile / "Preferences"
     _check_headless_supported(prefs_path)
+    blocked = browser_proc.headless_blocker()
+    if blocked:
+        sys.exit(f"error: cannot apply [extensions] offline -- {blocked}")
 
     port = pick_unused_port()
     try:
@@ -2710,6 +2713,7 @@ def apply_headless(
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        env=browser_proc._launch_env(),
     )
     client: CdpClient | None = None
     target: dict | None = None

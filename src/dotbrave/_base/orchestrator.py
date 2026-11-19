@@ -266,6 +266,8 @@ def _can_prompt_in_browser_ui(*, unattended: bool) -> bool:
         return False
     if _process._windows_console_session_mismatch():
         return False
+    if _process._macos_keychain_session_blocker("Brave") is not None:
+        return False
     isatty = getattr(sys.stdin, "isatty", None)
     if callable(isatty) and not isatty():
         return False
@@ -398,6 +400,19 @@ def _close_blocked(close_blocker_fn: Callable[[], str | None] | None) -> str | N
     return close_blocker_fn() if close_blocker_fn is not None else None
 
 
+def _needs_offline_browser(plans: list[Plan]) -> bool:
+    return any(
+        p.offline_browser_apply_fn is not None and not p.empty for p in plans
+    )
+
+
+def _headless_blocked(
+    headless_blocker_fn: Callable[[], str | None] | None,
+) -> str | None:
+    """Why a ``--headless=new`` offline browser run is unsafe here, or None."""
+    return headless_blocker_fn() if headless_blocker_fn is not None else None
+
+
 def cmd_apply(
     args: argparse.Namespace,
     *,
@@ -415,6 +430,10 @@ def cmd_apply(
     # Called after find_cmdline_fn, before every close: a reason string
     # means a relaunch could not bring the browser back, so it stays open.
     close_blocker_fn: Callable[[], str | None] | None = None,
+    # Called before closing for or executing a headless browser apply: a
+    # reason string means launching `--headless=new` in this session would
+    # lack OS cookie/credential encryption keys.
+    headless_blocker_fn: Callable[[], str | None] | None = None,
 ) -> None:
     """Unified apply orchestrator.
 
@@ -645,6 +664,12 @@ def cmd_apply(
                         f"re-launched for live apply"
                     )
                 blocked = _close_blocked(close_blocker_fn)
+                if (
+                    not blocked
+                    and skipped_ws_only
+                    and _needs_offline_browser(plans)
+                ):
+                    blocked = _headless_blocked(headless_blocker_fn)
                 if blocked:
                     sys.exit(
                         "error: "
@@ -734,6 +759,8 @@ def cmd_apply(
                             f"{settings}"
                         )
                     blocked = _close_blocked(close_blocker_fn)
+                    if not blocked and _needs_offline_browser(plans):
+                        blocked = _headless_blocked(headless_blocker_fn)
                     if blocked:
                         sys.exit(
                             f"error: {display_name} applied everything it could "
@@ -773,6 +800,8 @@ def cmd_apply(
                 return
             saved_cmdline = find_cmdline_fn()
             blocked = _close_blocked(close_blocker_fn)
+            if not blocked and _needs_offline_browser(plans):
+                blocked = _headless_blocked(headless_blocker_fn)
             if blocked:
                 sys.exit(
                     f"error: {_partial_note(applied_external, non_empty)} -- "
@@ -782,6 +811,38 @@ def cmd_apply(
             print(f"closing {display_name} normally for offline apply")
             graceful_close_fn()
             was_closed = True
+
+    if not is_running and _needs_offline_browser(plans):
+        blocked = _headless_blocked(headless_blocker_fn)
+        if blocked:
+            offline_browser_names = ", ".join(
+                dict.fromkeys(
+                    f"[{p.namespace}]"
+                    for p in plans
+                    if p.offline_browser_apply_fn is not None and not p.empty
+                )
+            )
+            if unattended:
+                remaining = [
+                    p for p in plans if p.offline_browser_apply_fn is None
+                ]
+                remaining_non_empty = [p for p in remaining if not p.empty]
+                _warn(
+                    f"unattended: skipping {offline_browser_names} -- "
+                    f"offline apply needs a headless {display_name} launch, "
+                    f"which is unsafe here: {blocked}"
+                )
+                if not remaining_non_empty:
+                    return
+                plans = remaining
+                non_empty = remaining_non_empty
+            else:
+                sys.exit(
+                    f"error: {_partial_note(applied_external, non_empty)} -- "
+                    f"offline apply for {offline_browser_names} needs a "
+                    f"headless {display_name} launch, which is unsafe here: "
+                    f"{blocked}"
+                )
 
     if was_closed:
         # The close flushed the browser's own PrefService over this file.

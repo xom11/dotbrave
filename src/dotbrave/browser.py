@@ -241,6 +241,7 @@ def cmd_apply(args: argparse.Namespace) -> None:
             graceful_close_fn=BROWSER_PROCESS.close_and_wait,
             launch_live_fn=BROWSER_PROCESS.launch_live,
             close_blocker_fn=BROWSER_PROCESS.relaunch_blocker,
+            headless_blocker_fn=BROWSER_PROCESS.headless_blocker,
         )
         return
 
@@ -264,6 +265,7 @@ def cmd_apply(args: argparse.Namespace) -> None:
         graceful_close_fn=proc.close_and_wait,
         launch_live_fn=proc.launch_live,
         close_blocker_fn=proc.relaunch_blocker,
+        headless_blocker_fn=proc.headless_blocker,
     )
 
 

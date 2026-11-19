@@ -263,8 +263,11 @@ dotbrave apply brave.toml              # live apply if Brave is running
   check on Windows and Linux. Paths may be absolute, `~/...`, or relative to
   the TOML file. Needs no `sudo` or Administrator privileges: when Brave is
   running it applies live in a background tab, and when Brave is closed a
-  short-lived `--headless=new` run commits `Secure Preferences` with Brave's
-  own MAC. Editing files inside an unpacked directory and re-running
+  short-lived `--headless=new` run inside your local desktop session (unlocked
+  macOS Aqua Keychain, Linux desktop keyring, or interactive Windows session)
+  commits `Secure Preferences` with Brave's own MAC — remote SSH / background
+  sessions without OS cookie-encryption access are refused up front so Brave
+  never opens `Cookies` without its decryption key. Editing files inside an unpacked directory and re-running
   `dotbrave apply` reloads the extension's `manifest.json` and MV3 service
   worker live without opening `brave://extensions`. Removing an entry from
   `unpacked` uninstalls it on the next apply.
@@ -388,8 +391,10 @@ run from a shell with no display (SSH, a service) relaunches Brave with
 the display settings of the session it was started in -- `$WAYLAND_DISPLAY`,
 `$DISPLAY` and the session type, so it comes back on Wayland rather than
 XWayland -- read from the process that launched it, since Brave blanks
-its own environment; when none can be found, dotbrave leaves Brave running and
-exits with an error instead of closing a browser it could not bring
+its own environment; when none can be found — or on macOS when `dotbrave`
+runs outside an unlocked Aqua GUI Keychain session (e.g. over SSH) —
+dotbrave leaves Brave running and
+exits with an error instead of closing a browser it could not safely bring
 back. A reopen waits for the failed relaunch to exit first, and is
 checked a few seconds later: one that did not survive is reported, not
 claimed. A config

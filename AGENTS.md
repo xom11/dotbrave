@@ -390,7 +390,55 @@ Preserve these contracts unless a change explicitly redesigns them:
    back with no debugging port — the same command failed once and worked
    on the retry, while exec'ing the binary brought the endpoint up in
    about a second every time. TCC grants follow the bundle, so nothing
-   is lost by doing it directly. And **`_read_cmdline` must split the
+   is lost by doing it directly. **Critical macOS Keychain / `OSCrypt`
+   constraint (measured 19/11/2026 on macOS 26.6 / Brave 158):**
+   exec'ing `/Applications/Brave Browser.app/Contents/MacOS/Brave Browser`
+   directly via `subprocess.Popen` (both `--headless=new` in
+   `extensions.apply_headless` and live bootstrap/relaunch in
+   `_spawn_detached` / `live_launch_cmdline`) inherits the caller's
+   launchd bootstrap domain (`launchctl managername`) and XNU
+   `SecuritySessionId` (`SessionGetInfo`), even with `start_new_session=True`,
+   and unprivileged `launchctl asuser $(id -u)` cannot cross audit sessions
+   (`Could not switch to audit session ...: 1: Operation not permitted`).
+   Over SSH (`managername == "Background"`, `sessionHasGraphicAccess == false`,
+   `sessionIsRemote == true`, `SecKeychainGetStatus` unlocked bit clear
+   even while the user is logged into the GUI console) — or inside `Aqua`
+   when `login.keychain-db` is locked — Keychain lookup of `"Brave Safe
+   Storage"` fails with `errSecInteractionNotAllowed` (`-25308`).
+   `--headless=new` does *not* imply `--use-mock-keychain` (and passing
+   `--use-mock-keychain` against a real profile is equally fatal): when
+   `OSCrypt` cannot read `"Brave Safe Storage"`,
+   `SQLitePersistentCookieStore` fails to decrypt every `v10` cookie,
+   treats them all as corrupt (`Cookie.LoadProblem`), and permanently
+   wipes `Default/Cookies` with `PRAGMA secure_delete = 1`.
+   `_macos_keychain_session_blocker` therefore refuses all macOS closes/relaunches
+   (`relaunch_blocker`), headless runs (`headless_blocker`), and direct
+   bundle-binary spawns (`_spawn_detached`) unless `$SSH_CONNECTION` is
+   unset, `launchctl managername == "Aqua"`, `SessionGetInfo` reports
+   `sessionHasGraphicAccess` without `sessionIsRemote`, and
+   `SecKeychainGetStatus` (with `SecKeychainSetUserInteractionAllowed(0)`
+   so probing never pops a modal dialog) confirms the default keychain is
+   unlocked and readable. Deliberately check `$SSH_CONNECTION` rather than
+   `$SSH_TTY` there: user LaunchAgents inside `Aqua` (measured: `orca-serve`)
+   set `SSH_TTY=1` for OSC52 clipboard integration while holding full Aqua
+   and Keychain access. The same `OSCrypt` rule applies to
+   `extensions.apply_headless` on Linux and Windows: on Linux `apply_headless`
+   forwards `BrowserProcess._launch_env()` (`XDG_CURRENT_DESKTOP`,
+   `DBUS_SESSION_BUS_ADDRESS`, `XDG_RUNTIME_DIR`, display) captured from a
+   closed desktop browser and `headless_blocker` refuses headless runs
+   outside a desktop session or over SSH without a captured desktop session
+   (where unset `XDG_CURRENT_DESKTOP` makes Chromium's `SelectBackend` fall
+   back to `BASIC_TEXT` `v10` and wipe `v11` keyring-encrypted cookies); on
+   Windows `headless_blocker` refuses Session 0 / cross-session headless
+   launches (where key-based SSH tokens can lack DPAPI / App-Bound
+   Encryption access) and `_spawn_detached` fails closed rather than
+   falling back to Session 0 `Popen` if the Task Scheduler trampoline is
+   unavailable. Both `relaunch_blocker` and `headless_blocker` MUST run in
+   `orchestrator.cmd_apply` **before** closing a running browser and
+   **before** taking a `Preferences` backup or mutating files (under
+   `--unattended` when Brave is already closed, blocked headless plans
+   warn on stderr and skip with exit 0 while still allowing plain JSON
+   `[settings]`/`[shortcuts]` edits). And **`_read_cmdline` must split the
    flat string** that `ps -o command=` / Win32_Process return: returning
    `[line]` made `line[1:]` empty, which silently disabled both flag
    forwarding and port discovery on macOS and Windows. `shlex` cannot do
