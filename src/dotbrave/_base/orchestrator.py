@@ -605,14 +605,19 @@ def cmd_apply(
             # the close there is no process left to ask.
             saved_cmdline = find_cmdline_fn()
             live_port = find_devtools_port(args.profile_root, args.profile)
+            skipped_ws_only = False
             if (
                 live_port is not None
                 and not _can_prompt_in_browser_ui(unattended=unattended)
                 and devtools_port_is_ws_only(args.profile_root, live_port)
             ):
                 # Connecting to a brave://inspect/#remote-debugging WebSocket
-                # prompts for interactive approval in Brave if not yet granted.
+                # prompts for interactive approval in Brave if not yet granted,
+                # and while user-enabled remote debugging is active in Local
+                # State a GUI relaunch ignores --remote-debugging-port in favor
+                # of that same WS-only server (measured on Brave 157).
                 live_port = None
+                skipped_ws_only = True
             if live_port is None:
                 # Neither file source covers a browser the user started
                 # with a fixed --remote-debugging-port; its command line
@@ -630,7 +635,9 @@ def cmd_apply(
                         f"{display_name} is closed."
                     )
                     return
-                if graceful_close_fn is None or launch_live_fn is None:
+                if graceful_close_fn is None or (
+                    launch_live_fn is None and not skipped_ws_only
+                ):
                     sys.exit(
                         "error: "
                         f"{_partial_note(applied_external, non_empty)} -- "
@@ -645,122 +652,110 @@ def cmd_apply(
                         f"{display_name} is running without a live endpoint "
                         f"and was left running: {blocked}"
                     )
-                live_port = pick_unused_port()
-                print(
-                    f"{display_name} is running without a live endpoint; "
-                    f"closing it normally and relaunching once for live apply "
-                    f"(no force-kill)."
-                )
-                graceful_close_fn()
-                used = launch_live_fn(
-                    args.profile_root, args.profile, live_port, None, saved_cmdline
-                )
-                print(
-                    f"relaunching {display_name} with live endpoint: "
-                    f"{' '.join(map(str, used))}"
-                )
+                if skipped_ws_only:
+                    print(
+                        f"closing {display_name} normally for offline apply "
+                        f"(brave://inspect endpoint requires interactive UI approval)"
+                    )
+                    graceful_close_fn()
+                    was_closed = True
+                else:
+                    live_port = pick_unused_port()
+                    print(
+                        f"{display_name} is running without a live endpoint; "
+                        f"closing it normally and relaunching once for live apply "
+                        f"(no force-kill)."
+                    )
+                    graceful_close_fn()
+                    used = launch_live_fn(
+                        args.profile_root, args.profile, live_port, None, saved_cmdline
+                    )
+                    print(
+                        f"relaunching {display_name} with live endpoint: "
+                        f"{' '.join(map(str, used))}"
+                    )
+                    try:
+                        wait_for_devtools_endpoint(live_port, display_name)
+                    except SystemExit as e:
+                        # Nothing has been written yet, so this is a real
+                        # failure -- but the browser we closed is ours to
+                        # restore before reporting it.
+                        note = _reopen_after_failed_relaunch(
+                            saved_cmdline,
+                            restart_fn,
+                            display_name,
+                            running_fn,
+                            args.profile_root,
+                        )
+                        sys.exit(f"{e}\n{note}")
+                    prefs = load_prefs(prefs_path)
+                    rebuilt = {
+                        (p.namespace, p.external_apply_fn is not None): p
+                        for p in build_plans_fn(prefs_path, prefs, doc, skip=skip)
+                    }
+                    plans = [
+                        rebuilt[(p.namespace, p.external_apply_fn is not None)]
+                        for p in plans
+                        if (p.namespace, p.external_apply_fn is not None) in rebuilt
+                    ]
+                    non_empty = [p for p in plans if not p.empty]
+            if live_port is not None:
+                live_port = int(live_port)
                 try:
-                    wait_for_devtools_endpoint(live_port, display_name)
-                except SystemExit as e:
-                    # Nothing has been written yet, so this is a real
-                    # failure -- but the browser we closed is ours to
-                    # restore before reporting it.
-                    note = _reopen_after_failed_relaunch(
-                        saved_cmdline,
-                        restart_fn,
-                        display_name,
-                        running_fn,
-                        args.profile_root,
+                    live_apply_fn(
+                        live_port,
+                        prefs_path,
+                        prefs,
+                        plans,
+                        unattended=unattended,
+                        # Which profile this run is bound to.  The adapter
+                        # drives a work tab the endpoint hands it, and the
+                        # endpoint is profile-blind -- so it needs to be told
+                        # what to confirm the tab against.
+                        profile=args.profile,
                     )
-                    sys.exit(f"{e}\n{note}")
-                # That close flushed the browser's own PrefService over this
-                # file, exactly as the offline fallback's close does -- but
-                # this path never reaches the `was_closed` re-read below, so
-                # without this the live half would diff the pre-close
-                # snapshot.  A key the user changed in-session would compare
-                # equal to that stale copy, produce no diff, never be pushed,
-                # and the run would still report `ok -- live applied`.
-                #
-                # Rebuild the plans rather than only re-reading `prefs`: the
-                # settings sidecar's prior-value capture reads the same dict
-                # at plan-construction time, so a stale copy would also record
-                # a "value before dotbrave" that was never on disk -- and that
-                # entry is first-seen-wins, so it would never be corrected.
-                # Plan construction is pure (it reads Preferences and the
-                # sidecars, writes nothing), so this is safe to redo.  The
-                # diff printed above can now be a hair stale; it is
-                # informational only, and reprinting it would be noisier than
-                # the discrepancy it describes.
-                prefs = load_prefs(prefs_path)
-                rebuilt = {
-                    (p.namespace, p.external_apply_fn is not None): p
-                    for p in build_plans_fn(prefs_path, prefs, doc, skip=skip)
-                }
-                # Keep the run's shape: external plans applied above were
-                # deliberately dropped from `plans` and must not come back,
-                # or the policy would be written a second time.
-                plans = [
-                    rebuilt[(p.namespace, p.external_apply_fn is not None)]
-                    for p in plans
-                    if (p.namespace, p.external_apply_fn is not None) in rebuilt
-                ]
-                non_empty = [p for p in plans if not p.empty]
-            live_port = int(live_port)
-            try:
-                live_apply_fn(
-                    live_port,
-                    prefs_path,
-                    prefs,
-                    plans,
-                    unattended=unattended,
-                    # Which profile this run is bound to.  The adapter
-                    # drives a work tab the endpoint hands it, and the
-                    # endpoint is profile-blind -- so it needs to be told
-                    # what to confirm the tab against.
-                    profile=args.profile,
-                )
-            except LiveApplyUnsupported as e:
-                settings = "\n".join(f"  {key}" for key in e.keys)
-                # The adapter may already have taken this run's backup,
-                # before its live half landed.  Invariant 1 allows one.
-                backup_taken = e.backup_taken
-                if unattended:
-                    _warn(
-                        "unattended: "
-                        f"{_partial_note(applied_external, non_empty)} -- "
-                        f"{display_name} cannot apply these settings live "
-                        f"and closing it is not allowed:\n" + settings
+                except LiveApplyUnsupported as e:
+                    settings = "\n".join(f"  {key}" for key in e.keys)
+                    # The adapter may already have taken this run's backup,
+                    # before its live half landed.  Invariant 1 allows one.
+                    backup_taken = e.backup_taken
+                    if unattended:
+                        _warn(
+                            "unattended: "
+                            f"{_partial_note(applied_external, non_empty)} -- "
+                            f"{display_name} cannot apply these settings live "
+                            f"and closing it is not allowed:\n" + settings
+                        )
+                        return
+                    if graceful_close_fn is None or launch_live_fn is None:
+                        sys.exit(
+                            f"error: {e.browser_name} cannot apply these settings "
+                            f"live and cannot be re-launched for offline apply:\n"
+                            f"{settings}"
+                        )
+                    blocked = _close_blocked(close_blocker_fn)
+                    if blocked:
+                        sys.exit(
+                            f"error: {display_name} applied everything it could "
+                            f"live, but these are not applied and "
+                            f"{display_name} was left running: {blocked}\n"
+                            f"{settings}"
+                        )
+                    print(
+                        f"{display_name} applied everything it could live; "
+                        f"closing it normally to finish these offline "
+                        f"(no force-kill):"
                     )
+                    print(settings)
+                    graceful_close_fn()
+                    relaunch_live_port = live_port
+                    was_closed = True
+                else:
+                    if not devtools_port_is_ws_only(args.profile_root, live_port):
+                        remember_devtools_port(
+                            args.profile_root, args.profile, live_port
+                        )
                     return
-                if graceful_close_fn is None or launch_live_fn is None:
-                    sys.exit(
-                        f"error: {e.browser_name} cannot apply these settings "
-                        f"live and cannot be re-launched for offline apply:\n"
-                        f"{settings}"
-                    )
-                blocked = _close_blocked(close_blocker_fn)
-                if blocked:
-                    sys.exit(
-                        f"error: {display_name} applied everything it could "
-                        f"live, but these are not applied and "
-                        f"{display_name} was left running: {blocked}\n"
-                        f"{settings}"
-                    )
-                print(
-                    f"{display_name} applied everything it could live; "
-                    f"closing it normally to finish these offline "
-                    f"(no force-kill):"
-                )
-                print(settings)
-                graceful_close_fn()
-                relaunch_live_port = live_port
-                was_closed = True
-            else:
-                if not devtools_port_is_ws_only(args.profile_root, live_port):
-                    remember_devtools_port(
-                        args.profile_root, args.profile, live_port
-                    )
-                return
         elif graceful_close_fn is None:
             sys.exit(
                 f"error: {_partial_note(applied_external, non_empty)} -- "

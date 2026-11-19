@@ -672,17 +672,15 @@ def test_ssh_and_non_tty_skip_ws_only_devtools_port(
         )
 
         # 1) SSH with PTY (`ssh -tt`): skipped -> falls through to relaunch.
+        # 1) SSH with PTY (`ssh -tt`): skipped -> closes for offline apply +
+        # restart (never GUI launch_live_fn, which user-enabled remote
+        # debugging ignores in favor of the same WS-only server).
         monkeypatch.setattr(orchestrator.sys, "stdin", FakeTtyStdin())
         monkeypatch.setenv("SSH_CONNECTION", "100.64.0.1 55555 100.64.0.2 22")
-        monkeypatch.setattr(orchestrator, "pick_unused_port", lambda: 9444)
-        monkeypatch.setattr(
-            orchestrator, "wait_for_devtools_endpoint", lambda p, n: None
-        )
-        monkeypatch.setattr(
-            orchestrator, "remember_devtools_port", lambda *a, **k: None
-        )
         seen_ports: list[int] = []
         closed: list[bool] = []
+        restarted: list[list[str]] = []
+        live_launches: list[bool] = []
         orchestrator.cmd_apply(
             argparse.Namespace(
                 profile_root=tmp_path,
@@ -694,29 +692,32 @@ def test_ssh_and_non_tty_skip_ws_only_devtools_port(
             display_name="Brave",
             running_fn=lambda: True,
             find_cmdline_fn=lambda: ["brave"],
-            restart_fn=lambda c: c,
+            restart_fn=lambda c: (restarted.append(c), c)[1],
             build_plans_fn=lambda p, prefs, doc, **kw: [
                 orchestrator.Plan(
                     namespace="settings",
                     diff_lines=["  settings: change"],
-                    apply_fn=lambda prefs: None,
+                    apply_fn=lambda prefs: prefs.__setitem__("a", {"b": True}),
                     verify_fn=lambda prefs: None,
                 )
             ],
             live_apply_fn=lambda port, *a, **k: seen_ports.append(port),
             graceful_close_fn=lambda: closed.append(True),
-            launch_live_fn=lambda *a, **k: ["brave"],
+            launch_live_fn=lambda *a, **k: (live_launches.append(True), ["brave"])[1],
         )
         assert closed == [True]
-        assert seen_ports == [9444]
+        assert seen_ports == []
+        assert live_launches == []
+        assert restarted == [["brave"]]
         assert srv.commands == []
 
-        # 2) Non-TTY stdin without SSH: also skipped.
+        # 2) Non-TTY stdin without SSH: also skipped -> offline apply + restart.
         monkeypatch.delenv("SSH_CONNECTION", raising=False)
         monkeypatch.delenv("SSH_TTY", raising=False)
         monkeypatch.setattr(orchestrator.sys, "stdin", FakePipeStdin())
         seen_ports.clear()
         closed.clear()
+        restarted.clear()
         orchestrator.cmd_apply(
             argparse.Namespace(
                 profile_root=tmp_path,
@@ -728,21 +729,23 @@ def test_ssh_and_non_tty_skip_ws_only_devtools_port(
             display_name="Brave",
             running_fn=lambda: True,
             find_cmdline_fn=lambda: ["brave"],
-            restart_fn=lambda c: c,
+            restart_fn=lambda c: (restarted.append(c), c)[1],
             build_plans_fn=lambda p, prefs, doc, **kw: [
                 orchestrator.Plan(
                     namespace="settings",
                     diff_lines=["  settings: change"],
-                    apply_fn=lambda prefs: None,
+                    apply_fn=lambda prefs: prefs.__setitem__("a", {"b": False}),
                     verify_fn=lambda prefs: None,
                 )
             ],
             live_apply_fn=lambda port, *a, **k: seen_ports.append(port),
             graceful_close_fn=lambda: closed.append(True),
-            launch_live_fn=lambda *a, **k: ["brave"],
+            launch_live_fn=lambda *a, **k: (live_launches.append(True), ["brave"])[1],
         )
         assert closed == [True]
-        assert seen_ports == [9444]
+        assert seen_ports == []
+        assert live_launches == []
+        assert restarted == [["brave"]]
 
         # 3) Local interactive TTY without SSH: uses WS-only port directly!
         monkeypatch.setattr(orchestrator.sys, "stdin", FakeTtyStdin())
