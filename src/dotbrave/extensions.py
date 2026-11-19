@@ -39,6 +39,8 @@ Two sub-keys live under ``[extensions]``:
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import math
@@ -379,13 +381,44 @@ def _encode_id_digest(digest: bytes) -> str:
     )
 
 
-def unpacked_extension_id(path: Path | str, *, platform: str | None = None) -> str:
-    """Compute Chromium's ``crx_file::id_util::GenerateIdForPath`` for ``path``.
+def _decode_manifest_key(manifest_key: str) -> bytes:
+    cleaned = "".join(manifest_key.split())
+    if not cleaned:
+        raise ValueError("manifest 'key' must be a non-empty base64 string")
+    try:
+        raw = base64.b64decode(cleaned, validate=True)
+    except (binascii.Error, ValueError) as e:
+        raise ValueError(f"manifest 'key' is not valid base64: {e}") from e
+    if not raw:
+        raise ValueError("manifest 'key' decoded to empty bytes")
+    return raw
 
+
+def extension_id_from_key(manifest_key: str) -> str:
+    """Compute Chromium's ``crx_file::id_util::GenerateId`` from manifest ``key``."""
+    return _encode_id_digest(
+        hashlib.sha256(_decode_manifest_key(manifest_key)).digest()
+    )
+
+
+def unpacked_extension_id(
+    path: Path | str,
+    *,
+    platform: str | None = None,
+    manifest_key: str | None = None,
+) -> str:
+    """Compute Chromium's extension ID for an unpacked directory.
+
+    When ``manifest_key`` (``manifest.json``'s base64 DER public ``"key"``) is
+    provided, Chromium hashes the decoded key bytes via
+    ``crx_file::id_util::GenerateId``, making the ID identical across hosts and
+    OSes. Otherwise it falls back to ``crx_file::id_util::GenerateIdForPath``:
     POSIX hashes ``FilePath::value()`` bytes (UTF-8 / fsencode); Windows
     uppercases an ASCII drive letter and hashes ``std::wstring`` UTF-16LE
     bytes without a ``\\\\?\\`` extended-length prefix.
     """
+    if manifest_key is not None:
+        return extension_id_from_key(manifest_key)
     plat = sys.platform if platform is None else platform
     raw_str = str(path)
     if plat in ("win32", "windows"):
@@ -703,7 +736,7 @@ def _resolve_value_file_urls(
     return value
 
 
-def _validate_manifest_dir(path: Path, display_path: str) -> None:
+def _validate_manifest_dir(path: Path, display_path: str) -> dict[str, Any]:
     if not path.is_dir():
         sys.exit(
             f"error: [extensions] unpacked directory not found: {path} "
@@ -724,6 +757,19 @@ def _validate_manifest_dir(path: Path, display_path: str) -> None:
         sys.exit(
             f"error: [extensions] manifest.json in {path} must be a JSON object"
         )
+    if "key" in manifest:
+        raw_key = manifest["key"]
+        if not isinstance(raw_key, str):
+            sys.exit(
+                f"error: [extensions] manifest.json 'key' in {path} must be a string"
+            )
+        try:
+            _decode_manifest_key(raw_key)
+        except ValueError as e:
+            sys.exit(
+                f"error: [extensions] invalid manifest.json 'key' in {path}: {e}"
+            )
+    return manifest
 
 
 def _validate_platforms_field(plats: object) -> list[str]:
@@ -1081,8 +1127,10 @@ def validate_extensions_table(
                 continue
 
             resolved = _resolve_extension_path(raw_path, config_dir)
-            _validate_manifest_dir(resolved, raw_path)
-            ext_id = unpacked_extension_id(resolved)
+            manifest = _validate_manifest_dir(resolved, raw_path)
+            ext_id = unpacked_extension_id(
+                resolved, manifest_key=manifest.get("key")
+            )
             if ext_id in seen_ids:
                 continue
             seen_ids.add(ext_id)
@@ -1338,11 +1386,23 @@ def _disk_extension_commands(
     prefs: dict, *, platform: str | None = None,
 ) -> dict[tuple[str, str], str]:
     prefix = _command_platform_key(platform) + ":"
-    cmds = prefs.get("extensions", {}).get("commands", {})
-    if not isinstance(cmds, dict):
-        return {}
+    # Chromium's DualLayerUserPrefStore merges syncable dict prefs with
+    # account_values taking precedence over local extensions.commands on key
+    # collisions (e.g. Brave Sync pushing another host's extension ID for
+    # `mac:Ctrl+B`).
+    merged: dict[str, Any] = {}
+    local_cmds = prefs.get("extensions", {}).get("commands", {})
+    if isinstance(local_cmds, dict):
+        merged.update(local_cmds)
+    account_vals = prefs.get("account_values")
+    if isinstance(account_vals, dict):
+        account_ext = account_vals.get("extensions")
+        if isinstance(account_ext, dict):
+            account_cmds = account_ext.get("commands")
+            if isinstance(account_cmds, dict):
+                merged.update(account_cmds)
     out: dict[tuple[str, str], str] = {}
-    for full_key, entry in cmds.items():
+    for full_key, entry in merged.items():
         if (
             not isinstance(full_key, str)
             or not full_key.startswith(prefix)
@@ -1382,20 +1442,13 @@ def _is_healthy_unpacked_record(
     return a == b
 
 
-def _mutate_commands_in_prefs(
-    prefs: dict,
+def _mutate_command_map(
+    cmds: dict[str, Any],
+    prefix: str,
     writes: list[tuple[str, str, str]],
-    uninstall_ids: list[str],
-    *,
-    platform: str | None = None,
+    uninstall_set: set[str],
+    target_pairs: set[tuple[str, str]],
 ) -> None:
-    if not writes and not uninstall_ids:
-        return
-    prefix = _command_platform_key(platform) + ":"
-    cmds = get_nested(prefs, ("extensions", "commands"))
-    uninstall_set = set(uninstall_ids)
-    target_pairs = {(ext_id, cmd_name) for ext_id, cmd_name, _ in writes}
-
     for key in list(cmds):
         entry = cmds.get(key)
         if not isinstance(entry, dict):
@@ -1414,6 +1467,33 @@ def _mutate_commands_in_prefs(
                 "extension": ext_id,
                 "global": False,
             }
+
+
+def _mutate_commands_in_prefs(
+    prefs: dict,
+    writes: list[tuple[str, str, str]],
+    uninstall_ids: list[str],
+    *,
+    platform: str | None = None,
+) -> None:
+    if not writes and not uninstall_ids:
+        return
+    prefix = _command_platform_key(platform) + ":"
+    uninstall_set = set(uninstall_ids)
+    target_pairs = {(ext_id, cmd_name) for ext_id, cmd_name, _ in writes}
+
+    local_cmds = get_nested(prefs, ("extensions", "commands"))
+    _mutate_command_map(local_cmds, prefix, writes, uninstall_set, target_pairs)
+
+    account_vals = prefs.get("account_values")
+    if isinstance(account_vals, dict):
+        account_ext = account_vals.get("extensions")
+        if isinstance(account_ext, dict):
+            account_cmds = account_ext.get("commands")
+            if isinstance(account_cmds, dict):
+                _mutate_command_map(
+                    account_cmds, prefix, writes, uninstall_set, target_pairs
+                )
 
 
 def _build_webstore_policy_plan(

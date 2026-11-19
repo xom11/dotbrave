@@ -83,7 +83,13 @@ class _FakeExtCdpClient:
         self.browser_calls.append((method, params))
         if method == "Extensions.loadUnpacked":
             assert params is not None
-            eid = extensions.unpacked_extension_id(params["path"])
+            manifest_path = Path(params["path"]) / "manifest.json"
+            manifest_key = None
+            if manifest_path.is_file():
+                manifest_key = json.loads(manifest_path.read_text(encoding="utf-8")).get("key")
+            eid = extensions.unpacked_extension_id(
+                params["path"], manifest_key=manifest_key
+            )
             self.installed_ids.add(eid)
             return {"result": {"id": eid}}
         if method == "Extensions.uninstall":
@@ -589,3 +595,244 @@ def test_unpacked_user_scripts_storage_messages_and_export_roundtrip(
         prefs_path, {}, parsed["extensions"], config_dir=tmp_path
     )
     assert all(p.empty for p in plans)
+
+
+def test_unpacked_extension_id_manifest_key(tmp_path: Path) -> None:
+    import base64
+
+    key_bytes = b"synthetic-public-key-der-bytes-for-testing"
+    key_b64 = base64.b64encode(key_bytes).decode("ascii")
+    expected_digest = hashlib.sha256(key_bytes).digest()[:16]
+    expected_id = "".join(
+        chr(ord("a") + (b >> 4)) + chr(ord("a") + (b & 0x0F))
+        for b in expected_digest
+    )
+
+    assert extensions.extension_id_from_key(key_b64) == expected_id
+    # Same ID across different hosts / OSes when manifest key is set.
+    assert (
+        extensions.unpacked_extension_id(
+            "/Users/alice/.nix/tabjump", platform="darwin", manifest_key=key_b64
+        )
+        == expected_id
+    )
+    assert (
+        extensions.unpacked_extension_id(
+            r"C:\Users\bob\.nix\tabjump", platform="win32", manifest_key=key_b64
+        )
+        == expected_id
+    )
+
+    ext_dir = tmp_path / "tabjump"
+    ext_dir.mkdir()
+    (ext_dir / "manifest.json").write_text(
+        json.dumps({"manifest_version": 3, "name": "TJ", "version": "1", "key": key_b64}),
+        encoding="utf-8",
+    )
+    validated = extensions.validate_table(
+        {"unpacked": [{"path": str(ext_dir)}]}, config_dir=tmp_path
+    )
+    assert len(validated) == 1
+    assert validated[0].ext_id == expected_id
+
+    # Invalid base64 key must fail validation clearly.
+    bad_dir = tmp_path / "bad_ext"
+    bad_dir.mkdir()
+    (bad_dir / "manifest.json").write_text(
+        json.dumps({"manifest_version": 3, "name": "Bad", "version": "1", "key": "not!base64!"}),
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit, match="invalid manifest.json 'key'"):
+        extensions.validate_table(
+            {"unpacked": [{"path": str(bad_dir)}]}, config_dir=tmp_path
+        )
+
+
+def test_unpacked_migrates_when_manifest_key_added(
+    tmp_path: Path, profile_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import base64
+
+    ext_dir = _make_ext(tmp_path, "tabjump")
+    old_id = extensions.unpacked_extension_id(ext_dir.resolve())
+    prof = profile_root / "Default"
+    prefs_path = prof / "Preferences"
+    (prof / "Secure Preferences").write_text(
+        json.dumps(
+            {
+                "extensions": {
+                    "settings": {
+                        old_id: {
+                            "location": 4,
+                            "path": str(ext_dir.resolve()),
+                            "creation_flags": 38,
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    extensions.state_file(prefs_path).write_text(
+        json.dumps(
+            {
+                "managed": {
+                    old_id: {
+                        "path": str(ext_dir.resolve()),
+                        "display_path": str(ext_dir),
+                        "source_sha256": extensions.hash_extension_dir(ext_dir.resolve()),
+                        "shortcuts": {"_execute_action": "Ctrl+B"},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    key_b64 = base64.b64encode(b"pinned-key-for-tabjump-migration").decode("ascii")
+    new_id = extensions.extension_id_from_key(key_b64)
+    assert new_id != old_id
+    (ext_dir / "manifest.json").write_text(
+        json.dumps(
+            {"manifest_version": 3, "name": "TabJump", "version": "0.1.0", "key": key_b64}
+        ),
+        encoding="utf-8",
+    )
+
+    fake_cdp = _FakeExtCdpClient(prof, installed_ids={old_id})
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake_cdp)
+    monkeypatch.setattr(brave_pkg, "brave_running", lambda: True)
+    from dotbrave._base import orchestrator as orch
+    monkeypatch.setattr(orch, "find_devtools_port", lambda r, p: 9222)
+    monkeypatch.setattr(orch, "remember_devtools_port", lambda r, p, port: None)
+
+    cfg = tmp_path / "brave.toml"
+    cfg.write_text(
+        "[[extensions.unpacked]]\n"
+        f"path = {json.dumps(str(ext_dir))}\n"
+        'shortcuts = { _execute_action = "Control+KeyB" }\n',
+        encoding="utf-8",
+    )
+    args = argparse.Namespace(
+        profile_root=profile_root,
+        profile="Default",
+        config=str(cfg),
+        dry_run=False,
+        channel="stable",
+    )
+    brave_pkg.cmd_apply(args)
+
+    # Uninstall of path-hashed old_id must precede loadUnpacked of key-pinned new_id.
+    methods = [(m, p) for m, p in fake_cdp.browser_calls]
+    assert ("Extensions.uninstall", {"id": old_id}) in methods
+    uninstall_idx = methods.index(("Extensions.uninstall", {"id": old_id}))
+    load_idx = next(i for i, (m, _) in enumerate(methods) if m == "Extensions.loadUnpacked")
+    assert uninstall_idx < load_idx
+    assert new_id in fake_cdp.installed_ids
+    assert old_id not in fake_cdp.installed_ids
+    assert any(
+        "updateExtensionCommand" in expr and new_id in expr and '"Ctrl+B"' in expr
+        for expr in fake_cdp.evaluations
+    )
+
+
+def test_extension_commands_respect_account_values_override(
+    tmp_path: Path, profile_root: Path
+) -> None:
+    ext_dir = _make_ext(tmp_path, "tabjump")
+    ext_id = extensions.unpacked_extension_id(ext_dir.resolve())
+    other_host_id = "mbnkfcpbnmmhjnlfdjiheoaeeibhmjag"
+    if other_host_id == ext_id:
+        other_host_id = "a" * 32
+
+    plat_prefix = extensions._command_platform_key()
+    prefs = {
+        "extensions": {
+            "commands": {
+                f"{plat_prefix}:Ctrl+B": {
+                    "command_name": "_execute_action",
+                    "extension": ext_id,
+                    "global": False,
+                }
+            }
+        },
+        "account_values": {
+            "extensions": {
+                "commands": {
+                    f"{plat_prefix}:Ctrl+B": {
+                        "command_name": "_execute_action",
+                        "extension": other_host_id,
+                        "global": False,
+                    }
+                }
+            }
+        },
+    }
+    prof = profile_root / "Default"
+    prefs_path = prof / "Preferences"
+    prefs_path.write_text(json.dumps(prefs), encoding="utf-8")
+    (prof / "Secure Preferences").write_text(
+        json.dumps(
+            {
+                "extensions": {
+                    "settings": {
+                        ext_id: {
+                            "location": 4,
+                            "path": str(ext_dir.resolve()),
+                            "creation_flags": 38,
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    extensions.state_file(prefs_path).write_text(
+        json.dumps(
+            {
+                "managed": {
+                    ext_id: {
+                        "path": str(ext_dir.resolve()),
+                        "display_path": str(ext_dir),
+                        "source_sha256": extensions.hash_extension_dir(ext_dir.resolve()),
+                        "shortcuts": {"_execute_action": "Ctrl+B"},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    future = time.time() + 5.0
+    os.utime(prefs_path, (future, future))
+
+    # Effective disk commands see account_values overriding local extensions.commands.
+    eff = extensions._disk_extension_commands(prefs)
+    assert (ext_id, "_execute_action") not in eff
+    assert eff[(other_host_id, "_execute_action")] == "Ctrl+B"
+
+    # Plan must detect the drift and mutate both local and account_values maps.
+    plans = extensions.plan_apply_all(
+        prefs_path,
+        prefs,
+        {
+            "unpacked": [
+                {
+                    "path": str(ext_dir),
+                    "shortcuts": {"_execute_action": "Control+KeyB"},
+                }
+            ]
+        },
+        config_dir=tmp_path,
+    )
+    assert len(plans) == 1 and not plans[0].empty
+    assert plans[0].offline_browser_apply_fn is None
+
+    plans[0].apply_fn(prefs)
+    assert prefs["extensions"]["commands"][f"{plat_prefix}:Ctrl+B"]["extension"] == ext_id
+    assert (
+        prefs["account_values"]["extensions"]["commands"][f"{plat_prefix}:Ctrl+B"][
+            "extension"
+        ]
+        == ext_id
+    )
+    plans[0].verify_fn(prefs)
