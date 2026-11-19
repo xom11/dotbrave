@@ -235,21 +235,30 @@ dotbrave apply brave.toml              # live apply if Brave is running
   `ExtensionSettings` managed policy (`installation_mode = "force_installed"`
   by default or `mode = "normal"`, Chrome Web Store `update_url`, and optional
   `pin = "force" | "default" | "unpinned" | bool`). Entries may be bare 32-char
-  extension IDs (`"a".."p"`) or `{ id, name, mode, pin, file_access, incognito, shortcuts, platforms }`
+  extension IDs (`"a".."p"`) or
+  `{ id, name, mode, pin, file_access, incognito, user_scripts, shortcuts, storage, messages, platforms }`
   tables (`name` is a human-readable diff label only). Like `[pwa]`, policy
   changes require `sudo` on Linux/macOS or Administrator on Windows (merged
   into the shared macOS plist, `/etc/brave/policies/managed/dotbrave-extensions.json`
   on Linux, and a `REG_SZ` JSON dict at
   `HKLM\Software\Policies\BraveSoftware\Brave\ExtensionSettings` on Windows)
   and refresh dynamically in a running Brave; optional `file_access`,
-  `incognito`, and `shortcuts` fields are applied via `chrome.developerPrivate`
-  once Brave installs the extension. Omitting `webstore` leaves existing
+  `incognito`, `user_scripts` (`Allow User Scripts` for MV3 extensions), and
+  `shortcuts` are applied via `chrome.developerPrivate`, while `storage`
+  (`chrome.storage.local` keys) and `messages` (`chrome.runtime.sendMessage`
+  payloads) run in a background `chrome-extension://<id>/manifest.json` tab
+  once Brave installs the extension. Any `{ file_url = "../path/to/file" }`
+  table inside `storage` or `messages` resolves relative to the TOML file into
+  a platform `file:///` URI (`file:///Users/...`, `file:///home/...`,
+  `file:///C:/Users/...`) and hashes the referenced file so edits re-apply on
+  the next `dotbrave apply`. Omitting `webstore` leaves existing
   `ExtensionSettings` policy untouched; omitting `unpacked` leaves managed
   unpacked extensions untouched; an empty `[extensions]` header resets both.
 - **Unpacked extensions**: `[extensions] unpacked` loads local extension
   directories directly in place (turning on Developer Mode automatically)
-  and assigns optional `incognito`, `file_access`, and command `shortcuts`
-  (`shortcuts = { _execute_action = "Control+KeyB" }`),
+  and assigns optional `incognito`, `file_access`, `user_scripts`, command
+  `shortcuts` (`shortcuts = { _execute_action = "Control+KeyB" }`), `storage`,
+  and `messages`,
   bypassing Chromium's `CommandService::CanAutoAssign` static default-accelerator
   check on Windows and Linux. Paths may be absolute, `~/...`, or relative to
   the TOML file. Needs no `sudo` or Administrator privileges: when Brave is
@@ -318,8 +327,9 @@ A running Brave is checked for an endpoint three ways before dotbrave
 concludes it has none: the port dotbrave itself launched and recorded, the
 browser's own `DevToolsActivePort` (both `--remote-debugging-port=0` HTTP
 endpoints and interactive `brave://inspect/#remote-debugging` Browser
-WebSocket endpoints; `--unattended` skips the latter so background runs never
-trigger an approval prompt), and the `--remote-debugging-port` on
+WebSocket endpoints; `--unattended`, SSH, and non-TTY sessions skip the latter
+so remote/background runs never block on an unanswerable approval modal), and
+the `--remote-debugging-port` on
 the running process's command line. That last one matters more than it
 sounds — Brave writes `DevToolsActivePort` only when the port is dynamic
 (`--remote-debugging-port=0`), so a browser you started on a fixed port

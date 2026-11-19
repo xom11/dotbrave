@@ -162,12 +162,17 @@ class CdpClient:
         self.port = port
         self.host = host
         self._ws_path = ws_path
+        self._ws_only = False
         self._browser_ws: _WebSocket | None = None
+        self._browser_ws_failed = False
         self._next_id = 1
 
     def bind_profile_root(self, profile_root: Path) -> None:
+        root = Path(profile_root)
         if self._ws_path is None:
-            self._ws_path = read_devtools_ws_path(Path(profile_root), self.port)
+            self._ws_path = read_devtools_ws_path(root, self.port)
+        if self._ws_path is not None:
+            self._ws_only = devtools_port_is_ws_only(root, self.port)
 
     def close(self) -> None:
         if self._browser_ws is not None:
@@ -177,6 +182,10 @@ class CdpClient:
     def _ensure_browser_ws(self) -> _WebSocket:
         if self._browser_ws is not None:
             return self._browser_ws
+        if self._browser_ws_failed:
+            raise CdpError(
+                f"DevTools browser websocket already failed on {self.host}:{self.port}"
+            )
         if not self._ws_path:
             self._ws_path = discover_browser_ws_path(self.port, host=self.host)
         if not self._ws_path:
@@ -185,9 +194,13 @@ class CdpClient:
             )
         # 15s allows interactive approval on brave://inspect/#remote-debugging
         # endpoints when connecting for the first time.
-        self._browser_ws = _WebSocket(
-            f"ws://{self.host}:{self.port}{self._ws_path}", timeout=15.0
-        )
+        try:
+            self._browser_ws = _WebSocket(
+                f"ws://{self.host}:{self.port}{self._ws_path}", timeout=15.0
+            )
+        except CdpError:
+            self._browser_ws_failed = True
+            raise
         return self._browser_ws
 
     def browser_command(
@@ -219,15 +232,16 @@ class CdpClient:
             while True:
                 msg = json.loads(ws.recv_text())
                 if msg.get("id") == req_id:
-                    if "error" in msg:
-                        raise CdpError(f"DevTools command failed: {msg['error']}")
-                    return msg
+                    break
         except CdpError:
             self.close()
             raise
         except json.JSONDecodeError as e:
             self.close()
             raise CdpError(f"DevTools websocket invalid JSON: {e}") from e
+        if "error" in msg:
+            raise CdpError(f"DevTools command failed: {msg['error']}")
+        return msg
 
     def _json(self, path: str) -> Any:
         url = f"http://{self.host}:{self.port}{path}"
@@ -270,7 +284,8 @@ class CdpClient:
             try:
                 self._ensure_browser_ws()
             except CdpError:
-                pass
+                if self._ws_only:
+                    raise
 
         if self._browser_ws is not None:
             try:
@@ -295,7 +310,8 @@ class CdpClient:
                     "_via_browser_ws": True,
                 }
             except CdpError:
-                pass
+                if self._ws_only:
+                    raise
 
         path = f"/json/new?{urllib.parse.quote(url, safe=':/')}"
         req = urllib.request.Request(

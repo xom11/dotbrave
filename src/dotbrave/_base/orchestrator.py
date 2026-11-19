@@ -257,6 +257,21 @@ def _policy_pickup_note(namespaces: tuple[str, ...] = ("pwa",)) -> str:
     return "[shields] takes full effect after a Brave restart"
 
 
+def _can_prompt_in_browser_ui(*, unattended: bool) -> bool:
+    """False when no local user can approve Brave's interactive
+    ``brave://inspect/#remote-debugging`` modal."""
+    if unattended:
+        return False
+    if os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_TTY"):
+        return False
+    if _process._windows_console_session_mismatch():
+        return False
+    isatty = getattr(sys.stdin, "isatty", None)
+    if callable(isatty) and not isatty():
+        return False
+    return True
+
+
 def _reload_external_policy_live(
     profile_root: Path,
     profile: str | None,
@@ -592,7 +607,7 @@ def cmd_apply(
             live_port = find_devtools_port(args.profile_root, args.profile)
             if (
                 live_port is not None
-                and unattended
+                and not _can_prompt_in_browser_ui(unattended=unattended)
                 and devtools_port_is_ws_only(args.profile_root, live_port)
             ):
                 # Connecting to a brave://inspect/#remote-debugging WebSocket

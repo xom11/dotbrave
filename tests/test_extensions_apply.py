@@ -502,3 +502,90 @@ def test_undo_clears_extensions_sidecar(
     )
     brave_pkg.cmd_apply(args)
     assert not sidecar.exists()
+
+
+def test_unpacked_user_scripts_storage_messages_and_export_roundtrip(
+    profile_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ext_dir = _make_ext(tmp_path, "tabjump")
+    ext_id = extensions.unpacked_extension_id(ext_dir.resolve())
+    sites_file = tmp_path / "sites.json"
+    sites_file.write_text('{"gh": "https://github.com"}\n', encoding="utf-8")
+    expected_uri = extensions.path_to_file_url(sites_file.resolve())
+
+    fake_cdp = _FakeExtCdpClient(profile_root / "Default")
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake_cdp)
+    monkeypatch.setattr(brave_pkg, "brave_running", lambda: True)
+    from dotbrave._base import orchestrator as orch
+    monkeypatch.setattr(orch, "find_devtools_port", lambda r, p: 9222)
+    monkeypatch.setattr(orch, "remember_devtools_port", lambda r, p, port: None)
+
+    cfg = tmp_path / "brave.toml"
+    cfg.write_text(
+        "[[extensions.unpacked]]\n"
+        f"path = {json.dumps(str(ext_dir))}\n"
+        "user_scripts = true\n"
+        'storage = { sitesUrl = { file_url = "sites.json" } }\n'
+        'messages = [ { action = "reloadSites", url = { file_url = "sites.json" } } ]\n',
+        encoding="utf-8",
+    )
+    args = argparse.Namespace(
+        profile_root=profile_root,
+        profile="Default",
+        config=str(cfg),
+        dry_run=False,
+        channel="stable",
+    )
+    brave_pkg.cmd_apply(args)
+
+    assert any(
+        "userScriptsAccess: true" in expr and ext_id in expr
+        for expr in fake_cdp.evaluations
+    )
+    assert f"chrome-extension://{ext_id}/manifest.json" in fake_cdp.navigations
+    assert any(
+        "chrome.storage.local.set(" in expr and expected_uri in expr
+        for expr in fake_cdp.evaluations
+    )
+    assert any(
+        "chrome.runtime.sendMessage(" in expr and '"reloadSites"' in expr
+        for expr in fake_cdp.evaluations
+    )
+
+    prefs_path = profile_root / "Default" / "Preferences"
+    sp_path = profile_root / "Default" / "Secure Preferences"
+    sp_path.write_text(
+        json.dumps(
+            {
+                "extensions": {
+                    "settings": {
+                        ext_id: {
+                            "location": 4,
+                            "path": str(ext_dir.resolve()),
+                            "creation_flags": 38,
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    future = time.time() + 5.0
+    os.utime(sp_path, (future, future))
+    os.utime(prefs_path, (future, future))
+
+    block = extensions.build_dump_block(prefs_path, {})
+    assert block is not None
+    parsed = tomllib.loads("\n".join(block) + "\n")
+    assert parsed["extensions"]["unpacked"] == [
+        {
+            "path": str(ext_dir.resolve()),
+            "user_scripts": True,
+            "storage": {"sitesUrl": expected_uri},
+            "messages": [{"action": "reloadSites", "url": expected_uri}],
+        }
+    ]
+    plans = extensions.plan_apply_all(
+        prefs_path, {}, parsed["extensions"], config_dir=tmp_path
+    )
+    assert all(p.empty for p in plans)

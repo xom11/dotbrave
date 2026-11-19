@@ -254,16 +254,25 @@ Preserve these contracts unless a change explicitly redesigns them:
    `[extensions]` splits into up to two `Plan`s (`plan_apply_all`): an
    external policy plan (emitted only when `webstore` is present or
    `[extensions]` is empty) and an unprivileged browser-bound plan for
-   `unpacked` plus any `file_access`/`incognito`/`shortcuts` on `webstore`
-   entries, so an `unpacked`-only config never escalates and a `webstore`-only
-   config never uninstalls managed unpacked extensions. Downgrading a
-   `webstore` entry from `force` to `normal` makes Chromium uninstall the
-   forced copy (`userMayModify: false`) and reinstall a fresh normal copy
+   `unpacked` plus any `file_access`/`incognito`/`user_scripts`/`shortcuts`/
+   `storage`/`messages` on `webstore` entries, so an `unpacked`-only config
+   never escalates and a `webstore`-only config never uninstalls managed
+   unpacked extensions. `storage` (`chrome.storage.local`) and `messages`
+   (`chrome.runtime.sendMessage`) run in a background
+   `chrome-extension://<id>/manifest.json` tab after `developerPrivate`
+   permissions settle, with recursive `{ file_url = "<path>" }` resolution
+   (stripping `\\?\` and uppercasing drive letters on Windows) and SHA-256
+   tracking in `Preferences.dotbrave.extensions.json` so edits to referenced
+   local config files trigger re-application. Downgrading a `webstore` entry
+   from `force` to `normal` makes Chromium uninstall the forced copy
+   (`userMayModify: false`) and reinstall a fresh normal copy
    (`userMayModify: true`, permissions reset to `false`), and re-adding a
-   `webstore` entry within 10s of a policy removal sees stale `Secure Preferences`
-   on disk -- so `_build_browser_plan` forces permission/shortcut re-application
-   on both transitions and `apply_via_cdp` polls past `userMayModify: false`
-   on mode downgrades.
+   `webstore` entry within 10s of a policy removal sees a stale policy
+   `location` (`{6, 7, 8}`) in `Secure Preferences` on disk (whereas adopting
+   an existing `location == 1` Sync/Web Store install upgrades `location`
+   in-place with permissions intact) -- so `_build_browser_plan` forces
+   re-application only on mode downgrades and stale policy records, and
+   `apply_via_cdp` polls past `userMayModify: false` on mode downgrades.
    On Linux the policy reaches every `--user-data-dir`, and a throwaway
    profile overwrites the real profile's launchers (same file names, its own
    data dir in `Exec`). A per-user systemd path unit runs
@@ -393,7 +402,13 @@ Preserve these contracts unless a change explicitly redesigns them:
    running command line. The third exists because Brave only writes
    `DevToolsActivePort` for a *dynamic* port (`=0`) — verified on macOS
    and Linux — so a browser started on a fixed port reads as having no
-   endpoint and gets closed for nothing. A recorded port gets
+   endpoint and gets closed for nothing. WS-only `DevToolsActivePort`
+   entries (`brave://inspect/#remote-debugging`, HTTP `/json/*` -> 404) are
+   skipped under `--unattended`, over SSH (`SSH_CONNECTION`/`SSH_TTY`), on
+   non-TTY stdin, and across Windows session mismatches so headless/remote
+   runs never hang on an unanswerable GUI approval prompt, and `CdpClient`
+   records `_browser_ws_failed` on handshake failure so a WS-only timeout
+   never retries a second 15s handshake via `list_targets`. A recorded port gets
    `_RECORDED_PORT_PROBES` probes, not one: a single 0.5s miss from a
    busy browser is all it takes to turn a live apply into a restart.
 

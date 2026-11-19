@@ -1310,3 +1310,400 @@ def test_readding_webstore_over_stale_secure_preferences_still_configures_cdp(
     _apply(profile_root, cfg)
     assert "no changes" in capsys.readouterr().out
     assert fake_cdp.evaluations == []
+
+
+def test_adopting_existing_sync_webstore_extension_skips_redundant_reapply(
+    profile_root: Path,
+    policy_env: dict,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Adopting an already-installed Sync/Web Store extension (``location == 1``)
+    into ``ExtensionSettings`` upgrades ``location`` in place and preserves
+    ``incognito`` / ``newAllowFileAccess`` / ``user_scripts_enabled``, so a run
+    whose desired permissions already match on disk must NOT emit ``(reapply)``
+    or touch CDP / restart Brave."""
+    monkeypatch.setattr(brave_pkg, "brave_running", lambda: True)
+    monkeypatch.setattr(orch, "find_devtools_port", lambda r, p: None)
+    monkeypatch.setattr(
+        brave_pkg.BROWSER_PROCESS,
+        "close_and_wait",
+        lambda: (_ for _ in ()).throw(AssertionError("must not close Brave")),
+    )
+
+    sp_path = profile_root / "Default" / "Secure Preferences"
+    sp_path.write_text(
+        json.dumps(
+            {
+                "extensions": {
+                    "settings": {
+                        SURFINGKEYS_ID: {
+                            "location": 1,
+                            "incognito": True,
+                            "newAllowFileAccess": True,
+                            "user_scripts_enabled": True,
+                        },
+                        # Uninstalled tombstone (`location` absent) must NOT be
+                        # mistaken for an installed extension with `incognito: True`.
+                        BITWARDEN_ID: {
+                            "incognito": True,
+                        },
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cfg = tmp_path / "brave.toml"
+    cfg.write_text(
+        "[extensions]\n"
+        "webstore = [\n"
+        f'  {{ id = "{SURFINGKEYS_ID}", name = "Surfingkeys", mode = "normal", '
+        "file_access = true, incognito = true, user_scripts = true },\n"
+        "]\n",
+        encoding="utf-8",
+    )
+    _apply(profile_root, cfg)
+
+    out = capsys.readouterr().out
+    assert "(reapply)" not in out
+    assert "[extensions] applied without touching the running Brave" in out
+    sidecar = json.loads(
+        extensions.state_file(profile_root / "Default" / "Preferences").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert sidecar["webstore_prefs"][SURFINGKEYS_ID] == {
+        "incognito": True,
+        "file_access": True,
+        "user_scripts": True,
+    }
+
+    # Verify tombstone entry (`location: None`) still produces `False -> True` diff.
+    plans = extensions.plan_apply_all(
+        profile_root / "Default" / "Preferences",
+        {},
+        {"webstore": [{"id": BITWARDEN_ID, "incognito": True}]},
+    )
+    assert any("False -> True" in line for p in plans for line in p.diff_lines)
+
+
+def test_path_to_file_url_posix_and_windows() -> None:
+    assert (
+        extensions.path_to_file_url(
+            "/Users/lenamkhanh/.nix/home-manager/dotfiles/browser/surfingkeys/configs.js",
+            platform="darwin",
+        )
+        == "file:///Users/lenamkhanh/.nix/home-manager/dotfiles/browser/surfingkeys/configs.js"
+    )
+    assert (
+        extensions.path_to_file_url(
+            "/home/kln/.nix/home-manager/dotfiles/browser/surfingkeys/configs.js",
+            platform="linux",
+        )
+        == "file:///home/kln/.nix/home-manager/dotfiles/browser/surfingkeys/configs.js"
+    )
+    assert (
+        extensions.path_to_file_url(
+            r"c:\Users\kln\.nix\home-manager\dotfiles\browser\surfingkeys\configs.js",
+            platform="win32",
+        )
+        == "file:///C:/Users/kln/.nix/home-manager/dotfiles/browser/surfingkeys/configs.js"
+    )
+    assert (
+        extensions.path_to_file_url(
+            r"\\?\c:\Users\kln\.nix\surfingkeys\my configs#1.js",
+            platform="win32",
+        )
+        == "file:///C:/Users/kln/.nix/surfingkeys/my%20configs%231.js"
+    )
+    assert (
+        extensions.path_to_file_url(
+            r"\\?\UNC\nas\dotfiles\configs.js",
+            platform="win32",
+        )
+        == "file://nas/dotfiles/configs.js"
+    )
+
+
+@pytest.mark.parametrize(
+    "raw, needle",
+    [
+        (
+            {"webstore": [{"id": SURFINGKEYS_ID, "user_scripts": "true"}]},
+            "user_scripts must be a boolean",
+        ),
+        (
+            {"webstore": [{"id": SURFINGKEYS_ID, "storage": ["bad"]}]},
+            "storage must be a table",
+        ),
+        (
+            {"webstore": [{"id": SURFINGKEYS_ID, "storage": {"": 1}}]},
+            "storage key must be a non-empty string",
+        ),
+        (
+            {
+                "webstore": [
+                    {
+                        "id": SURFINGKEYS_ID,
+                        "storage": {"localPath": {"file_url": "   "}},
+                    }
+                ]
+            },
+            "file_url in storage.localPath must be a non-empty string",
+        ),
+        (
+            {
+                "webstore": [
+                    {
+                        "id": SURFINGKEYS_ID,
+                        "storage": {"localPath": {"file_url": " padded.js "}},
+                    }
+                ]
+            },
+            "surrounding whitespace",
+        ),
+        (
+            {"webstore": [{"id": SURFINGKEYS_ID, "messages": {"action": "x"}}]},
+            "messages must be an array",
+        ),
+        (
+            {
+                "webstore": [
+                    {"id": SURFINGKEYS_ID, "messages": [{"file_url": "a.js"}]}
+                ]
+            },
+            "messages[0] must be a message table",
+        ),
+    ],
+)
+def test_validate_user_scripts_storage_messages_rejects_invalid(
+    raw: object, needle: str
+) -> None:
+    with pytest.raises(SystemExit) as e:
+        extensions.validate_extensions_table(raw, platform="macos")
+    assert needle in str(e.value)
+
+
+def test_validate_file_url_missing_remote_and_platform_skip(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit) as e_missing:
+        extensions.validate_extensions_table(
+            {
+                "webstore": [
+                    {
+                        "id": SURFINGKEYS_ID,
+                        "storage": {"localPath": {"file_url": "../nope.js"}},
+                    }
+                ]
+            },
+            config_dir=tmp_path,
+            platform="macos",
+        )
+    assert "file_url file not found" in str(e_missing.value)
+
+    with pytest.raises(SystemExit) as e_remote:
+        extensions.validate_extensions_table(
+            {
+                "webstore": [
+                    {
+                        "id": SURFINGKEYS_ID,
+                        "storage": {"localPath": {"file_url": "../configs.js"}},
+                    }
+                ]
+            },
+            config_dir=None,
+            platform="macos",
+        )
+    assert "local TOML file" in str(e_remote.value)
+
+    # Non-matching platform skips file existence check after validating syntax.
+    skipped = extensions.validate_extensions_table(
+        {
+            "webstore": [
+                {
+                    "id": SURFINGKEYS_ID,
+                    "storage": {"localPath": {"file_url": "/nonexistent/win.js"}},
+                    "platforms": ["windows"],
+                }
+            ]
+        },
+        config_dir=tmp_path,
+        platform="linux",
+    )
+    assert skipped.webstore == []
+
+
+def test_webstore_user_scripts_storage_messages_file_url_edit_removal_and_export(
+    profile_root: Path,
+    policy_env: dict,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    browser_dir = tmp_path / "browser"
+    cfg_dir = browser_dir / "dotbrave"
+    sk_dir = browser_dir / "surfingkeys"
+    cfg_dir.mkdir(parents=True)
+    sk_dir.mkdir(parents=True)
+    configs_js = sk_dir / "configs.js"
+    configs_js.write_text('api.map("J", "R");\n', encoding="utf-8")
+    expected_uri = extensions.path_to_file_url(configs_js.resolve())
+
+    fake_cdp = _FakeExtCdpClient(
+        profile_root / "Default", installed_ids={SURFINGKEYS_ID}
+    )
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake_cdp)
+    monkeypatch.setattr(brave_pkg, "brave_running", lambda: True)
+    monkeypatch.setattr(brave_pkg, "find_main_brave_cmdline", lambda: ["brave"])
+    monkeypatch.setattr(orch, "find_devtools_port", lambda r, p: 9222)
+    monkeypatch.setattr(orch, "remember_devtools_port", lambda r, p, port: None)
+
+    cfg = cfg_dir / "brave.toml"
+    cfg.write_text(
+        "[[extensions.webstore]]\n"
+        f'id = "{SURFINGKEYS_ID}"\n'
+        'name = "Surfingkeys"\n'
+        'mode = "normal"\n'
+        "file_access = true\n"
+        "incognito = true\n"
+        "user_scripts = true\n"
+        'storage = { showAdvanced = true, obsoleteKey = "v1", localPath = { file_url = "../surfingkeys/configs.js" } }\n'
+        "messages = [\n"
+        '  { action = "updateSettings", needResponse = true, settings = { showAdvanced = true } },\n'
+        '  { action = "loadSettingsFromUrl", needResponse = true, url = { file_url = "../surfingkeys/configs.js" } },\n'
+        "]\n",
+        encoding="utf-8",
+    )
+    _apply(profile_root, cfg)
+
+    assert any(
+        "userScriptsAccess: true" in expr and SURFINGKEYS_ID in expr
+        for expr in fake_cdp.evaluations
+    )
+    assert f"chrome-extension://{SURFINGKEYS_ID}/manifest.json" in fake_cdp.navigations
+    assert any(
+        "chrome.storage.local.set(" in expr and expected_uri in expr
+        for expr in fake_cdp.evaluations
+    )
+    msg_evals = [
+        expr for expr in fake_cdp.evaluations if "chrome.runtime.sendMessage(" in expr
+    ]
+    assert len(msg_evals) == 2
+    assert '"updateSettings"' in msg_evals[0]
+    assert '"loadSettingsFromUrl"' in msg_evals[1] and expected_uri in msg_evals[1]
+
+    # Seed Secure Preferences after flush (without user_scripts_enabled, as on
+    # Chromium builds storing user_scripts in StateStore LevelDB) and verify
+    # steady-state re-apply is a 0-CDP no-op!
+    prefs_path = profile_root / "Default" / "Preferences"
+    sp_path = profile_root / "Default" / "Secure Preferences"
+    sp_path.write_text(
+        json.dumps(
+            {
+                "extensions": {
+                    "settings": {
+                        SURFINGKEYS_ID: {
+                            "location": 6,
+                            "incognito": True,
+                            "newAllowFileAccess": True,
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    future = time.time() + 5.0
+    os.utime(sp_path, (future, future))
+    os.utime(prefs_path, (future, future))
+
+    capsys.readouterr()
+    fake_cdp.evaluations.clear()
+    fake_cdp.navigations.clear()
+    _apply(profile_root, cfg)
+    assert "no changes" in capsys.readouterr().out
+    assert fake_cdp.evaluations == []
+
+    # Export round-trips user_scripts, storage, and messages cleanly with 0 diff!
+    block = extensions.build_dump_block(prefs_path, {})
+    assert block is not None
+    exported_parsed = tomllib.loads("\n".join(block) + "\n")
+    roundtrip_plans = extensions.plan_apply_all(
+        prefs_path, {}, exported_parsed["extensions"], config_dir=cfg_dir
+    )
+    assert all(p.empty for p in roundtrip_plans)
+
+    # Editing configs.js on disk updates SHA-256 and triggers re-applying storage + messages!
+    configs_js.write_text('api.map("J", "R");\napi.map("K", "E");\n', encoding="utf-8")
+    fake_cdp.evaluations.clear()
+    _apply(profile_root, cfg)
+    out = capsys.readouterr().out
+    assert "file_url updated" in out
+    assert any("chrome.storage.local.set(" in expr for expr in fake_cdp.evaluations)
+    assert (
+        sum(
+            1
+            for expr in fake_cdp.evaluations
+            if "chrome.runtime.sendMessage(" in expr
+        )
+        == 2
+    )
+
+    # Dropping `obsoleteKey` from storage removes it via chrome.storage.local.remove.
+    cfg.write_text(
+        cfg.read_text(encoding="utf-8").replace(', obsoleteKey = "v1"', ""),
+        encoding="utf-8",
+    )
+    fake_cdp.evaluations.clear()
+    _apply(profile_root, cfg)
+    assert any(
+        'chrome.storage.local.remove(["obsoleteKey"])' in expr
+        for expr in fake_cdp.evaluations
+    )
+
+
+def test_extension_message_failure_raises_cdp_error(
+    profile_root: Path, tmp_path: Path
+) -> None:
+    from dotbrave._base.cdp import CdpError
+
+    configs_js = tmp_path / "configs.js"
+    configs_js.write_text("// test\n", encoding="utf-8")
+    prefs_path = profile_root / "Default" / "Preferences"
+
+    plans = extensions.plan_apply_all(
+        prefs_path,
+        {},
+        {
+            "webstore": [
+                {
+                    "id": SURFINGKEYS_ID,
+                    "messages": [
+                        {
+                            "action": "loadSettingsFromUrl",
+                            "url": {"file_url": "configs.js"},
+                        }
+                    ],
+                }
+            ]
+        },
+        config_dir=tmp_path,
+    )
+    browser_plan = next(p for p in plans if p.external_apply_fn is None)
+
+    fake_cdp = _FakeExtCdpClient(
+        profile_root / "Default", installed_ids={SURFINGKEYS_ID}
+    )
+    orig_eval = fake_cdp.evaluate
+
+    def failing_eval(target: dict, expr: str):
+        if "chrome.runtime.sendMessage(" in expr:
+            return {"status": "Failed", "error": "Failed to fetch"}
+        return orig_eval(target, expr)
+
+    fake_cdp.evaluate = failing_eval  # type: ignore[method-assign]
+    target = fake_cdp.create_page("chrome://extensions")
+    with pytest.raises(CdpError, match="Failed to fetch"):
+        extensions.apply_via_cdp(fake_cdp, target, browser_plan)

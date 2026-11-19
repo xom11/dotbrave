@@ -79,11 +79,12 @@ focus_location    = ["Control+KeyL"]
 # ]
 
 # [extensions] — Chrome Web Store (`webstore`, requires sudo/Admin) and
-# unpacked local extension directories (`unpacked`) + command shortcuts.
+# unpacked local extension directories (`unpacked`) + permissions, shortcuts,
+# `chrome.storage.local` keys, and runtime messages.
 #
 # [extensions]
 # webstore = [
-#   { id = "gfbliohnnapiefjpjlpjnehglfpaknnc", name = "Surfingkeys", file_access = true },
+#   { id = "gfbliohnnapiefjpjlpjnehglfpaknnc", name = "Surfingkeys", file_access = true, user_scripts = true },
 # ]
 # unpacked = [
 #   { path = "../my-extension", shortcuts = { _execute_action = "Control+KeyB" } },

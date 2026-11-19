@@ -641,3 +641,186 @@ def test_create_page_prefers_background_browser_ws_over_http_json_new(
             client.close_page(target)
         finally:
             client.close()
+
+
+def test_ssh_and_non_tty_skip_ws_only_devtools_port(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Attended runs over SSH (`ssh -tt`) or with non-TTY stdin must skip a
+    WS-only `brave://inspect` DevToolsActivePort instead of hanging on an
+    unanswerable GUI modal, while a local interactive TTY still uses it."""
+    import argparse
+    from dotbrave._base import orchestrator
+
+    profile_dir = tmp_path / "Default"
+    profile_dir.mkdir()
+    (profile_dir / "Preferences").write_text(json.dumps({"a": {"b": False}}))
+    cfg = tmp_path / "brave.toml"
+    cfg.write_text('[settings]\n"a.b" = true\n')
+
+    class FakeTtyStdin:
+        def isatty(self) -> bool:
+            return True
+
+    class FakePipeStdin:
+        def isatty(self) -> bool:
+            return False
+
+    with _MockWsOnlyDevToolsServer(profile_dir) as srv:
+        (tmp_path / "DevToolsActivePort").write_text(
+            f"{srv.port}\n{srv.ws_path}\n", encoding="utf-8"
+        )
+
+        # 1) SSH with PTY (`ssh -tt`): skipped -> falls through to relaunch.
+        monkeypatch.setattr(orchestrator.sys, "stdin", FakeTtyStdin())
+        monkeypatch.setenv("SSH_CONNECTION", "100.64.0.1 55555 100.64.0.2 22")
+        monkeypatch.setattr(orchestrator, "pick_unused_port", lambda: 9444)
+        monkeypatch.setattr(
+            orchestrator, "wait_for_devtools_endpoint", lambda p, n: None
+        )
+        monkeypatch.setattr(
+            orchestrator, "remember_devtools_port", lambda *a, **k: None
+        )
+        seen_ports: list[int] = []
+        closed: list[bool] = []
+        orchestrator.cmd_apply(
+            argparse.Namespace(
+                profile_root=tmp_path,
+                profile="Default",
+                config=str(cfg),
+                dry_run=False,
+                unattended=False,
+            ),
+            display_name="Brave",
+            running_fn=lambda: True,
+            find_cmdline_fn=lambda: ["brave"],
+            restart_fn=lambda c: c,
+            build_plans_fn=lambda p, prefs, doc, **kw: [
+                orchestrator.Plan(
+                    namespace="settings",
+                    diff_lines=["  settings: change"],
+                    apply_fn=lambda prefs: None,
+                    verify_fn=lambda prefs: None,
+                )
+            ],
+            live_apply_fn=lambda port, *a, **k: seen_ports.append(port),
+            graceful_close_fn=lambda: closed.append(True),
+            launch_live_fn=lambda *a, **k: ["brave"],
+        )
+        assert closed == [True]
+        assert seen_ports == [9444]
+        assert srv.commands == []
+
+        # 2) Non-TTY stdin without SSH: also skipped.
+        monkeypatch.delenv("SSH_CONNECTION", raising=False)
+        monkeypatch.delenv("SSH_TTY", raising=False)
+        monkeypatch.setattr(orchestrator.sys, "stdin", FakePipeStdin())
+        seen_ports.clear()
+        closed.clear()
+        orchestrator.cmd_apply(
+            argparse.Namespace(
+                profile_root=tmp_path,
+                profile="Default",
+                config=str(cfg),
+                dry_run=False,
+                unattended=False,
+            ),
+            display_name="Brave",
+            running_fn=lambda: True,
+            find_cmdline_fn=lambda: ["brave"],
+            restart_fn=lambda c: c,
+            build_plans_fn=lambda p, prefs, doc, **kw: [
+                orchestrator.Plan(
+                    namespace="settings",
+                    diff_lines=["  settings: change"],
+                    apply_fn=lambda prefs: None,
+                    verify_fn=lambda prefs: None,
+                )
+            ],
+            live_apply_fn=lambda port, *a, **k: seen_ports.append(port),
+            graceful_close_fn=lambda: closed.append(True),
+            launch_live_fn=lambda *a, **k: ["brave"],
+        )
+        assert closed == [True]
+        assert seen_ports == [9444]
+
+        # 3) Local interactive TTY without SSH: uses WS-only port directly!
+        monkeypatch.setattr(orchestrator.sys, "stdin", FakeTtyStdin())
+        monkeypatch.setattr(
+            orchestrator._process,
+            "_windows_console_session_mismatch",
+            lambda: False,
+        )
+        seen_ports.clear()
+        closed.clear()
+        orchestrator.cmd_apply(
+            argparse.Namespace(
+                profile_root=tmp_path,
+                profile="Default",
+                config=str(cfg),
+                dry_run=False,
+                unattended=False,
+            ),
+            display_name="Brave",
+            running_fn=lambda: True,
+            find_cmdline_fn=lambda: ["brave"],
+            restart_fn=lambda c: c,
+            build_plans_fn=lambda p, prefs, doc, **kw: [
+                orchestrator.Plan(
+                    namespace="settings",
+                    diff_lines=["  settings: change"],
+                    apply_fn=lambda prefs: None,
+                    verify_fn=lambda prefs: None,
+                )
+            ],
+            live_apply_fn=lambda port, *a, **k: seen_ports.append(port),
+            graceful_close_fn=lambda: closed.append(True),
+            launch_live_fn=lambda *a, **k: ["brave"],
+        )
+        assert closed == []
+        assert seen_ports == [srv.port]
+
+
+def test_ws_only_handshake_failure_fails_fast_without_double_retry(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """When a WS-only `brave://inspect` handshake fails or is denied, live apply
+    must raise `LiveApplyUnsupported` after a single WS attempt rather than
+    swallowing `CdpError`, trying `/json/new`, and hanging a second time in
+    `list_targets`."""
+    import pytest
+    from dotbrave import live
+    from dotbrave._base import live_apply as shared_live
+    from dotbrave._base.utils import Plan
+
+    profile_dir = tmp_path / "Default"
+    profile_dir.mkdir()
+    prefs_path = profile_dir / "Preferences"
+    prefs = {"brave": {"tabs": {"vertical_tabs_enabled": False}}}
+    prefs_path.write_text(json.dumps(prefs), encoding="utf-8")
+
+    ws_attempts: list[str] = []
+
+    class RejectingWebSocket:
+        def __init__(self, url: str, timeout: float = 5.0):
+            ws_attempts.append(url)
+            raise cdp.CdpError("DevTools websocket handshake failed (HTTP/1.1 403 Forbidden)")
+
+    with _MockWsOnlyDevToolsServer(profile_dir) as srv:
+        (tmp_path / "DevToolsActivePort").write_text(
+            f"{srv.port}\n{srv.ws_path}\n", encoding="utf-8"
+        )
+        monkeypatch.setattr(cdp, "_WebSocket", RejectingWebSocket)
+        plan = Plan(
+            namespace="settings",
+            diff_lines=['  + "brave.tabs.vertical_tabs_enabled" = true'],
+            apply_fn=lambda d: None,
+            verify_fn=lambda _d: None,
+        )
+        with pytest.raises(shared_live.LiveApplyUnsupported):
+            live.apply_live(
+                srv.port, prefs_path, prefs, [plan], unattended=False, profile="Default"
+            )
+
+        assert len(ws_attempts) == 1
+        assert not any(p.startswith("/json/new") for p in srv.http_paths)

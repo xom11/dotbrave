@@ -7,9 +7,10 @@ Two sub-keys live under ``[extensions]``:
   plist alongside ``[pwa]`` and ``[shields]``, written to
   ``/etc/brave/policies/managed/dotbrave-extensions.json`` on Linux, and stored
   as a ``REG_SZ`` JSON object on ``HKLM\\Software\\Policies\\BraveSoftware\\Brave``
-  on Windows. Optional ``file_access``, ``incognito``, and ``shortcuts`` fields
-  on ``webstore`` entries are applied through ``chrome.developerPrivate`` once
-  Brave installs the extension.
+  on Windows. Optional ``file_access``, ``incognito``, ``user_scripts``,
+  ``shortcuts``, ``storage``, and ``messages`` fields on ``webstore`` entries
+  are applied through ``chrome.developerPrivate`` and ``chrome-extension://``
+  work tabs once Brave installs the extension.
 - ``unpacked = [...]`` loads local unpacked extension directories via CDP:
   - ``extensions.settings`` and ``extensions.ui.developer_mode`` are tracked in
     ``Secure Preferences`` under ``ENFORCE_ON_LOAD`` on macOS and Windows
@@ -40,11 +41,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
 import sys
 import time
+import urllib.parse
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -80,9 +83,14 @@ POLICY_FILE = _default_policy_file()
 _WINDOWS_POLICY_KEY = pwa_mod._WINDOWS_POLICY_KEY
 _WEBSTORE_INSTALL_WAIT_S = 20.0
 _WEBSTORE_INSTALL_POLL_S = 0.25
+_EXT_CONTEXT_WAIT_S = 5.0
+_EXT_CONTEXT_POLL_S = 0.05
+_EXT_MESSAGE_SETTLE_MS = 150
 
 _EXT_ID_RE = re.compile(r"^[a-p]{32}$")
+_BARE_TOML_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _UNPACKED_LOCATION = 4
+_POLICY_LOCATIONS = frozenset({6, 7, 8})
 _ALLOW_FILE_ACCESS_FLAG = 1 << 2
 _INSTALLED_VIA_CDP_FLAG = 1 << 15
 _EXTENSIONS_URL = "chrome://extensions"
@@ -152,7 +160,11 @@ class WebstoreEntry:
     toolbar_pin: str | None = None
     file_access: bool | None = None
     incognito: bool | None = None
+    user_scripts: bool | None = None
     shortcuts: dict[str, str] = field(default_factory=dict)
+    storage: dict[str, Any] | None = None
+    messages: list[dict[str, Any]] = field(default_factory=list)
+    file_hashes: dict[str, str] = field(default_factory=dict)
 
     @property
     def display_label(self) -> str:
@@ -177,6 +189,10 @@ class UnpackedEntry:
     shortcuts: dict[str, str] = field(default_factory=dict)
     incognito: bool | None = None
     file_access: bool | None = None
+    user_scripts: bool | None = None
+    storage: dict[str, Any] | None = None
+    messages: list[dict[str, Any]] = field(default_factory=list)
+    file_hashes: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -195,6 +211,10 @@ class ExtensionEntryOp:
     needs_incognito_update: bool
     shortcut_writes: dict[str, str]
     needs_file_access_update: bool = False
+    needs_user_scripts_update: bool = False
+    storage_writes: dict[str, Any] = field(default_factory=dict)
+    storage_removals: list[str] = field(default_factory=list)
+    messages_to_send: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -203,6 +223,10 @@ class WebstoreEntryOp:
     needs_incognito_update: bool
     needs_file_access_update: bool
     shortcut_writes: dict[str, str]
+    needs_user_scripts_update: bool = False
+    storage_writes: dict[str, Any] = field(default_factory=dict)
+    storage_removals: list[str] = field(default_factory=list)
+    messages_to_send: list[dict[str, Any]] = field(default_factory=list)
     fallback_prefs: dict[str, Any] | None = None
     wait_for_modifiable: bool = False
 
@@ -211,7 +235,11 @@ class WebstoreEntryOp:
         return bool(
             self.needs_incognito_update
             or self.needs_file_access_update
+            or self.needs_user_scripts_update
             or self.shortcut_writes
+            or self.storage_writes
+            or self.storage_removals
+            or self.messages_to_send
         )
 
 
@@ -236,11 +264,20 @@ class ExtensionPlanOps:
             op.needs_reload
             or op.needs_incognito_update
             or op.needs_file_access_update
+            or op.needs_user_scripts_update
+            or op.storage_writes
+            or op.storage_removals
+            or op.messages_to_send
             for op in self.entry_ops
         ):
             return True
         return any(
-            wop.needs_incognito_update or wop.needs_file_access_update
+            wop.needs_incognito_update
+            or wop.needs_file_access_update
+            or wop.needs_user_scripts_update
+            or wop.storage_writes
+            or wop.storage_removals
+            or wop.messages_to_send
             for wop in self.webstore_ops
         )
 
@@ -520,6 +557,152 @@ def _resolve_extension_path(raw_path: str, config_dir: Path | None) -> Path:
         sys.exit(f"error: [extensions] cannot resolve {raw_path!r}: {e}")
 
 
+def path_to_file_url(path: Path | str, *, platform: str | None = None) -> str:
+    """Convert a resolved local path into an RFC 8089 ``file://`` URI across
+    POSIX and Windows (stripping ``\\\\?\\`` and uppercasing ASCII drive letters)."""
+    plat = sys.platform if platform is None else platform
+    raw_str = str(path)
+    if plat in ("win32", "windows"):
+        if raw_str.startswith("\\\\?\\UNC\\"):
+            unc = raw_str[8:].replace("\\", "/")
+            return f"file://{urllib.parse.quote(unc, safe='/')}"
+        if raw_str.startswith("\\\\?\\"):
+            raw_str = raw_str[4:]
+        if raw_str.startswith("\\\\"):
+            unc = raw_str[2:].replace("\\", "/")
+            return f"file://{urllib.parse.quote(unc, safe='/')}"
+        if len(raw_str) >= 2 and "a" <= raw_str[0] <= "z" and raw_str[1] == ":":
+            raw_str = raw_str[0].upper() + raw_str[1:]
+        if len(raw_str) >= 2 and raw_str[1] == ":":
+            drive = raw_str[:2]
+            rest = raw_str[2:].replace("\\", "/")
+            if not rest.startswith("/"):
+                rest = "/" + rest
+            return f"file:///{drive}{urllib.parse.quote(rest, safe='/')}"
+    norm = raw_str.replace("\\", "/") if plat in ("win32", "windows") else raw_str
+    if not norm.startswith("/"):
+        norm = "/" + norm
+    return f"file://{urllib.parse.quote(norm, safe='/')}"
+
+
+def _is_file_url_sentinel(value: object) -> bool:
+    return isinstance(value, dict) and set(value) == {"file_url"}
+
+
+def _validate_payload_syntax(value: object, *, context: str) -> None:
+    if _is_file_url_sentinel(value):
+        assert isinstance(value, dict)
+        raw_fp = value["file_url"]
+        if (
+            not isinstance(raw_fp, str)
+            or not raw_fp.strip()
+            or raw_fp != raw_fp.strip()
+        ):
+            sys.exit(
+                f"error: [extensions] file_url in {context} must be a non-empty "
+                f"string without surrounding whitespace, got {raw_fp!r}"
+            )
+        return
+    if value is None or isinstance(value, (bool, int, str)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            sys.exit(
+                f"error: [extensions] non-finite float {value!r} is not "
+                f"allowed in {context}"
+            )
+        return
+    if isinstance(value, list):
+        for elem in value:
+            _validate_payload_syntax(elem, context=context)
+        return
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if not isinstance(k, str):
+                sys.exit(
+                    f"error: [extensions] table key in {context} must be a "
+                    f"string, got {k!r}"
+                )
+            _validate_payload_syntax(v, context=context)
+        return
+    sys.exit(
+        f"error: [extensions] unsupported value {value!r} "
+        f"({type(value).__name__}) in {context}"
+    )
+
+
+def _validate_storage_syntax(raw_storage: object) -> dict[str, Any]:
+    if not isinstance(raw_storage, dict):
+        sys.exit("error: [extensions] storage must be a table")
+    for k, v in raw_storage.items():
+        if not isinstance(k, str) or not k:
+            sys.exit(
+                f"error: [extensions] storage key must be a non-empty string, "
+                f"got {k!r}"
+            )
+        _validate_payload_syntax(v, context=f"storage.{k}")
+    return raw_storage
+
+
+def _validate_messages_syntax(raw_messages: object) -> list[dict[str, Any]]:
+    if not isinstance(raw_messages, list):
+        sys.exit("error: [extensions] messages must be an array of tables")
+    for idx, msg in enumerate(raw_messages):
+        if not isinstance(msg, dict) or _is_file_url_sentinel(msg):
+            sys.exit(
+                f"error: [extensions] messages[{idx}] must be a message table, "
+                f"got {msg!r}"
+            )
+        for k, v in msg.items():
+            if not isinstance(k, str):
+                sys.exit(
+                    f"error: [extensions] messages[{idx}] key must be a string, "
+                    f"got {k!r}"
+                )
+            _validate_payload_syntax(v, context=f"messages[{idx}].{k}")
+    return raw_messages
+
+
+def _resolve_value_file_urls(
+    value: Any,
+    *,
+    config_dir: Path | None,
+    file_hashes: dict[str, str],
+) -> Any:
+    if _is_file_url_sentinel(value):
+        raw_fp = value["file_url"]
+        resolved = _resolve_extension_path(raw_fp, config_dir)
+        if not resolved.is_file():
+            sys.exit(
+                f"error: [extensions] file_url file not found: {resolved} "
+                f"(from {raw_fp!r})"
+            )
+        try:
+            digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
+        except OSError as e:
+            sys.exit(
+                f"error: [extensions] cannot read file_url {resolved}: {e}"
+            )
+        uri = path_to_file_url(resolved)
+        file_hashes[uri] = digest
+        return uri
+    if isinstance(value, list):
+        return [
+            _resolve_value_file_urls(
+                elem, config_dir=config_dir, file_hashes=file_hashes
+            )
+            for elem in value
+        ]
+    if isinstance(value, dict):
+        return {
+            k: _resolve_value_file_urls(
+                v, config_dir=config_dir, file_hashes=file_hashes
+            )
+            for k, v in value.items()
+        }
+    return value
+
+
 def _validate_manifest_dir(path: Path, display_path: str) -> None:
     if not path.is_dir():
         sys.exit(
@@ -654,7 +837,10 @@ def validate_extensions_table(
             toolbar_pin: str | None = None
             file_access: bool | None = None
             incognito: bool | None = None
+            user_scripts: bool | None = None
             raw_shortcuts: dict[str, Any] = {}
+            raw_storage: dict[str, Any] | None = None
+            raw_messages: list[dict[str, Any]] = []
             entry_platforms: list[str] | None = None
 
             if isinstance(item, str):
@@ -667,7 +853,10 @@ def validate_extensions_table(
                     "pin",
                     "file_access",
                     "incognito",
+                    "user_scripts",
                     "shortcuts",
+                    "storage",
+                    "messages",
                     "platforms",
                 }
                 if bad:
@@ -675,7 +864,8 @@ def validate_extensions_table(
                         f"error: [extensions] webstore entry has unsupported keys: "
                         f"{sorted(bad)} (expected {{ id = \"...\", name = \"...\", "
                         f'mode = "force"|"normal", pin = "force"|"default"|"unpinned"|bool, '
-                        f"file_access = bool, incognito = bool, shortcuts = {{...}}, "
+                        f"file_access = bool, incognito = bool, user_scripts = bool, "
+                        f"shortcuts = {{...}}, storage = {{...}}, messages = [...], "
                         f"platforms = [...] }})"
                     )
                 ext_id = _validate_webstore_id(item.get("id"))
@@ -718,6 +908,13 @@ def validate_extensions_table(
                             f"got {item['incognito']!r}"
                         )
                     incognito = item["incognito"]
+                if "user_scripts" in item:
+                    if not isinstance(item["user_scripts"], bool):
+                        sys.exit(
+                            f"error: [extensions] user_scripts must be a boolean, "
+                            f"got {item['user_scripts']!r}"
+                        )
+                    user_scripts = item["user_scripts"]
                 if "platforms" in item:
                     entry_platforms = _validate_platforms_field(item["platforms"])
                 if "shortcuts" in item:
@@ -725,6 +922,10 @@ def validate_extensions_table(
                     if not isinstance(sc, dict):
                         sys.exit("error: [extensions] shortcuts must be a table")
                     raw_shortcuts = sc
+                if "storage" in item:
+                    raw_storage = _validate_storage_syntax(item["storage"])
+                if "messages" in item:
+                    raw_messages = _validate_messages_syntax(item["messages"])
             else:
                 sys.exit(
                     f"error: [extensions] webstore entries must be strings or tables, "
@@ -746,6 +947,26 @@ def validate_extensions_table(
             if ext_id in seen_ws:
                 continue
             seen_ws.add(ext_id)
+            ws_file_hashes: dict[str, str] = {}
+            resolved_ws_storage = (
+                {
+                    k: _resolve_value_file_urls(
+                        v, config_dir=config_dir, file_hashes=ws_file_hashes
+                    )
+                    for k, v in raw_storage.items()
+                }
+                if raw_storage is not None
+                else None
+            )
+            resolved_ws_messages = [
+                {
+                    k: _resolve_value_file_urls(
+                        v, config_dir=config_dir, file_hashes=ws_file_hashes
+                    )
+                    for k, v in msg.items()
+                }
+                for msg in raw_messages
+            ]
             webstore_out.append(
                 WebstoreEntry(
                     ext_id=ext_id,
@@ -754,7 +975,11 @@ def validate_extensions_table(
                     toolbar_pin=toolbar_pin,
                     file_access=file_access,
                     incognito=incognito,
+                    user_scripts=user_scripts,
                     shortcuts=norm_shortcuts,
+                    storage=resolved_ws_storage,
+                    messages=resolved_ws_messages,
+                    file_hashes=dict(sorted(ws_file_hashes.items())),
                 )
             )
 
@@ -768,6 +993,9 @@ def validate_extensions_table(
             raw_shortcuts = {}
             incognito = None
             file_access = None
+            user_scripts = None
+            raw_storage = None
+            raw_messages = []
             entry_platforms = None
 
             if isinstance(item, str):
@@ -778,13 +1006,17 @@ def validate_extensions_table(
                     "shortcuts",
                     "incognito",
                     "file_access",
+                    "user_scripts",
+                    "storage",
+                    "messages",
                     "platforms",
                 }
                 if bad:
                     sys.exit(
                         f"error: [extensions] entry has unsupported keys: {sorted(bad)} "
                         f'(expected {{ path = "...", shortcuts = {{...}}, '
-                        f"incognito = bool, file_access = bool, platforms = [...] }})"
+                        f"incognito = bool, file_access = bool, user_scripts = bool, "
+                        f"storage = {{...}}, messages = [...], platforms = [...] }})"
                     )
                 raw_path = item.get("path")
                 if not isinstance(raw_path, str):
@@ -805,6 +1037,13 @@ def validate_extensions_table(
                             f"got {item['file_access']!r}"
                         )
                     file_access = item["file_access"]
+                if "user_scripts" in item:
+                    if not isinstance(item["user_scripts"], bool):
+                        sys.exit(
+                            f"error: [extensions] user_scripts must be a boolean, "
+                            f"got {item['user_scripts']!r}"
+                        )
+                    user_scripts = item["user_scripts"]
                 if "platforms" in item:
                     entry_platforms = _validate_platforms_field(item["platforms"])
                 if "shortcuts" in item:
@@ -812,6 +1051,10 @@ def validate_extensions_table(
                     if not isinstance(sc, dict):
                         sys.exit("error: [extensions] shortcuts must be a table")
                     raw_shortcuts = sc
+                if "storage" in item:
+                    raw_storage = _validate_storage_syntax(item["storage"])
+                if "messages" in item:
+                    raw_messages = _validate_messages_syntax(item["messages"])
             else:
                 sys.exit(
                     f"error: [extensions] unpacked entries must be strings or tables, "
@@ -843,6 +1086,26 @@ def validate_extensions_table(
             if ext_id in seen_ids:
                 continue
             seen_ids.add(ext_id)
+            unp_file_hashes: dict[str, str] = {}
+            resolved_unp_storage = (
+                {
+                    k: _resolve_value_file_urls(
+                        v, config_dir=config_dir, file_hashes=unp_file_hashes
+                    )
+                    for k, v in raw_storage.items()
+                }
+                if raw_storage is not None
+                else None
+            )
+            resolved_unp_messages = [
+                {
+                    k: _resolve_value_file_urls(
+                        v, config_dir=config_dir, file_hashes=unp_file_hashes
+                    )
+                    for k, v in msg.items()
+                }
+                for msg in raw_messages
+            ]
             unpacked_out.append(
                 UnpackedEntry(
                     path=resolved,
@@ -852,6 +1115,10 @@ def validate_extensions_table(
                     shortcuts=norm_shortcuts,
                     incognito=incognito,
                     file_access=file_access,
+                    user_scripts=user_scripts,
+                    storage=resolved_unp_storage,
+                    messages=resolved_unp_messages,
+                    file_hashes=dict(sorted(unp_file_hashes.items())),
                 )
             )
 
@@ -970,6 +1237,101 @@ def _record_file_access(rec: dict[str, Any] | None) -> bool:
         return bool(rec["newAllowFileAccess"])
     flags = rec.get("creation_flags", 0)
     return bool(flags & _ALLOW_FILE_ACCESS_FLAG) if isinstance(flags, int) else False
+
+
+def _record_user_scripts(rec: dict[str, Any] | None) -> bool | None:
+    if not isinstance(rec, dict):
+        return None
+    val = rec.get("user_scripts_enabled")
+    return val if isinstance(val, bool) else None
+
+
+def _json_equal(a: Any, b: Any) -> bool:
+    return json.dumps(a, sort_keys=True, separators=(",", ":")) == json.dumps(
+        b, sort_keys=True, separators=(",", ":")
+    )
+
+
+def _format_storage_preview(val: Any) -> str:
+    rendered = json.dumps(val)
+    return rendered if len(rendered) <= 80 else rendered[:77] + "..."
+
+
+def _diff_storage_and_messages(
+    *,
+    label: str,
+    prev_rec: dict[str, Any] | None,
+    want_storage: dict[str, Any] | None,
+    want_messages: list[dict[str, Any]],
+    want_hashes: dict[str, str],
+    reinstall: bool,
+    permissions_changed: bool,
+    suppress_add_diff: bool,
+    diff: list[str],
+) -> tuple[dict[str, Any], list[str], list[dict[str, Any]]]:
+    prev_storage = (
+        prev_rec.get("storage", {})
+        if (prev_rec is not None and isinstance(prev_rec.get("storage"), dict))
+        else {}
+    )
+    prev_messages = (
+        prev_rec.get("messages", [])
+        if (prev_rec is not None and isinstance(prev_rec.get("messages"), list))
+        else []
+    )
+    prev_hashes = (
+        prev_rec.get("file_hashes", {})
+        if (prev_rec is not None and isinstance(prev_rec.get("file_hashes"), dict))
+        else {}
+    )
+    target_storage = dict(want_storage) if want_storage is not None else {}
+    hashes_changed = bool(want_hashes) and want_hashes != prev_hashes
+
+    storage_removals = sorted(set(prev_storage) - set(target_storage))
+    if reinstall or hashes_changed:
+        storage_writes = dict(target_storage)
+    else:
+        storage_writes = {
+            k: v
+            for k, v in target_storage.items()
+            if k not in prev_storage or not _json_equal(prev_storage[k], v)
+        }
+
+    if want_messages and (
+        reinstall
+        or not _json_equal(want_messages, prev_messages)
+        or hashes_changed
+        or bool(storage_writes)
+        or bool(storage_removals)
+        or permissions_changed
+    ):
+        messages_to_send = list(want_messages)
+    else:
+        messages_to_send = []
+
+    if not suppress_add_diff:
+        for k in sorted(storage_writes):
+            op_sym = "+" if k not in prev_storage else "~"
+            diff.append(
+                f"  {op_sym} {label} storage.{k} = "
+                f"{_format_storage_preview(storage_writes[k])}"
+            )
+    for k in storage_removals:
+        diff.append(f"  - {label} storage.{k}")
+
+    if messages_to_send and not suppress_add_diff:
+        if not prev_messages:
+            diff.append(f"  + {label} messages ({len(messages_to_send)})")
+        elif hashes_changed:
+            diff.append(
+                f"  ~ {label} messages ({len(messages_to_send)}, file_url updated)"
+            )
+        else:
+            diff.append(f"  ~ {label} messages ({len(messages_to_send)})")
+    elif prev_messages and not want_messages:
+        diff.append(f"  - {label} messages (clear)")
+
+    return storage_writes, storage_removals, messages_to_send
 
 
 def _disk_extension_commands(
@@ -1106,6 +1468,14 @@ def _webstore_prefs_record(entry: WebstoreEntry) -> dict[str, Any]:
         rec["incognito"] = entry.incognito
     if entry.file_access is not None:
         rec["file_access"] = entry.file_access
+    if entry.user_scripts is not None:
+        rec["user_scripts"] = entry.user_scripts
+    if entry.storage:
+        rec["storage"] = dict(entry.storage)
+    if entry.messages:
+        rec["messages"] = list(entry.messages)
+    if entry.file_hashes:
+        rec["file_hashes"] = dict(sorted(entry.file_hashes.items()))
     return rec
 
 
@@ -1204,7 +1574,7 @@ def _build_browser_plan(
                 and (needs_install or cur_incog != entry.incognito)
             )
 
-            disk_fa = _record_file_access(rec)
+            disk_fa = _record_file_access(rec) if installed_on_disk else False
             prev_fa = (
                 prev.get("file_access")
                 if (prev is not None and isinstance(prev.get("file_access"), bool))
@@ -1214,6 +1584,25 @@ def _build_browser_plan(
             needs_file_access = (
                 entry.file_access is not None
                 and (needs_install or cur_fa != entry.file_access)
+            )
+
+            disk_us = _record_user_scripts(rec) if installed_on_disk else False
+            prev_us = (
+                prev.get("user_scripts")
+                if (prev is not None and isinstance(prev.get("user_scripts"), bool))
+                else None
+            )
+            if needs_install:
+                cur_us: bool | None = False
+            elif installed_live and prev_us is not None:
+                cur_us = prev_us
+            elif disk_us is not None:
+                cur_us = disk_us
+            else:
+                cur_us = prev_us
+            needs_user_scripts = (
+                entry.user_scripts is not None
+                and (needs_install or cur_us != entry.user_scripts)
             )
 
             if needs_install:
@@ -1230,6 +1619,16 @@ def _build_browser_plan(
                     f"  ~ {entry.display_path} file_access: "
                     f"{cur_fa} -> {entry.file_access}"
                 )
+            if needs_user_scripts and not needs_install:
+                if cur_us is None:
+                    diff.append(
+                        f"  + {entry.display_path} user_scripts: {entry.user_scripts}"
+                    )
+                else:
+                    diff.append(
+                        f"  ~ {entry.display_path} user_scripts: "
+                        f"{cur_us} -> {entry.user_scripts}"
+                    )
 
             prev_shortcuts = (
                 prev.get("shortcuts", {})
@@ -1269,6 +1668,20 @@ def _build_browser_plan(
                     + (f": {have_binding} (clear)" if have_binding else " (clear)")
                 )
 
+            unp_storage_writes, unp_storage_removals, unp_messages = (
+                _diff_storage_and_messages(
+                    label=entry.display_path,
+                    prev_rec=prev,
+                    want_storage=entry.storage,
+                    want_messages=entry.messages,
+                    want_hashes=entry.file_hashes,
+                    reinstall=needs_install,
+                    permissions_changed=needs_file_access or needs_user_scripts,
+                    suppress_add_diff=needs_install,
+                    diff=diff,
+                )
+            )
+
             entry_ops.append(
                 ExtensionEntryOp(
                     entry=entry,
@@ -1277,6 +1690,10 @@ def _build_browser_plan(
                     needs_incognito_update=needs_incognito,
                     shortcut_writes=shortcut_writes,
                     needs_file_access_update=needs_file_access,
+                    needs_user_scripts_update=needs_user_scripts,
+                    storage_writes=unp_storage_writes,
+                    storage_removals=unp_storage_removals,
+                    messages_to_send=unp_messages,
                 )
             )
 
@@ -1306,6 +1723,26 @@ def _build_browser_plan(
                     if e.file_access is not None
                     else {}
                 ),
+                **(
+                    {"user_scripts": e.user_scripts}
+                    if e.user_scripts is not None
+                    else {}
+                ),
+                **(
+                    {"storage": dict(e.storage)}
+                    if e.storage
+                    else {}
+                ),
+                **(
+                    {"messages": list(e.messages)}
+                    if e.messages
+                    else {}
+                ),
+                **(
+                    {"file_hashes": dict(sorted(e.file_hashes.items()))}
+                    if e.file_hashes
+                    else {}
+                ),
             }
             for e in entries
         }
@@ -1328,24 +1765,35 @@ def _build_browser_plan(
                 if current_policy is not None
                 else None
             )
+            rec_installed = (
+                isinstance(rec, dict)
+                and isinstance(rec.get("location"), int)
+                and rec.get("state") != 0
+            )
             # Two policy transitions invalidate on-disk Secure Preferences:
-            # 1) Adding an ID not currently in ExtensionSettings (`prev_pol is
-            #    None`) may land inside Brave's ~10s commit window right after a
-            #    policy uninstall left stale `incognito`/`newAllowFileAccess` on
-            #    disk.
+            # 1) Re-adding an ID absent from ExtensionSettings (`prev_pol is
+            #    None`) while `rec` still claims a policy location (`6, 7, 8`)
+            #    means a recent policy removal has not flushed to Secure
+            #    Preferences yet (whereas `location == 1` is an existing
+            #    Sync/Web Store install adopted in-place with permissions kept).
             # 2) Downgrading `force_installed` -> `normal_installed` causes
             #    Chromium's `ExternalPolicyLoader(FORCED)` to uninstall the
-            #    extension and reinstall it fresh with `incognito = false` and
-            #    `fileAccess = false`.
-            is_new_to_policy = current_policy is not None and prev_pol is None
+            #    extension and reinstall it fresh with permissions reset.
+            is_stale_policy_record = (
+                current_policy is not None
+                and prev_pol is None
+                and rec_installed
+                and rec.get("location") in _POLICY_LOCATIONS
+            )
             is_mode_downgrade = (
                 prev_pol is not None
                 and prev_pol.get("installation_mode") == "force_installed"
                 and ws_entry.installation_mode == "normal_installed"
             )
-            policy_reinstall = is_new_to_policy or is_mode_downgrade
+            policy_reinstall = is_stale_policy_record or is_mode_downgrade
+            effective_installed = rec_installed or live_wp
 
-            disk_incog = bool(rec.get("incognito")) if isinstance(rec, dict) else False
+            disk_incog = bool(rec.get("incognito")) if rec_installed else False
             prev_incog = (
                 prev_wp.get("incognito")
                 if (prev_wp is not None and isinstance(prev_wp.get("incognito"), bool))
@@ -1358,7 +1806,7 @@ def _build_browser_plan(
                 policy_reinstall or cur_incog != ws_entry.incognito
             )
 
-            disk_fa = _record_file_access(rec)
+            disk_fa = _record_file_access(rec) if rec_installed else False
             prev_fa = (
                 prev_wp.get("file_access")
                 if (
@@ -1370,6 +1818,27 @@ def _build_browser_plan(
             cur_fa = prev_fa if (live_wp and prev_fa is not None) else disk_fa
             needs_file_access = ws_entry.file_access is not None and (
                 policy_reinstall or cur_fa != ws_entry.file_access
+            )
+
+            disk_us = _record_user_scripts(rec) if rec_installed else False
+            prev_us = (
+                prev_wp.get("user_scripts")
+                if (
+                    prev_wp is not None
+                    and isinstance(prev_wp.get("user_scripts"), bool)
+                )
+                else None
+            )
+            if not effective_installed:
+                cur_us = False
+            elif live_wp and prev_us is not None:
+                cur_us = prev_us
+            elif disk_us is not None:
+                cur_us = disk_us
+            else:
+                cur_us = prev_us
+            needs_user_scripts = ws_entry.user_scripts is not None and (
+                policy_reinstall or cur_us != ws_entry.user_scripts
             )
 
             if needs_incognito:
@@ -1393,6 +1862,22 @@ def _build_browser_plan(
                     diff.append(
                         f"  ~ {ws_entry.display_label} file_access: "
                         f"{ws_entry.file_access} (reapply)"
+                    )
+            if needs_user_scripts:
+                if cur_us is None:
+                    diff.append(
+                        f"  + {ws_entry.display_label} user_scripts: "
+                        f"{ws_entry.user_scripts}"
+                    )
+                elif cur_us != ws_entry.user_scripts:
+                    diff.append(
+                        f"  ~ {ws_entry.display_label} user_scripts: "
+                        f"{cur_us} -> {ws_entry.user_scripts}"
+                    )
+                else:
+                    diff.append(
+                        f"  ~ {ws_entry.display_label} user_scripts: "
+                        f"{ws_entry.user_scripts} (reapply)"
                     )
 
             prev_shortcuts = (
@@ -1440,13 +1925,39 @@ def _build_browser_plan(
                     + (f": {have_binding} (clear)" if have_binding else " (clear)")
                 )
 
-            if needs_incognito or needs_file_access or ws_shortcut_writes:
+            ws_storage_writes, ws_storage_removals, ws_messages = (
+                _diff_storage_and_messages(
+                    label=ws_entry.display_label,
+                    prev_rec=prev_wp,
+                    want_storage=ws_entry.storage,
+                    want_messages=ws_entry.messages,
+                    want_hashes=ws_entry.file_hashes,
+                    reinstall=policy_reinstall or not effective_installed,
+                    permissions_changed=needs_file_access or needs_user_scripts,
+                    suppress_add_diff=False,
+                    diff=diff,
+                )
+            )
+
+            if (
+                needs_incognito
+                or needs_file_access
+                or needs_user_scripts
+                or ws_shortcut_writes
+                or ws_storage_writes
+                or ws_storage_removals
+                or ws_messages
+            ):
                 webstore_ops.append(
                     WebstoreEntryOp(
                         entry=ws_entry,
                         needs_incognito_update=needs_incognito,
                         needs_file_access_update=needs_file_access,
                         shortcut_writes=ws_shortcut_writes,
+                        needs_user_scripts_update=needs_user_scripts,
+                        storage_writes=ws_storage_writes,
+                        storage_removals=ws_storage_removals,
+                        messages_to_send=ws_messages,
                         fallback_prefs=dict(prev_wp) if prev_wp is not None else None,
                         wait_for_modifiable=is_mode_downgrade,
                     )
@@ -1721,6 +2232,7 @@ def _apply_extension_config_and_shortcuts(
     *,
     incognito: bool | None,
     file_access: bool | None,
+    user_scripts: bool | None = None,
     shortcut_writes: dict[str, str],
 ) -> None:
     if incognito is not None:
@@ -1745,6 +2257,17 @@ def _apply_extension_config_and_shortcuts(
             f"return true;"
             f"}})()",
         )
+    if user_scripts is not None:
+        client.evaluate(
+            target,
+            f"(async () => {{"
+            f"await chrome.developerPrivate.updateExtensionConfiguration({{"
+            f"extensionId: {json.dumps(ext_id)}, "
+            f"userScriptsAccess: {json.dumps(user_scripts)}"
+            f"}});"
+            f"return true;"
+            f"}})()",
+        )
     for cmd_name, binding in shortcut_writes.items():
         client.evaluate(
             target,
@@ -1754,6 +2277,105 @@ def _apply_extension_config_and_shortcuts(
             f"commandName: {json.dumps(cmd_name)}, "
             f"keybinding: {json.dumps(binding)}"
             f"}});"
+            f"return true;"
+            f"}})()",
+        )
+
+
+def _await_extension_manifest_page(
+    client: CdpClient,
+    target: dict,
+    ext_id: str,
+    *,
+    require_user_scripts: bool = False,
+    timeout: float | None = None,
+) -> None:
+    budget = _EXT_CONTEXT_WAIT_S if timeout is None else timeout
+    ext_url = f"chrome-extension://{ext_id}/manifest.json"
+    ready_expr = (
+        "document.readyState === 'complete' && "
+        "typeof chrome !== 'undefined' && "
+        "typeof chrome.storage?.local?.set === 'function' && "
+        "typeof chrome.runtime?.sendMessage === 'function'"
+    )
+    if require_user_scripts:
+        ready_expr += (
+            " && (!chrome.runtime.getManifest?.()?.permissions?.includes?.('userScripts') "
+            "|| typeof chrome.userScripts !== 'undefined')"
+        )
+    client.navigate(target, ext_url)
+    deadline = time.monotonic() + budget
+    while True:
+        try:
+            ready = client.evaluate(target, ready_expr)
+            if ready is True:
+                return
+            href = client.evaluate(target, "String(location.href || '')")
+            if isinstance(href, str) and href.startswith("chrome-error://"):
+                client.navigate(target, ext_url)
+        except CdpError:
+            if time.monotonic() >= deadline:
+                raise
+            client.navigate(target, ext_url)
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(_EXT_CONTEXT_POLL_S)
+    raise CdpError(
+        f"extension {ext_id} context at {ext_url} did not become ready"
+    )
+
+
+def _apply_extension_storage_and_messages(
+    client: CdpClient,
+    target: dict,
+    ext_id: str,
+    *,
+    require_user_scripts: bool,
+    storage_removals: list[str],
+    storage_writes: dict[str, Any],
+    messages_to_send: list[dict[str, Any]],
+) -> None:
+    if not (storage_removals or storage_writes or messages_to_send):
+        return
+    _await_extension_manifest_page(
+        client,
+        target,
+        ext_id,
+        require_user_scripts=require_user_scripts,
+    )
+    if storage_removals:
+        client.evaluate(
+            target,
+            f"(async () => {{"
+            f"await chrome.storage.local.remove({json.dumps(storage_removals)});"
+            f"return true;"
+            f"}})()",
+        )
+    if storage_writes:
+        client.evaluate(
+            target,
+            f"(async () => {{"
+            f"await chrome.storage.local.set({json.dumps(storage_writes)});"
+            f"return true;"
+            f"}})()",
+        )
+    for msg in messages_to_send:
+        resp = client.evaluate(
+            target,
+            f"(async () => {{"
+            f"return await chrome.runtime.sendMessage({json.dumps(msg)});"
+            f"}})()",
+        )
+        if isinstance(resp, dict) and (
+            resp.get("status") == "Failed"
+            or (isinstance(resp.get("error"), str) and bool(resp["error"]))
+        ):
+            raise CdpError(f"extension {ext_id} message failed: {resp}")
+    if messages_to_send and _EXT_MESSAGE_SETTLE_MS > 0:
+        client.evaluate(
+            target,
+            f"(async () => {{"
+            f"await new Promise(r => setTimeout(r, {_EXT_MESSAGE_SETTLE_MS}));"
             f"return true;"
             f"}})()",
         )
@@ -1804,6 +2426,9 @@ def apply_via_cdp(client: CdpClient, target: dict, plan: Plan) -> None:
         )
 
     live_ids = _query_live_extension_ids(client, target)
+    pending_runtime_ops: list[
+        tuple[str, bool, list[str], dict[str, Any], list[dict[str, Any]]]
+    ] = []
 
     for op in ops.entry_ops:
         ext_id = op.entry.ext_id
@@ -1863,8 +2488,21 @@ def apply_via_cdp(client: CdpClient, target: dict, plan: Plan) -> None:
             ext_id,
             incognito=op.entry.incognito if op.needs_incognito_update else None,
             file_access=op.entry.file_access if op.needs_file_access_update else None,
+            user_scripts=(
+                op.entry.user_scripts if op.needs_user_scripts_update else None
+            ),
             shortcut_writes=op.shortcut_writes,
         )
+        if op.storage_removals or op.storage_writes or op.messages_to_send:
+            pending_runtime_ops.append(
+                (
+                    ext_id,
+                    op.entry.user_scripts is True,
+                    op.storage_removals,
+                    op.storage_writes,
+                    op.messages_to_send,
+                )
+            )
 
     active_ws_ops = [wop for wop in ops.webstore_ops if wop.needs_cdp_action]
     if active_ws_ops:
@@ -1891,8 +2529,27 @@ def apply_via_cdp(client: CdpClient, target: dict, plan: Plan) -> None:
                 file_access=(
                     wop.entry.file_access if wop.needs_file_access_update else None
                 ),
+                user_scripts=(
+                    wop.entry.user_scripts
+                    if wop.needs_user_scripts_update
+                    else None
+                ),
                 shortcut_writes=wop.shortcut_writes,
             )
+            if (
+                wop.storage_removals
+                or wop.storage_writes
+                or wop.messages_to_send
+            ):
+                pending_runtime_ops.append(
+                    (
+                        ext_id,
+                        wop.entry.user_scripts is True,
+                        wop.storage_removals,
+                        wop.storage_writes,
+                        wop.messages_to_send,
+                    )
+                )
 
     if ops.removed_webstore_shortcuts:
         if live_ids is None:
@@ -1914,6 +2571,23 @@ def apply_via_cdp(client: CdpClient, target: dict, plan: Plan) -> None:
                 )
             except CdpError:
                 pass
+
+    for (
+        rt_ext_id,
+        rt_user_scripts,
+        rt_removals,
+        rt_writes,
+        rt_messages,
+    ) in pending_runtime_ops:
+        _apply_extension_storage_and_messages(
+            client,
+            target,
+            rt_ext_id,
+            require_user_scripts=rt_user_scripts,
+            storage_removals=rt_removals,
+            storage_writes=rt_writes,
+            messages_to_send=rt_messages,
+        )
 
 
 def _check_headless_supported(prefs_path: Path) -> None:
@@ -1988,9 +2662,42 @@ def apply_headless(
                 child.kill()
 
 
+def _format_toml_key(key: str) -> str:
+    return key if _BARE_TOML_KEY_RE.match(key) else json.dumps(key)
+
+
+def _format_toml_value(val: Any) -> str:
+    if isinstance(val, bool):
+        return "true" if val else "false"
+    if isinstance(val, int):
+        return str(val)
+    if isinstance(val, float):
+        return repr(val)
+    if isinstance(val, str):
+        return json.dumps(val)
+    if isinstance(val, list):
+        if not val:
+            return "[]"
+        return "[ " + ", ".join(_format_toml_value(x) for x in val) + " ]"
+    if isinstance(val, dict):
+        items = [(k, v) for k, v in val.items() if v is not None]
+        if not items:
+            return "{}"
+        return (
+            "{ "
+            + ", ".join(
+                f"{_format_toml_key(str(k))} = {_format_toml_value(v)}"
+                for k, v in items
+            )
+            + " }"
+        )
+    return json.dumps(str(val))
+
+
 def _format_shortcuts_inline(sc: dict[str, str]) -> str:
     return ", ".join(
-        f"{cmd} = {json.dumps(val)}" for cmd, val in sorted(sc.items())
+        f"{_format_toml_key(cmd)} = {json.dumps(val)}"
+        for cmd, val in sorted(sc.items())
     )
 
 
@@ -1999,6 +2706,7 @@ def build_dump_block(prefs_path: Path, prefs: dict) -> list[str] | None:
     managed ``ExtensionSettings`` nor unpacked extensions exist."""
     disk_settings, _ = _disk_extension_settings(prefs_path, prefs)
     disk_commands = _disk_extension_commands(prefs)
+    managed_sidecar, _, ws_prefs_sidecar, _ = _read_sidecar(prefs_path)
     profile_dir = prefs_path.parent
 
     webstore_policy = (
@@ -2021,11 +2729,37 @@ def build_dump_block(prefs_path: Path, prefs: dict) -> list[str] | None:
         pin = _POLICY_TO_PIN.get(raw_pin) if isinstance(raw_pin, str) else None
 
         rec = disk_settings.get(ext_id)
-        incog = bool(rec.get("incognito")) if isinstance(rec, dict) else False
+        rec_installed = (
+            isinstance(rec, dict)
+            and isinstance(rec.get("location"), int)
+            and rec.get("state") != 0
+        )
+        ws_prev = ws_prefs_sidecar.get(ext_id, {})
+        incog = bool(rec.get("incognito")) if rec_installed else False
         file_acc = (
             bool(rec["newAllowFileAccess"])
-            if (isinstance(rec, dict) and "newAllowFileAccess" in rec)
+            if (rec_installed and isinstance(rec, dict) and "newAllowFileAccess" in rec)
             else False
+        )
+        disk_us = _record_user_scripts(rec) if rec_installed else None
+        user_scr = (
+            disk_us
+            if disk_us is not None
+            else (
+                ws_prev["user_scripts"]
+                if isinstance(ws_prev.get("user_scripts"), bool)
+                else False
+            )
+        )
+        storage_val = (
+            ws_prev["storage"]
+            if isinstance(ws_prev.get("storage"), dict) and ws_prev["storage"]
+            else None
+        )
+        messages_val = (
+            ws_prev["messages"]
+            if isinstance(ws_prev.get("messages"), list) and ws_prev["messages"]
+            else None
         )
         sc: dict[str, str] = {}
         for (cid, cmd_name), binding in sorted(disk_commands.items()):
@@ -2037,7 +2771,10 @@ def build_dump_block(prefs_path: Path, prefs: dict) -> list[str] | None:
             and pin is None
             and not file_acc
             and not incog
+            and not user_scr
             and not sc
+            and storage_val is None
+            and messages_val is None
         ):
             webstore_lines.append(f"  {json.dumps(ext_id)},")
         else:
@@ -2050,11 +2787,17 @@ def build_dump_block(prefs_path: Path, prefs: dict) -> list[str] | None:
                 fields.append("file_access = true")
             if incog:
                 fields.append("incognito = true")
+            if user_scr:
+                fields.append("user_scripts = true")
             if sc:
                 fields.append(f"shortcuts = {{ {_format_shortcuts_inline(sc)} }}")
+            if storage_val is not None:
+                fields.append(f"storage = {_format_toml_value(storage_val)}")
+            if messages_val is not None:
+                fields.append(f"messages = {_format_toml_value(messages_val)}")
             webstore_lines.append(f"  {{ {', '.join(fields)} }},")
 
-    rows: list[tuple[str, dict[str, str]]] = []
+    rows: list[tuple[str, list[str]]] = []
     for ext_id, rec in sorted(disk_settings.items()):
         if not isinstance(rec, dict) or rec.get("location") != _UNPACKED_LOCATION:
             continue
@@ -2070,7 +2813,42 @@ def build_dump_block(prefs_path: Path, prefs: dict) -> list[str] | None:
         for (cid, cmd_name), binding in sorted(disk_commands.items()):
             if cid == ext_id and binding:
                 sc[cmd_name] = to_keyevent_shortcut(binding)
-        rows.append((str(resolved), sc))
+        unp_prev = managed_sidecar.get(ext_id, {})
+        disk_us = _record_user_scripts(rec)
+        user_scr = (
+            disk_us
+            if disk_us is not None
+            else (
+                unp_prev["user_scripts"]
+                if isinstance(unp_prev.get("user_scripts"), bool)
+                else False
+            )
+        )
+        storage_val = (
+            unp_prev["storage"]
+            if isinstance(unp_prev.get("storage"), dict) and unp_prev["storage"]
+            else None
+        )
+        messages_val = (
+            unp_prev["messages"]
+            if isinstance(unp_prev.get("messages"), list) and unp_prev["messages"]
+            else None
+        )
+        extra_fields: list[str] = []
+        if isinstance(unp_prev.get("incognito"), bool) and bool(rec.get("incognito")):
+            extra_fields.append("incognito = true")
+        if isinstance(unp_prev.get("file_access"), bool):
+            fa = _record_file_access(rec)
+            extra_fields.append(f"file_access = {'true' if fa else 'false'}")
+        if user_scr:
+            extra_fields.append("user_scripts = true")
+        if sc:
+            extra_fields.append(f"shortcuts = {{ {_format_shortcuts_inline(sc)} }}")
+        if storage_val is not None:
+            extra_fields.append(f"storage = {_format_toml_value(storage_val)}")
+        if messages_val is not None:
+            extra_fields.append(f"messages = {_format_toml_value(messages_val)}")
+        rows.append((str(resolved), extra_fields))
 
     if not webstore_lines and not rows:
         return None
@@ -2083,12 +2861,12 @@ def build_dump_block(prefs_path: Path, prefs: dict) -> list[str] | None:
     if rows:
         rows.sort(key=lambda item: item[0])
         lines.append("unpacked = [")
-        for path_str, sc in rows:
-            if sc:
-                lines.append(
-                    f"  {{ path = {json.dumps(path_str)}, "
-                    f"shortcuts = {{ {_format_shortcuts_inline(sc)} }} }},"
+        for path_str, extra_fields in rows:
+            if extra_fields:
+                fields_str = ", ".join(
+                    [f"path = {json.dumps(path_str)}", *extra_fields]
                 )
+                lines.append(f"  {{ {fields_str} }},")
             else:
                 lines.append(f"  {json.dumps(path_str)},")
         lines.append("]")
