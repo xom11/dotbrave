@@ -643,6 +643,15 @@ def cmd_apply(
                 # does.  Without this, such a browser gets closed and
                 # relaunched for an endpoint it already had.
                 live_port = live_port_from_cmdline(lambda: saved_cmdline)
+            elif not skipped_ws_only and devtools_port_is_ws_only(
+                args.profile_root, live_port
+            ):
+                print(
+                    f"note: brave://inspect/#remote-debugging is enabled "
+                    f"({display_name} may prompt for UI approval and ignores "
+                    f"--remote-debugging-port until unchecked at "
+                    f"brave://inspect/#remote-debugging)."
+                )
             if live_port is None:
                 if unattended:
                     _warn(
@@ -768,10 +777,23 @@ def cmd_apply(
                             f"{display_name} was left running: {blocked}\n"
                             f"{settings}"
                         )
+                    has_setting_key = any(
+                        k != "shortcuts"
+                        and not k.startswith("shortcuts.")
+                        and not k.startswith("extensions")
+                        and not k.startswith("live apply failed:")
+                        for k in e.keys
+                    )
+                    hint = (
+                        " (if the same [settings] key repeats on the next run, "
+                        f"{display_name} may have removed or renamed it)"
+                        if has_setting_key
+                        else ""
+                    )
                     print(
                         f"{display_name} applied everything it could live; "
                         f"closing it normally to finish these offline "
-                        f"(no force-kill):"
+                        f"(no force-kill){hint}:"
                     )
                     print(settings)
                     graceful_close_fn()

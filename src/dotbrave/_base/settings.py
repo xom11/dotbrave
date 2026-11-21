@@ -532,6 +532,17 @@ def diff_summary(
     return lines
 
 
+def _resolve_renamed_key(
+    prefs: dict, key: str, renamed: dict[str, tuple[str, ...]]
+) -> str:
+    if _get_value(prefs, _split_key(key)) is not _MISSING:
+        return key
+    for alt in renamed.get(key, ()):
+        if _get_value(prefs, _split_key(alt)) is not _MISSING:
+            return alt
+    return key
+
+
 def plan_apply(
     browser_name: str,
     prefs_path: Path,
@@ -539,12 +550,16 @@ def plan_apply(
     raw_table: object,
     *,
     local_state_keys: frozenset[str] = frozenset(),
+    renamed_settings: dict[str, tuple[str, ...]] | None = None,
 ) -> Plan:
     target = _validate_table(raw_table)
+    renamed = renamed_settings or {}
 
     macs = _all_macs(prefs, prefs_path)
     rejected: list[str] = []
-    for key in target:
+    effective_target: dict[str, Any] = {}
+    for key, value in target.items():
+        eff_key = _resolve_renamed_key(prefs, key, renamed)
         parts = _split_key(key)
         if key in local_state_keys:
             rejected.append(
@@ -557,6 +572,24 @@ def plan_apply(
             continue
         if _is_mac_protected(macs, parts):
             rejected.append(f"{key} (MAC-protected; writing would be reset on launch)")
+            continue
+        if eff_key != key:
+            eff_parts = _split_key(eff_key)
+            if eff_key in local_state_keys:
+                rejected.append(
+                    f"{eff_key} (lives in Local State, not this profile's "
+                    f"Preferences; dotbrave cannot write it)"
+                )
+                continue
+            if eff_parts[0] == "protection":
+                rejected.append(f"{eff_key} (Chromium MAC bookkeeping subtree)")
+                continue
+            if _is_mac_protected(macs, eff_parts):
+                rejected.append(
+                    f"{eff_key} (MAC-protected; writing would be reset on launch)"
+                )
+                continue
+        effective_target[eff_key] = value
     if rejected:
         sys.exit(
             "error: the following [settings] keys cannot be written in v1:\n  "
@@ -564,14 +597,48 @@ def plan_apply(
             + "\n(remove them from your config; MAC support is planned for v2)"
         )
 
-    target_keys = set(target)
     config_managed_keys = _get_managed_keys(prefs_path)
-    removed_keys = config_managed_keys - target_keys
+    existing_prior = dict(_get_prior_values(prefs_path))
+    all_target_names = set(target) | set(effective_target)
+    migrated_old_keys: set[str] = set()
+    for old_k in config_managed_keys - set(effective_target):
+        for alt in renamed.get(old_k, ()):
+            if alt in all_target_names:
+                migrated_old_keys.add(old_k)
+                eff_alt = _resolve_renamed_key(prefs, alt, renamed)
+                if old_k in existing_prior:
+                    existing_prior.setdefault(eff_alt, existing_prior[old_k])
+                break
+    removed_keys = (config_managed_keys - set(effective_target)) - migrated_old_keys
 
-    diff = diff_summary(prefs, target, removed_keys)
+    diff = diff_summary(prefs, effective_target, removed_keys)
 
     warnings: list[str] = []
-    if (target or removed_keys) and _sync_enabled(browser_name, prefs):
+    state_path = _state_file(prefs_path)
+    try:
+        flushed_since_apply = (
+            state_path.exists()
+            and prefs_path.exists()
+            and prefs_path.stat().st_mtime > state_path.stat().st_mtime
+        )
+    except OSError:
+        flushed_since_apply = False
+    if flushed_since_apply:
+        for orig_key in sorted(target):
+            eff_k = _resolve_renamed_key(prefs, orig_key, renamed)
+            was_managed = orig_key in config_managed_keys or any(
+                a in config_managed_keys for a in renamed.get(orig_key, ())
+            )
+            if was_managed and _get_value(prefs, _split_key(eff_k)) is _MISSING:
+                warnings.append(
+                    f"warning: [settings] {orig_key!r} was previously applied "
+                    f"by dotbrave but is absent from Preferences after "
+                    f"{browser_name.title()} ran -- {browser_name.title()} may "
+                    f"have removed or renamed this pref in an update "
+                    f"(check with `dotbrave export --snapshot`)."
+                )
+
+    if (effective_target or removed_keys) and _sync_enabled(browser_name, prefs):
         warnings.append(
             f"warning: {browser_name.title()} Sync is enabled "
             f"(sync.has_setup_completed=true).\n"
@@ -584,28 +651,28 @@ def plan_apply(
         )
 
     def apply_fn(prefs: dict) -> None:
-        for key, value in target.items():
+        for key, value in effective_target.items():
             _set_value(prefs, _split_key(key), value)
         for key in removed_keys:
             _pop_value(prefs, _split_key(key))
 
     def verify_fn(reloaded: dict) -> None:
-        for key, value in target.items():
+        for key, value in effective_target.items():
             got = _get_value(reloaded, _split_key(key))
             if got != value:
                 sys.exit(f"error: settings verification failed for key {key!r}: got {got!r}")
 
     prior_values = merge_prior_values(
-        _get_prior_values(prefs_path),
-        _capture_prior_values(prefs, target_keys),
+        existing_prior,
+        _capture_prior_values(prefs, set(effective_target)),
     )
 
     return Plan(
         namespace=NAMESPACE,
         diff_lines=diff,
-        state_path=_state_file(prefs_path),
+        state_path=state_path,
         state_payload={
-            "managed_keys": sorted(target_keys),
+            "managed_keys": sorted(effective_target),
             "prior_values": prior_values,
         },
         apply_fn=apply_fn,
