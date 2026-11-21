@@ -1970,37 +1970,3 @@ def test_newtab_scripts_wait_for_hydration_and_support_renamed_takeovers_action(
     ]
     assert parsed["mut"] is True
     assert parsed["calls"] == [["clock", False], ["takeover", False]]
-
-
-def test_live_apply_falls_back_to_renamed_setting_alias(
-    tmp_path: Path, monkeypatch
-) -> None:
-    """On an empty profile running an older Brave build, configuring
-    ``browser.ctrl_tab_mru`` probes ``brave.mru_cycling_enabled`` when
-    ``settingsPrivate`` rejects the new name and applies the alias live."""
-    prefs_path = tmp_path / "Default" / "Preferences"
-    prefs_path.parent.mkdir()
-    prefs: dict = {}
-    prefs_path.write_text(json.dumps(prefs))
-
-    plan = settings_mod.plan_apply(prefs_path, prefs, {"browser.ctrl_tab_mru": False})
-    fake = FakeCdpClient(
-        9333,
-        evaluation_results=[
-            [{"key": "browser.ctrl_tab_mru", "supported": False}],
-            [{"key": "brave.mru_cycling_enabled", "supported": True, "value": True}],
-        ],
-    )
-    monkeypatch.setattr(live, "CdpClient", lambda port: fake)
-
-    live.apply_live(9333, prefs_path, prefs, [plan])
-
-    assert any(
-        'setPref("brave.mru_cycling_enabled", false)' in e for e in fake.evaluations
-    )
-    state = json.loads(_sidecar(prefs_path).read_text())
-    assert state["managed_keys"] == ["brave.mru_cycling_enabled"]
-    assert state["prior_values"]["brave.mru_cycling_enabled"] == {
-        "present": True,
-        "value": True,
-    }

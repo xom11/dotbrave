@@ -580,48 +580,6 @@ def test_a_drop_only_config_does_not_produce_an_empty_plan(tmp_path: Path) -> No
     ]
 
 
-def test_renamed_setting_matches_counterpart_on_disk_without_diff_or_removal(
-    tmp_path: Path,
-) -> None:
-    """`browser.ctrl_tab_mru` and `brave.mru_cycling_enabled` bridge Brave 157/158
-    so one `brave.toml` produces zero diff and no spurious removal on both."""
-    from dotbrave import settings as brave_settings
-
-    # Case 1: Brave 157 still holds `brave.mru_cycling_enabled = false`, while
-    # the config already names `browser.ctrl_tab_mru = false`.
-    p1 = tmp_path / "p1" / "Default"
-    p1.mkdir(parents=True)
-    prefs1_path = p1 / "Preferences"
-    prefs1 = {"brave": {"mru_cycling_enabled": False}}
-    prefs1_path.write_text(json.dumps(prefs1))
-    plan1 = brave_settings.plan_apply(prefs1_path, prefs1, {"browser.ctrl_tab_mru": False})
-    assert plan1.empty is True
-    assert plan1.state_payload["managed_keys"] == ["brave.mru_cycling_enabled"]
-
-    # Case 2: Brave 158 migrated `brave.mru_cycling_enabled` -> `browser.ctrl_tab_mru`
-    # and deleted the old key, while the sidecar still listed the old name.
-    p2 = tmp_path / "p2" / "Default"
-    p2.mkdir(parents=True)
-    prefs2_path = p2 / "Preferences"
-    prefs2 = {"browser": {"ctrl_tab_mru": False}}
-    prefs2_path.write_text(json.dumps(prefs2))
-    prefs2_path.with_name("Preferences.dotbrave.settings.json").write_text(
-        json.dumps({
-            "managed_keys": ["brave.mru_cycling_enabled"],
-            "prior_values": {
-                "brave.mru_cycling_enabled": {"present": True, "value": True},
-            },
-        })
-    )
-    plan2 = brave_settings.plan_apply(prefs2_path, prefs2, {"browser.ctrl_tab_mru": False})
-    assert plan2.empty is True
-    assert plan2.state_payload["managed_keys"] == ["browser.ctrl_tab_mru"]
-    assert plan2.state_payload["prior_values"]["browser.ctrl_tab_mru"] == {
-        "present": True,
-        "value": True,
-    }
-
-
 def test_disappeared_managed_setting_emits_deprecation_warning(
     tmp_path: Path,
 ) -> None:

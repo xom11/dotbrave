@@ -13,7 +13,6 @@ from dotbrave._base import settings as _base_settings
 from dotbrave._base.utils import Plan
 from dotbrave.command_ids import ID_TO_NAME
 from dotbrave import extensions as extensions_mod
-from dotbrave import settings as settings_mod
 from dotbrave import shortcuts as shortcuts_mod
 
 
@@ -331,11 +330,7 @@ def _plan_removals(plans: list[Plan], managed_before: set[str]) -> set[str]:
         keys = payload.get("managed_keys")
         if not isinstance(keys, list):
             continue
-        current = {k for k in keys if isinstance(k, str)}
-        for old_k in managed - current:
-            if any(alt in current for alt in settings_mod.RENAMED_SETTINGS.get(old_k, ())):
-                continue
-            out.add(old_k)
+        out |= managed - {k for k in keys if isinstance(k, str)}
     return out
 
 
@@ -973,38 +968,6 @@ def apply_live(
         unsupported, learned_values = _preflight_settings(
             client, target, newtab_changes, ordinary_changes
         )
-        renamed_live_keys: dict[str, str] = {}
-        change_keys = {k for k, _ in changes}
-        for key, val in list(ordinary_changes):
-            if (
-                key not in unsupported
-                or key not in change_keys
-                or key not in settings_mod.RENAMED_SETTINGS
-            ):
-                continue
-            alts = [(alt, val) for alt in settings_mod.RENAMED_SETTINGS[key]]
-            alias_script = _settings_preflight_script(alts)
-            if alias_script is None:
-                continue
-            alias_unsupported: list[str] = []
-            alias_values: dict[str, Any] = {}
-            _read_preflight_result(
-                client.evaluate(target, alias_script),
-                alias_unsupported,
-                alias_values,
-            )
-            supported_alts = [alt for alt, _ in alts if alt not in alias_unsupported]
-            if not supported_alts:
-                continue
-            chosen = supported_alts[0]
-            unsupported = [u for u in unsupported if u != key]
-            ordinary_changes = [
-                (chosen, v) if k == key else (k, v)
-                for k, v in ordinary_changes
-            ]
-            if chosen in alias_values:
-                learned_values[chosen] = alias_values[chosen]
-            renamed_live_keys[key] = chosen
         shortcuts_unsupported: list[str] = []
         if shortcut_script is not None:
             shortcuts_unsupported = _preflight_shortcuts(client, target)
@@ -1130,27 +1093,6 @@ def apply_live(
         # the `--unattended` refusal either.  The learned values are
         # discarded in that case; `plan_apply` recomputes `prior_values`
         # from disk on the next run, as before.
-        for old_key, chosen in renamed_live_keys.items():
-            if old_key in managed_before:
-                managed_before = (managed_before - {old_key}) | {chosen}
-            for plan in plans:
-                if (
-                    plan.namespace == _base_settings.NAMESPACE
-                    and isinstance(plan.state_payload, dict)
-                ):
-                    if isinstance(plan.state_payload.get("managed_keys"), list):
-                        plan.state_payload["managed_keys"] = sorted(
-                            {
-                                chosen if m == old_key else m
-                                for m in plan.state_payload["managed_keys"]
-                            }
-                        )
-                    if (
-                        isinstance(plan.state_payload.get("prior_values"), dict)
-                        and old_key not in recorded_before
-                    ):
-                        plan.state_payload["prior_values"].pop(old_key, None)
-
         live_writes = [
             (key, write_value)
             for key, _store, _actions, _props, write_value in live_newtab

@@ -28,12 +28,7 @@ diff_summary = _base.diff_summary
 
 def plan_apply(prefs_path: Path, prefs: dict, raw_table: object) -> Plan:
     return _base.plan_apply(
-        "brave",
-        prefs_path,
-        prefs,
-        raw_table,
-        local_state_keys=LOCAL_STATE_KEYS,
-        renamed_settings=RENAMED_SETTINGS,
+        "brave", prefs_path, prefs, raw_table, local_state_keys=LOCAL_STATE_KEYS
     )
 
 
@@ -67,7 +62,6 @@ KNOWN_SETTINGS: tuple[str, ...] = (
     "browser.show_home_button",
     # Tabs / window behavior
     "brave.tabs.",
-    "brave.mru_cycling_enabled",
     "browser.ctrl_tab_mru",
     "brave.enable_closing_last_tab",
     "brave.enable_window_closing_confirm",
@@ -94,15 +88,6 @@ KNOWN_SETTINGS: tuple[str, ...] = (
     # Omnibox
     "omnibox.prevent_url_elisions",
 )
-
-
-# Bidirectional aliases for prefs migrated across Brave/Chromium releases
-# (`MigrateObsoleteProfilePrefs`), keeping one `brave.toml` working live on
-# mixed-version fleets without spurious removals or offline restarts.
-RENAMED_SETTINGS: dict[str, tuple[str, ...]] = {
-    "brave.mru_cycling_enabled": ("browser.ctrl_tab_mru",),
-    "browser.ctrl_tab_mru": ("brave.mru_cycling_enabled",),
-}
 
 
 # Prefs that live in `<profile-root>/Local State`, not in a profile's
