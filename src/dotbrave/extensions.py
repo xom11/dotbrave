@@ -1287,11 +1287,11 @@ def _record_file_access(rec: dict[str, Any] | None) -> bool:
     return bool(flags & _ALLOW_FILE_ACCESS_FLAG) if isinstance(flags, int) else False
 
 
-def _record_user_scripts(rec: dict[str, Any] | None) -> bool | None:
+def _record_user_scripts(rec: dict[str, Any] | None) -> bool:
     if not isinstance(rec, dict):
-        return None
+        return False
     val = rec.get("user_scripts_enabled")
-    return val if isinstance(val, bool) else None
+    return val if isinstance(val, bool) else False
 
 
 def _json_equal(a: Any, b: Any) -> bool:
@@ -1673,13 +1673,11 @@ def _build_browser_plan(
                 else None
             )
             if needs_install:
-                cur_us: bool | None = False
+                cur_us = False
             elif installed_live and prev_us is not None:
                 cur_us = prev_us
-            elif disk_us is not None:
-                cur_us = disk_us
             else:
-                cur_us = prev_us
+                cur_us = disk_us
             needs_user_scripts = (
                 entry.user_scripts is not None
                 and (needs_install or cur_us != entry.user_scripts)
@@ -1700,15 +1698,10 @@ def _build_browser_plan(
                     f"{cur_fa} -> {entry.file_access}"
                 )
             if needs_user_scripts and not needs_install:
-                if cur_us is None:
-                    diff.append(
-                        f"  + {entry.display_path} user_scripts: {entry.user_scripts}"
-                    )
-                else:
-                    diff.append(
-                        f"  ~ {entry.display_path} user_scripts: "
-                        f"{cur_us} -> {entry.user_scripts}"
-                    )
+                diff.append(
+                    f"  ~ {entry.display_path} user_scripts: "
+                    f"{cur_us} -> {entry.user_scripts}"
+                )
 
             prev_shortcuts = (
                 prev.get("shortcuts", {})
@@ -1909,14 +1902,9 @@ def _build_browser_plan(
                 )
                 else None
             )
-            if not effective_installed:
-                cur_us = False
-            elif live_wp and prev_us is not None:
-                cur_us = prev_us
-            elif disk_us is not None:
-                cur_us = disk_us
-            else:
-                cur_us = prev_us
+            cur_us = (
+                prev_us if (live_wp and prev_us is not None) else disk_us
+            )
             needs_user_scripts = ws_entry.user_scripts is not None and (
                 policy_reinstall or cur_us != ws_entry.user_scripts
             )
@@ -1944,12 +1932,7 @@ def _build_browser_plan(
                         f"{ws_entry.file_access} (reapply)"
                     )
             if needs_user_scripts:
-                if cur_us is None:
-                    diff.append(
-                        f"  + {ws_entry.display_label} user_scripts: "
-                        f"{ws_entry.user_scripts}"
-                    )
-                elif cur_us != ws_entry.user_scripts:
+                if cur_us != ws_entry.user_scripts:
                     diff.append(
                         f"  ~ {ws_entry.display_label} user_scripts: "
                         f"{cur_us} -> {ws_entry.user_scripts}"
@@ -2788,9 +2771,10 @@ def _format_shortcuts_inline(sc: dict[str, str]) -> str:
 def build_dump_block(prefs_path: Path, prefs: dict) -> list[str] | None:
     """Emit ``[extensions]`` for ``dotbrave export``, or ``None`` when neither
     managed ``ExtensionSettings`` nor unpacked extensions exist."""
-    disk_settings, _ = _disk_extension_settings(prefs_path, prefs)
+    disk_settings, disk_mtime = _disk_extension_settings(prefs_path, prefs)
     disk_commands = _disk_extension_commands(prefs)
-    managed_sidecar, _, ws_prefs_sidecar, _ = _read_sidecar(prefs_path)
+    managed_sidecar, _, ws_prefs_sidecar, sidecar_mtime = _read_sidecar(prefs_path)
+    in_commit_window = sidecar_mtime is not None and sidecar_mtime >= disk_mtime
     profile_dir = prefs_path.parent
 
     webstore_policy = (
@@ -2825,15 +2809,11 @@ def build_dump_block(prefs_path: Path, prefs: dict) -> list[str] | None:
             if (rec_installed and isinstance(rec, dict) and "newAllowFileAccess" in rec)
             else False
         )
-        disk_us = _record_user_scripts(rec) if rec_installed else None
+        disk_us = _record_user_scripts(rec) if rec_installed else False
         user_scr = (
-            disk_us
-            if disk_us is not None
-            else (
-                ws_prev["user_scripts"]
-                if isinstance(ws_prev.get("user_scripts"), bool)
-                else False
-            )
+            ws_prev["user_scripts"]
+            if (in_commit_window and isinstance(ws_prev.get("user_scripts"), bool))
+            else disk_us
         )
         storage_val = (
             ws_prev["storage"]
@@ -2900,13 +2880,9 @@ def build_dump_block(prefs_path: Path, prefs: dict) -> list[str] | None:
         unp_prev = managed_sidecar.get(ext_id, {})
         disk_us = _record_user_scripts(rec)
         user_scr = (
-            disk_us
-            if disk_us is not None
-            else (
-                unp_prev["user_scripts"]
-                if isinstance(unp_prev.get("user_scripts"), bool)
-                else False
-            )
+            unp_prev["user_scripts"]
+            if (in_commit_window and isinstance(unp_prev.get("user_scripts"), bool))
+            else disk_us
         )
         storage_val = (
             unp_prev["storage"]

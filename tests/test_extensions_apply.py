@@ -569,6 +569,7 @@ def test_unpacked_user_scripts_storage_messages_and_export_roundtrip(
                             "location": 4,
                             "path": str(ext_dir.resolve()),
                             "creation_flags": 38,
+                            "user_scripts_enabled": True,
                         }
                     }
                 }

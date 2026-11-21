@@ -1594,9 +1594,8 @@ def test_webstore_user_scripts_storage_messages_file_url_edit_removal_and_export
     assert '"updateSettings"' in msg_evals[0]
     assert '"loadSettingsFromUrl"' in msg_evals[1] and expected_uri in msg_evals[1]
 
-    # Seed Secure Preferences after flush (without user_scripts_enabled, as on
-    # Chromium builds storing user_scripts in StateStore LevelDB) and verify
-    # steady-state re-apply is a 0-CDP no-op!
+    # Seed flushed Secure Preferences with Chromium's on-disk
+    # user_scripts_enabled flag and verify steady-state re-apply is a 0-CDP no-op.
     prefs_path = profile_root / "Default" / "Preferences"
     sp_path = profile_root / "Default" / "Secure Preferences"
     sp_path.write_text(
@@ -1608,6 +1607,7 @@ def test_webstore_user_scripts_storage_messages_file_url_edit_removal_and_export
                             "location": 6,
                             "incognito": True,
                             "newAllowFileAccess": True,
+                            "user_scripts_enabled": True,
                         }
                     }
                 }
@@ -1662,6 +1662,98 @@ def test_webstore_user_scripts_storage_messages_file_url_edit_removal_and_export
         'chrome.storage.local.remove(["obsoleteKey"])' in expr
         for expr in fake_cdp.evaluations
     )
+
+
+def test_webstore_reinstall_missing_user_scripts_enabled_reapplies(
+    profile_root: Path,
+    policy_env: dict,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """When a webstore extension is reinstalled (e.g. across Chrome Web Store
+    recovery), Chromium omits ``newAllowFileAccess`` and ``user_scripts_enabled``
+    from ``Secure Preferences``; ``dotbrave apply`` outside the commit window
+    must restore both instead of trusting stale ``true`` in the sidecar."""
+    browser_dir = tmp_path / "browser"
+    cfg_dir = browser_dir / "dotbrave"
+    sk_dir = browser_dir / "surfingkeys"
+    cfg_dir.mkdir(parents=True)
+    sk_dir.mkdir(parents=True)
+    configs_js = sk_dir / "configs.js"
+    configs_js.write_text('api.map("J", "R");\n', encoding="utf-8")
+
+    fake_cdp = _FakeExtCdpClient(
+        profile_root / "Default", installed_ids={SURFINGKEYS_ID}
+    )
+    monkeypatch.setattr(live, "CdpClient", lambda port: fake_cdp)
+    monkeypatch.setattr(brave_pkg, "brave_running", lambda: True)
+    monkeypatch.setattr(brave_pkg, "find_main_brave_cmdline", lambda: ["brave"])
+    monkeypatch.setattr(orch, "find_devtools_port", lambda r, p: 9222)
+    monkeypatch.setattr(orch, "remember_devtools_port", lambda r, p, port: None)
+
+    cfg = cfg_dir / "brave.toml"
+    cfg.write_text(
+        "[[extensions.webstore]]\n"
+        f'id = "{SURFINGKEYS_ID}"\n'
+        'name = "Surfingkeys"\n'
+        'mode = "normal"\n'
+        "file_access = true\n"
+        "incognito = true\n"
+        "user_scripts = true\n"
+        'storage = { showAdvanced = true, localPath = { file_url = "../surfingkeys/configs.js" } }\n'
+        "messages = [\n"
+        '  { action = "updateSettings", needResponse = true, settings = { showAdvanced = true } },\n'
+        '  { action = "loadSettingsFromUrl", needResponse = true, url = { file_url = "../surfingkeys/configs.js" } },\n'
+        "]\n",
+        encoding="utf-8",
+    )
+    _apply(profile_root, cfg)
+
+    # Simulate an extension reinstall flushed to disk after the commit window:
+    # Chromium resets both file_access and user_scripts (keys omitted).
+    prefs_path = profile_root / "Default" / "Preferences"
+    sp_path = profile_root / "Default" / "Secure Preferences"
+    sp_path.write_text(
+        json.dumps(
+            {
+                "extensions": {
+                    "settings": {
+                        SURFINGKEYS_ID: {
+                            "location": 6,
+                            "incognito": True,
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    future = time.time() + 5.0
+    os.utime(sp_path, (future, future))
+    os.utime(prefs_path, (future, future))
+
+    capsys.readouterr()
+    fake_cdp.evaluations.clear()
+    _apply(profile_root, cfg)
+
+    out = capsys.readouterr().out
+    assert "file_access: False -> True" in out
+    assert "user_scripts: False -> True" in out
+    assert any(
+        "fileAccess: true" in expr and SURFINGKEYS_ID in expr
+        for expr in fake_cdp.evaluations
+    )
+    assert any(
+        "userScriptsAccess: true" in expr and SURFINGKEYS_ID in expr
+        for expr in fake_cdp.evaluations
+    )
+    msg_evals = [
+        expr for expr in fake_cdp.evaluations if "chrome.runtime.sendMessage(" in expr
+    ]
+    assert len(msg_evals) == 2
+    assert '"updateSettings"' in msg_evals[0]
+    assert '"loadSettingsFromUrl"' in msg_evals[1]
 
 
 def test_extension_message_failure_raises_cdp_error(
